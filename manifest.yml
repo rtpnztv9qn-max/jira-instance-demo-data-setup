@@ -1,0 +1,29 @@
+modules:
+  jira:globalPage:
+    - key: cprime-demo-agent-page
+      resource: main
+      resolver:
+        function: resolver
+      title: Cprime Demo Environment Creator
+  function:
+    - key: resolver
+      handler: index.handler
+resources:
+  - key: main
+    path: static/hello-world/build
+app:
+  runtime:
+    name: nodejs24.x
+    memoryMB: 1024
+    architecture: arm64
+  id: ari:cloud:ecosystem::app/9e6922cc-738c-4223-a182-238b10e76e2c
+permissions:
+  scopes:
+    - read:jira-work
+    - write:jira-work
+    - read:jira-user
+    - manage:jira-project
+    - manage:jira-configuration
+    - read:servicedesk-request
+    - write:servicedesk-request
+    - manage:servicedesk-customer
