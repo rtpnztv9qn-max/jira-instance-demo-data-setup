@@ -4,10 +4,24 @@ modules:
       resource: main
       resolver:
         function: resolver
-      title: Cprime Demo Environment Creator
+      title: Jira Instance - Demo Data Setup
+  jira:dashboardGadget:
+    - key: cprime-demo-dashboard-gadget
+      title: Cprime Demo Gadget
+      description: Environment-specific demo dashboard gadget for Cprime demo data.
+      thumbnail: https://developer.atlassian.com/platform/forge/images/icons/issue-panel-icon.svg
+      resource: main
+      resolver:
+        function: resolver
   function:
     - key: resolver
       handler: index.handler
+    - key: environment-cleanup
+      handler: index.scheduledCleanup
+  scheduledTrigger:
+    - key: weekly-environment-cleanup
+      function: environment-cleanup
+      interval: week
 resources:
   - key: main
     path: static/hello-world/build
@@ -22,8 +36,22 @@ permissions:
     - read:jira-work
     - write:jira-work
     - read:jira-user
+    - read:project:jira
     - manage:jira-project
     - manage:jira-configuration
+    - read:board-scope:jira-software
+    - write:board-scope:jira-software
+    - write:sprint:jira-software
     - read:servicedesk-request
     - write:servicedesk-request
     - manage:servicedesk-customer
+    - read:space:confluence
+    - write:space:confluence
+    - read:page:confluence
+    - write:page:confluence
+    - storage:app
+  external:
+    fetch:
+      backend:
+        - address: https://api.openai.com
+          inScopeEUD: true
