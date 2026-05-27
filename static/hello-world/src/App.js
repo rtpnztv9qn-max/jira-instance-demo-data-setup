@@ -2039,10 +2039,20 @@ function App() {
   };
 
   const removeJsmProject = () => {
+    const nextJsmProjectCount = Math.max(0, selectedJsmProjectCount - 1);
+
     setForm({
       ...form,
-      jsmProjectCount: Math.max(0, selectedJsmProjectCount - 1),
+      jsmProjectCount: nextJsmProjectCount,
+      ...(nextJsmProjectCount === 0 ? {
+        opsDashboardTypes: [],
+        opsDashboardPrompt: '',
+      } : {}),
     });
+
+    if (nextJsmProjectCount === 0 && openDashboardPicker === 'ops') {
+      setOpenDashboardPicker(null);
+    }
   };
 
   const updateSoftwareProject = (index, field, value) => {
@@ -2273,20 +2283,21 @@ function App() {
               </div>
             </div>
           ))}
-          <div style={{ ...optionalSectionStyle, marginTop: '16px', marginBottom: 0 }}>
-            <div style={{ ...fieldStyle, marginBottom: 0 }}>
-              <label style={labelStyle}>Dashboard - Ops / Service Management</label>
-              {renderDashboardMultiDropdown({
-                id: 'ops',
-                options: opsDashboardOptions,
-                selectedValues: form.opsDashboardTypes,
-                fieldName: 'opsDashboardTypes',
-                promptFieldName: 'opsDashboardPrompt',
-                disabled: selectedJsmProjectCount === 0,
-                emptyLabel: 'Choose service management dashboards',
-              })}
+          {selectedJsmProjectCount > 0 && (
+            <div style={{ ...optionalSectionStyle, marginTop: '16px', marginBottom: 0 }}>
+              <div style={{ ...fieldStyle, marginBottom: 0 }}>
+                <label style={labelStyle}>Dashboard - Ops / Service Management</label>
+                {renderDashboardMultiDropdown({
+                  id: 'ops',
+                  options: opsDashboardOptions,
+                  selectedValues: form.opsDashboardTypes,
+                  fieldName: 'opsDashboardTypes',
+                  promptFieldName: 'opsDashboardPrompt',
+                  emptyLabel: 'Choose service management dashboards',
+                })}
+              </div>
             </div>
-          </div>
+          )}
         </div>
 
         <div style={sectionStyle}>
@@ -2343,20 +2354,21 @@ function App() {
               </div>
             </div>
           ))}
-          <div style={{ ...optionalSectionStyle, marginTop: '16px', marginBottom: 0 }}>
-            <div style={{ ...fieldStyle, marginBottom: 0 }}>
-              <label style={labelStyle}>Dashboard - Software</label>
-              {renderDashboardMultiDropdown({
-                id: 'software',
-                options: softwareDashboardOptions,
-                selectedValues: form.softwareDashboardTypes,
-                fieldName: 'softwareDashboardTypes',
-                promptFieldName: 'softwareDashboardPrompt',
-                disabled: selectedSoftwareProjectCount === 0,
-                emptyLabel: 'Choose software dashboards',
-              })}
+          {selectedSoftwareProjectCount > 0 && (
+            <div style={{ ...optionalSectionStyle, marginTop: '16px', marginBottom: 0 }}>
+              <div style={{ ...fieldStyle, marginBottom: 0 }}>
+                <label style={labelStyle}>Dashboard - Software</label>
+                {renderDashboardMultiDropdown({
+                  id: 'software',
+                  options: softwareDashboardOptions,
+                  selectedValues: form.softwareDashboardTypes,
+                  fieldName: 'softwareDashboardTypes',
+                  promptFieldName: 'softwareDashboardPrompt',
+                  emptyLabel: 'Choose software dashboards',
+                })}
+              </div>
             </div>
-          </div>
+          )}
         </div>
 
         <button
