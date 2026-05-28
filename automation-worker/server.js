@@ -25,6 +25,18 @@ function createReleaseHeaders() {
   ];
 }
 
+app.get('/', (req, res) => {
+  res.type('text/plain').send([
+    'Jira demo data automation worker is running.',
+    '',
+    'Available endpoints:',
+    'GET  /health',
+    'POST /generate-demo',
+    '',
+    'Use POST /generate-demo to generate tickets.csv and release-versions.csv.',
+  ].join('\n'));
+});
+
 app.get('/health', (req, res) => {
   res.json({
     ok: true,
