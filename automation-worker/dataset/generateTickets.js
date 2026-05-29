@@ -100,7 +100,14 @@ function linkRecords(recordsByType) {
   }
 }
 
-export function generateTickets(input) {
+function selectBlueprintScenario(aiBlueprint, issueType, index) {
+  const scenarios = Array.isArray(aiBlueprint?.jsmScenarios) ? aiBlueprint.jsmScenarios : [];
+  const matching = scenarios.filter(scenario => scenario.issueType === issueType);
+  const pool = matching.length ? matching : scenarios;
+  return pool.length ? pool[index % pool.length] : null;
+}
+
+export function generateTickets(input, options = {}) {
   const normalizedInput = normaliseInput(input);
   const domain = getDomainContent(normalizedInput.industry);
   const releaseVersions = buildReleaseVersions({
@@ -112,22 +119,25 @@ export function generateTickets(input) {
 
   for (let index = 0; index < normalizedInput.ticketCount; index += 1) {
     const issueType = chooseWeightedIssueType(normalizedInput, index).label;
-    const priority = choosePriority(issueType, index);
+    const blueprintScenario = selectBlueprintScenario(options.aiBlueprint, issueType, index);
+    const priority = blueprintScenario?.priority || choosePriority(issueType, index);
     const createdDate = generateCreatedDate(issueType, normalizedInput.dateRange);
     const status = chooseStatus(index, issueType === 'Service Request' ? 0.82 : 0.72);
     const sla = getSlaForTicket(issueType, priority);
     const resolvedDate = status === 'Done'
       ? generateResolutionDate(createdDate, sla, { breachRate: priority === 'P1' ? 0.08 : 0.14 })
       : null;
-    const summary = buildDomainSummary(issueType, normalizedInput.industry, index);
+    const summary = blueprintScenario?.summary || buildDomainSummary(issueType, normalizedInput.industry, index);
     const issueKey = `${normalizedInput.project}-${index + 1}`;
     const version = selectVersionForTicket(releaseVersions, index, issueType);
-    const component = domain.components[index % domain.components.length];
-    const team = domain.teams[index % domain.teams.length];
+    const component = blueprintScenario?.component || domain.components[index % domain.components.length];
+    const team = blueprintScenario?.team || domain.teams[index % domain.teams.length];
     const record = {
       'Issue key': issueKey,
       'Issue id': index + 1,
       'Project key': normalizedInput.project,
+      'Project name': input.projectName || normalizedInput.project,
+      'Project type': input.projectType || 'service_desk',
       Summary: `${summary} #${index + 1}`,
       'Issue Type': issueType,
       Priority: priority,
@@ -141,7 +151,7 @@ export function generateTickets(input) {
       Causes: '',
       Relates: '',
       Blocks: '',
-      Description: buildDomainDescription({
+      Description: blueprintScenario?.description || buildDomainDescription({
         issueType,
         industry: normalizedInput.industry,
         component,

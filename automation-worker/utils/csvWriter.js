@@ -6,6 +6,8 @@ const CSV_HEADERS = [
   { id: 'Issue key', title: 'Issue key' },
   { id: 'Issue id', title: 'Issue id' },
   { id: 'Project key', title: 'Project key' },
+  { id: 'Project name', title: 'Project name' },
+  { id: 'Project type', title: 'Project type' },
   { id: 'Summary', title: 'Summary' },
   { id: 'Issue Type', title: 'Issue Type' },
   { id: 'Priority', title: 'Priority' },

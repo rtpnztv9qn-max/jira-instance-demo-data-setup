@@ -26,6 +26,11 @@ const demoDateFieldsByProjectCache = new Map();
 let demoDateFieldIdsCache = null;
 let formsDynamicSchemaRejected = false;
 const ACTIVE_TICKET_RETENTION_DAYS = 180;
+const WORKER_GENERATION_ENDPOINT = process.env.WORKER_GENERATION_ENDPOINT || 'http://localhost:4000/generate-demo';
+const WORKER_DATE_PATCH_ENDPOINT = process.env.WORKER_DATE_PATCH_ENDPOINT
+  || WORKER_GENERATION_ENDPOINT.replace(/\/generate-demo\/?$/, '/generate-date-patch');
+const ISSUE_CREATION_MODE = process.env.ISSUE_CREATION_MODE || 'rest-date-csv';
+const WORKER_FETCH_TIMEOUT_MS = 10000;
 const DASHBOARD_TEMPLATE_IDS = ['10000', '10671'];
 const MANAGED_DASHBOARD_GADGET_SLOT_COUNT = 6;
 const DEMO_DATE_FIELD_DEFINITIONS = {
@@ -725,6 +730,178 @@ async function executeAiContentGenerationStep(config, state) {
   }
 
   return config;
+}
+
+function isCsvIssueCreationMode() {
+  return String(ISSUE_CREATION_MODE || '').toLowerCase() === 'csv';
+}
+
+function isRestDatePatchMode() {
+  return ['rest-date-csv', 'hybrid', 'rest-csv-dates'].includes(String(ISSUE_CREATION_MODE || '').toLowerCase());
+}
+
+function formatCsvDateTime(value) {
+  if (!value) {
+    return '';
+  }
+
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) {
+    return '';
+  }
+
+  return [
+    date.getFullYear(),
+    '-',
+    pad(date.getMonth() + 1),
+    '-',
+    pad(date.getDate()),
+    ' ',
+    pad(date.getHours()),
+    ':',
+    pad(date.getMinutes()),
+  ].join('');
+}
+
+function addHistoricalDatePatchIssue(state, { key, summary, lifecycle, status }) {
+  if (!key || !lifecycle?.createdAt) {
+    return;
+  }
+
+  state.metadata.historicalDatePatchIssues = state.metadata.historicalDatePatchIssues || [];
+  const resolvedDate = isDoneLikeStatus(status || lifecycle.targetStatus)
+    ? lifecycle.resolutionDate || lifecycle.updatedAt || null
+    : null;
+
+  state.metadata.historicalDatePatchIssues.push({
+    'Issue key': key,
+    'Project key': String(key).split('-')[0],
+    Summary: summary || key,
+    Created: formatCsvDateTime(lifecycle.createdAt),
+    Resolved: formatCsvDateTime(resolvedDate),
+    Resolution: resolvedDate ? 'Done' : '',
+  });
+}
+
+async function forgeFetchWithTimeout(url, options = {}, timeoutMs = WORKER_FETCH_TIMEOUT_MS) {
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), timeoutMs);
+
+  try {
+    return await forgeFetch(url, {
+      ...options,
+      signal: controller.signal,
+    });
+  } catch (err) {
+    if (err?.name === 'AbortError') {
+      throw new Error(`Worker request timed out after ${timeoutMs / 1000}s`);
+    }
+
+    throw err;
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+
+function buildWorkerGenerationPayload(config, state = null) {
+  const jsmProjects = (state?.results?.jsmProjects || [])
+    .filter(project => project?.key)
+    .map(project => ({
+      projectKey: project.key,
+      projectName: project.name,
+    }));
+  const softwareProjects = (config.softwareProjects || []).map((projectConfig, index) => {
+    const createdProject = state?.results?.softwareProjects?.[index];
+    return {
+      ...projectConfig,
+      projectKey: createdProject?.key || projectConfig.projectKey,
+      projectName: createdProject?.name || projectConfig.projectName,
+    };
+  });
+
+  return {
+    environmentName: config.environmentName,
+    industry: config.industry,
+    customIndustry: config.customIndustry,
+    isCustomIndustry: config.isCustomIndustry,
+    dateRange: config.dateRange,
+    jsmProjectCount: config.jsmProjectCount,
+    incidentRequestsPerProject: config.itsmWorkCounts?.incidentRequestsPerProject || 0,
+    problemRequestsPerProject: config.itsmWorkCounts?.problemRequestsPerProject || 0,
+    changeRequestsPerProject: config.itsmWorkCounts?.changeRequestsPerProject || 0,
+    serviceRequestsPerProject: config.itsmWorkCounts?.serviceRequestsPerProject || 0,
+    jsmProjects,
+    softwareProjects,
+    opsDashboardTypes: config.opsDashboardTypes,
+    opsDashboardSelections: config.opsDashboardSelections,
+    softwareDashboardTypes: config.softwareDashboardTypes,
+    softwareDashboardSelections: config.softwareDashboardSelections,
+  };
+}
+
+async function executeWorkerDatasetGenerationStep(config, state) {
+  try {
+    const response = await forgeFetchWithTimeout(WORKER_GENERATION_ENDPOINT, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'ngrok-skip-browser-warning': 'true',
+      },
+      body: JSON.stringify(buildWorkerGenerationPayload(config, state)),
+    });
+    const text = await response.text();
+    const data = text ? JSON.parse(text) : {};
+
+    if (!response.ok || !data.success) {
+      throw new Error(data.message || `Worker returned ${response.status}`);
+    }
+
+    state.metadata.workerDataset = data;
+    const aiBlueprint = data.metadata?.aiBlueprint;
+    const aiBlueprintSummary = aiBlueprint
+      ? `Worker AI blueprint source: ${aiBlueprint.source}${aiBlueprint.model ? ` (${aiBlueprint.model})` : ''}.`
+      : 'Worker AI blueprint source: not returned.';
+    addChunkedDiagnostics(state, [
+      `Worker dataset generated: ${data.ticketCount || 0} CSV issue rows.`,
+      aiBlueprintSummary,
+      `Worker ticket CSV: ${data.ticketCsvPath || 'not returned'}`,
+      `Worker release CSV: ${data.releaseCsvPath || 'not returned'}`,
+      'CSV-first mode: Jira REST issue creation is skipped so historical Created/Resolved dates can come from CSV import.',
+    ]);
+  } catch (err) {
+    state.metadata.workerDataset = {
+      success: false,
+      message: err.message,
+    };
+    addChunkedDiagnostics(state, [
+      `Worker dataset generation skipped or failed: ${err.message}`,
+      'Existing Forge REST creation flow will continue for now until the worker is hosted and reachable from Forge.',
+    ]);
+  }
+}
+
+async function executeWorkerDatePatchGenerationStep(config, state) {
+  const issues = state.metadata.historicalDatePatchIssues || [];
+
+  if (issues.length === 0) {
+    state.metadata.workerDatePatch = {
+      success: false,
+      message: 'No REST-created issue keys were available for date patch CSV generation.',
+    };
+    addChunkedDiagnostics(state, ['Historical date patch CSV skipped: no REST-created issue keys were available.']);
+    return;
+  }
+
+  state.metadata.workerDatePatch = {
+    success: true,
+    ticketCount: issues.length,
+    browserDownload: true,
+  };
+  addChunkedDiagnostics(state, [
+    `Historical date patch CSV prepared in the app: ${issues.length} existing issue row(s).`,
+    'Use the Download Historical Date Patch CSV button in the app result.',
+    'Jira Cloud does not reliably allow importing the system Updated date; CSV import sets Updated to the import time.',
+  ]);
 }
 
 function getContent(industry) {
@@ -4876,6 +5053,8 @@ function createChunkedExecutionState(accountId) {
       dashboardPlan: null,
       dashboardPlans: [],
       dashboardCatalog: null,
+      historicalDatePatchIssues: [],
+      workerDatePatch: null,
       runLabel: createRunLabel(),
     },
     results: {
@@ -4905,6 +5084,7 @@ function buildChunkedExecutionPlan(config) {
     label: 'Generate AI demo content',
   }];
   const incidentCount = config.incidentsPerProject;
+  const csvIssueCreation = isCsvIssueCreationMode();
 
   for (let projectIndex = 0; projectIndex < config.jsmProjectCount; projectIndex++) {
     steps.push({
@@ -4931,14 +5111,16 @@ function buildChunkedExecutionPlan(config) {
       label: `Configure queues, request types, and knowledge base for JSM project ${projectIndex + 1}`,
     });
 
-    for (let start = 0; start < incidentCount; start += INCIDENT_BATCH_SIZE) {
-      steps.push({
-        type: 'create-business-incidents-batch',
-        projectIndex,
-        start,
-        count: Math.min(INCIDENT_BATCH_SIZE, incidentCount - start),
-        label: `Create ITSM work items ${start + 1}-${Math.min(start + INCIDENT_BATCH_SIZE, incidentCount)} for JSM project ${projectIndex + 1}`,
-      });
+    if (!csvIssueCreation) {
+      for (let start = 0; start < incidentCount; start += INCIDENT_BATCH_SIZE) {
+        steps.push({
+          type: 'create-business-incidents-batch',
+          projectIndex,
+          start,
+          count: Math.min(INCIDENT_BATCH_SIZE, incidentCount - start),
+          label: `Create ITSM work items ${start + 1}-${Math.min(start + INCIDENT_BATCH_SIZE, incidentCount)} for JSM project ${projectIndex + 1}`,
+        });
+      }
     }
   }
 
@@ -4976,15 +5158,17 @@ function buildChunkedExecutionPlan(config) {
       });
     }
 
-    const epicCount = getConfiguredContent(config).epics.length;
-    for (let start = 0; start < epicCount; start += EPIC_BATCH_SIZE) {
-      steps.push({
-        type: 'create-software-epics-batch',
-        projectIndex,
-        start,
-        count: Math.min(EPIC_BATCH_SIZE, epicCount - start),
-        label: `Create epics ${start + 1}-${Math.min(start + EPIC_BATCH_SIZE, epicCount)} for software project ${projectIndex + 1}`,
-      });
+    if (!csvIssueCreation) {
+      const epicCount = getConfiguredContent(config).epics.length;
+      for (let start = 0; start < epicCount; start += EPIC_BATCH_SIZE) {
+        steps.push({
+          type: 'create-software-epics-batch',
+          projectIndex,
+          start,
+          count: Math.min(EPIC_BATCH_SIZE, epicCount - start),
+          label: `Create epics ${start + 1}-${Math.min(start + EPIC_BATCH_SIZE, epicCount)} for software project ${projectIndex + 1}`,
+        });
+      }
     }
 
     steps.push({
@@ -4993,17 +5177,19 @@ function buildChunkedExecutionPlan(config) {
       label: `Find ${softwareTemplate === 'kanban' ? 'Kanban' : 'Scrum'} board for software project ${projectIndex + 1}`,
     });
 
-    for (let start = 0; start < issueCount; start += ISSUE_BATCH_SIZE) {
-      steps.push({
-        type: 'create-software-issues-batch',
-        projectIndex,
-        start,
-        count: Math.min(ISSUE_BATCH_SIZE, issueCount - start),
-        label: `Create issues ${start + 1}-${Math.min(start + ISSUE_BATCH_SIZE, issueCount)} for software project ${projectIndex + 1}`,
-      });
+    if (!csvIssueCreation) {
+      for (let start = 0; start < issueCount; start += ISSUE_BATCH_SIZE) {
+        steps.push({
+          type: 'create-software-issues-batch',
+          projectIndex,
+          start,
+          count: Math.min(ISSUE_BATCH_SIZE, issueCount - start),
+          label: `Create issues ${start + 1}-${Math.min(start + ISSUE_BATCH_SIZE, issueCount)} for software project ${projectIndex + 1}`,
+        });
+      }
     }
 
-    if (usesScrumTemplate) {
+    if (!csvIssueCreation && usesScrumTemplate) {
       for (let sprintIndex = 0; sprintIndex < config.sprintsPerProject; sprintIndex++) {
         steps.push({
           type: 'create-software-sprint',
@@ -5015,10 +5201,24 @@ function buildChunkedExecutionPlan(config) {
     }
   }
 
-  steps.push({
-    type: 'create-dependencies',
-    label: 'Create links between the sample projects',
-  });
+  if (csvIssueCreation) {
+    steps.push({
+      type: 'generate-worker-dataset',
+      label: 'Generate CSV-ready historical dataset with real project keys',
+    });
+  } else {
+    steps.push({
+      type: 'create-dependencies',
+      label: 'Create links between the sample projects',
+    });
+
+    if (isRestDatePatchMode()) {
+      steps.push({
+        type: 'generate-worker-date-patch',
+        label: 'Generate CSV date patch for REST-created issues',
+      });
+    }
+  }
 
   steps.push({
     type: 'prepare-dashboard-catalog',
@@ -5395,6 +5595,12 @@ async function executeBusinessIncidentBatchStep(config, state, step) {
         workType: workItem.workType,
         requestTypeName,
       };
+      addHistoricalDatePatchIssue(state, {
+        key: created.key,
+        summary: workItem.title,
+        lifecycle: lifecycleForStatus,
+        status: targetStatus,
+      });
       project.incidents.push(createdItem);
       project.itsmWorkItems = [...(project.itsmWorkItems || []), createdItem];
       state.results.totalIncidents++;
@@ -5574,6 +5780,12 @@ async function executeSoftwareEpicBatchStep(config, state, step) {
         retentionPeriodDays: config.retentionPeriodDays,
       });
       project.epicKeys.push(epic.key);
+      addHistoricalDatePatchIssue(state, {
+        key: epic.key,
+        summary: epicName,
+        lifecycle,
+        status: lifecycle.targetStatus,
+      });
     } catch (err) {
       addChunkedError(state, `Epic "${epicName}" for ${project.key}: ${err.message}`);
     }
@@ -5668,6 +5880,13 @@ async function executeSoftwareIssueBatchStep(config, state, step) {
       if (!project.firstIssueKey) {
         project.firstIssueKey = issue.key;
       }
+
+      addHistoricalDatePatchIssue(state, {
+        key: issue.key,
+        summary: template.title,
+        lifecycle: lifecycleForStatus,
+        status,
+      });
 
       if (status !== 'To Do') {
         await transitionIssue(issue.key, status);
@@ -6591,6 +6810,11 @@ function validateGeneratedVolumeAccuracy(config, state) {
     return;
   }
 
+  if (isCsvIssueCreationMode()) {
+    state.metadata.volumeValidationComplete = true;
+    return;
+  }
+
   const createdJsmProjects = state.results.jsmProjects.filter(project => project?.key && !project.failed);
   const expectedItsmPerProject = config.incidentsPerProject;
 
@@ -6666,6 +6890,9 @@ function buildChunkedSummary(config, state) {
     ...results.softwareProjects.map(project => project.key),
   ].filter(Boolean);
   const automationBlueprints = buildAutomationBlueprints(projectKeys);
+  const workerDataset = state.metadata.workerDataset;
+  const workerDatePatch = state.metadata.workerDatePatch;
+  const workerAiBlueprint = workerDataset?.metadata?.aiBlueprint;
   const lines = [
     hasProjects
       ? `"${config.environmentName}" demo environment created successfully.`
@@ -6681,6 +6908,13 @@ function buildChunkedSummary(config, state) {
     `- Dev Project Management: ${softwareStyleSummary}`,
     `- Sprints per Scrum Software Project: ${scrumProjectCount > 0 ? config.sprintsPerProject : 0}`,
     `- Ticket Lifecycle: archive generated tickets after 6 months, then delete them after 1 year in archived state`,
+    `- Issue Creation Mode: ${isCsvIssueCreationMode() ? 'CSV-first historical import' : isRestDatePatchMode() ? 'Forge REST creation + CSV date patch' : 'Forge REST issue creation'}`,
+    ...(isCsvIssueCreationMode()
+      ? [
+          `- Historical CSV Rows Generated: ${workerDataset?.success ? (workerDataset.ticketCount || 0) : 'Not generated'}`,
+          `- Worker AI Blueprint: ${workerAiBlueprint?.source || 'Not confirmed'}${workerAiBlueprint?.model ? ` (${workerAiBlueprint.model})` : ''}`,
+        ]
+      : []),
     `- Dashboards: ${dashboards.length > 0 ? `${dashboards.length} created` : 'Not created'}`,
     `- Dashboard Template: ${results.dashboardTemplateId || 'Generated gadget layout'}`,
     `- Saved Filters: ${savedFilters.length > 0 ? `${savedFilters.length} auto-created` : 'Auto-created filter not available'}`,
@@ -6691,7 +6925,7 @@ function buildChunkedSummary(config, state) {
 
   if (createdJsmProjects.length > 0) {
     lines.push('JSM ITSM Projects Created:');
-    lines.push(...createdJsmProjects.map(project => `- ${project.key}: ${project.name} (${project.incidents.length} ITSM work items)`));
+    lines.push(...createdJsmProjects.map(project => `- ${project.key}: ${project.name} (${isCsvIssueCreationMode() ? 'CSV import pending' : `${project.incidents.length} ITSM work items`})`));
     const projectsWithForms = createdJsmProjects.filter(project => project.smartForm?.name);
     if (projectsWithForms.length > 0) {
       lines.push('');
@@ -6714,7 +6948,7 @@ function buildChunkedSummary(config, state) {
 
   if (results.softwareProjects.length > 0) {
     lines.push('Software Projects Created:');
-    lines.push(...results.softwareProjects.map(project => `- ${project.key}: ${project.name} (${project.issueCount} issues, ${getProjectManagementStyleLabel(project.softwareProjectStyle)}, board ${project.boardId || 'pending'})`));
+    lines.push(...results.softwareProjects.map(project => `- ${project.key}: ${project.name} (${isCsvIssueCreationMode() ? 'CSV import pending' : `${project.issueCount} issues`}, ${getProjectManagementStyleLabel(project.softwareProjectStyle)}, board ${project.boardId || 'pending'})`));
     const softwareProjectsWithForms = results.softwareProjects.filter(project => project.smartForm?.name);
     if (softwareProjectsWithForms.length > 0) {
       lines.push('');
@@ -6733,6 +6967,32 @@ function buildChunkedSummary(config, state) {
   if (savedFilters.length > 0) {
     lines.push('Saved Filters Ready:');
     lines.push(...savedFilters.map(filter => `- ${filter.name} (${filter.id})${filter.viewUrl ? ` - ${filter.viewUrl}` : ''}`));
+    lines.push('');
+  }
+
+  if (isCsvIssueCreationMode()) {
+    lines.push('Historical CSV Import Required:');
+    if (workerDataset?.success) {
+      lines.push(`- Ticket CSV: ${workerDataset.ticketCsvPath || 'worker path not returned'}`);
+      lines.push(`- Release CSV: ${workerDataset.releaseCsvPath || 'worker path not returned'}`);
+      lines.push('- Import this CSV through Jira External System Import to create issues with historical Created and Resolved dates.');
+      lines.push('- Forge REST issue creation was skipped to avoid Jira stamping today as Created/Updated.');
+    } else {
+      lines.push(`- Worker dataset was not generated: ${workerDataset?.message || 'worker result not available'}`);
+    }
+    lines.push('');
+  }
+
+  if (isRestDatePatchMode()) {
+    lines.push('Historical Date Patch CSV:');
+    if (workerDatePatch?.success) {
+      lines.push(`- Rows: ${workerDatePatch.ticketCount || 0} existing Jira issues`);
+      lines.push('- Download it from the app using the Historical Date Patch CSV button.');
+      lines.push('- Import this small CSV through Jira External System Import to update existing issue Created and Resolved dates.');
+      lines.push('- Jira Cloud does not reliably import the system Updated date; it is normally set to the import/update time.');
+    } else {
+      lines.push(`- Date patch CSV was not generated: ${workerDatePatch?.message || 'worker result not available'}`);
+    }
     lines.push('');
   }
 
@@ -6840,6 +7100,12 @@ resolver.define('executeDemoEnvironmentStep', async ({ payload }) => {
   switch (step.type) {
     case 'generate-ai-content':
       config = await executeAiContentGenerationStep(config, state);
+      break;
+    case 'generate-worker-dataset':
+      await executeWorkerDatasetGenerationStep(config, state);
+      break;
+    case 'generate-worker-date-patch':
+      await executeWorkerDatePatchGenerationStep(config, state);
       break;
     case 'create-business-project':
       await executeBusinessProjectStep(config, state, step);

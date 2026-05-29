@@ -28,6 +28,11 @@ export function parsePositiveInt(value, fallback) {
   return Number.isFinite(parsed) && parsed > 0 ? parsed : fallback;
 }
 
+export function parseNonNegativeInt(value, fallback) {
+  const parsed = Number.parseInt(value, 10);
+  return Number.isFinite(parsed) && parsed >= 0 ? parsed : fallback;
+}
+
 export function getDateRangeDays(value) {
   return DATE_RANGES[value] || DATE_RANGES[DEFAULT_INPUT.dateRange];
 }
@@ -38,10 +43,10 @@ export function normaliseInput(input = {}) {
     ticketCount: parsePositiveInt(input.ticketCount, DEFAULT_INPUT.ticketCount),
     dateRange: String(input.dateRange || DEFAULT_INPUT.dateRange),
     industry: String(input.industry || DEFAULT_INPUT.industry).trim() || DEFAULT_INPUT.industry,
-    incidentRatio: parsePositiveInt(input.incidentRatio, DEFAULT_INPUT.incidentRatio),
-    serviceRequestRatio: parsePositiveInt(input.serviceRequestRatio, DEFAULT_INPUT.serviceRequestRatio),
-    problemRatio: parsePositiveInt(input.problemRatio, DEFAULT_INPUT.problemRatio),
-    changeRatio: parsePositiveInt(input.changeRatio, DEFAULT_INPUT.changeRatio),
+    incidentRatio: parseNonNegativeInt(input.incidentRatio, DEFAULT_INPUT.incidentRatio),
+    serviceRequestRatio: parseNonNegativeInt(input.serviceRequestRatio, DEFAULT_INPUT.serviceRequestRatio),
+    problemRatio: parseNonNegativeInt(input.problemRatio, DEFAULT_INPUT.problemRatio),
+    changeRatio: parseNonNegativeInt(input.changeRatio, DEFAULT_INPUT.changeRatio),
   };
 }
 
@@ -54,6 +59,9 @@ export function chooseWeightedIssueType(input, index) {
   ].filter(item => item.weight > 0);
 
   const totalWeight = entries.reduce((total, item) => total + item.weight, 0);
+  if (!totalWeight) {
+    return { key: 'incident', label: ISSUE_TYPES.incident, weight: 1 };
+  }
   const bucket = (index * 37) % totalWeight;
   let cursor = 0;
 

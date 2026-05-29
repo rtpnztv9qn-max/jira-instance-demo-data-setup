@@ -17,6 +17,25 @@ Create `.env` from `.env.example`, then authenticate Playwright once:
 npm run auth:login
 ```
 
+## AI Blueprint Generation
+
+The worker can use OpenAI to create a domain-specific demo blueprint before it
+writes the CSV. The blueprint gives the deterministic generator realistic
+services, components, teams, issue themes, relationship hints, release themes,
+and dashboard KPI intent.
+
+Add this to `.env` to enable it:
+
+```dotenv
+OPENAI_API_KEY=your-openai-api-key
+OPENAI_MODEL=gpt-4.1-mini
+OPENAI_TIMEOUT_MS=20000
+```
+
+If `OPENAI_API_KEY` is blank, the worker still runs and uses the local fallback
+templates. Jira creation, CSV formatting, dates, links, versions, and dashboard
+execution remain deterministic so the generated data stays valid.
+
 Generate an import-ready CSV:
 
 ```powershell
@@ -64,6 +83,12 @@ Run the Jira CSV import automation:
 npm run import:csv
 ```
 
+Before running the import automation, verify Jira login and import wizard access:
+
+```powershell
+npm run verify:import
+```
+
 Run both generation and import:
 
 ```powershell
@@ -87,6 +112,9 @@ Generate a dataset through the API:
 ```powershell
 Invoke-RestMethod -Method Post -Uri http://localhost:4000/generate-demo -ContentType "application/json" -Body '{"project":"ITSM","ticketCount":500,"dateRange":"6_months","industry":"healthcare","incidentRatio":60,"serviceRequestRatio":25,"problemRatio":10,"changeRatio":5}'
 ```
+
+The API response includes `metadata.aiBlueprint`. Use it to confirm whether the
+worker used OpenAI or the local fallback.
 
 ## Relationship Model
 

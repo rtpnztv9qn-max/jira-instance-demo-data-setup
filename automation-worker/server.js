@@ -2,6 +2,7 @@ import cors from 'cors';
 import dotenv from 'dotenv';
 import express from 'express';
 import { buildReleaseCatalogRecords } from './dataset/releaseVersions.js';
+import { generateFromForgePayload } from './dataset/generateFromForgePayload.js';
 import { generateTickets } from './dataset/generateTickets.js';
 import { writeRecordsCsv, writeTicketsCsv } from './utils/csvWriter.js';
 import { info } from './utils/logger.js';
@@ -49,7 +50,10 @@ app.post('/generate-demo', async (req, res) => {
     const payload = req.body || {};
     const outputPath = payload.output || process.env.CSV_OUTPUT || 'exports/tickets.csv';
     const releaseOutputPath = payload.releaseOutput || process.env.RELEASE_CSV_OUTPUT || 'exports/release-versions.csv';
-    const { tickets, releaseVersions } = generateTickets(payload);
+    const generated = payload.environmentName || payload.softwareProjects || payload.jsmProjectCount
+      ? await generateFromForgePayload(payload)
+      : generateTickets(payload);
+    const { tickets, releaseVersions } = generated;
     const ticketCsvPath = await writeTicketsCsv(tickets, outputPath);
     const releaseCsvPath = await writeRecordsCsv(
       buildReleaseCatalogRecords(releaseVersions),
@@ -62,6 +66,7 @@ app.post('/generate-demo', async (req, res) => {
       project: payload.project,
       industry: payload.industry,
       dateRange: payload.dateRange,
+      aiBlueprint: generated.metadata?.aiBlueprint || null,
     });
 
     res.json({
@@ -75,6 +80,50 @@ app.post('/generate-demo', async (req, res) => {
         releaseDate: version.releaseDate,
         issueCount: version.issueKeys.length,
       })),
+      metadata: generated.metadata || null,
+    });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({
+      success: false,
+      message: err.message,
+    });
+  }
+});
+
+app.post('/generate-date-patch', async (req, res) => {
+  try {
+    const payload = req.body || {};
+    const outputPath = payload.output || process.env.DATE_PATCH_CSV_OUTPUT || 'exports/date-patch-tickets.csv';
+    const issues = Array.isArray(payload.issues) ? payload.issues : [];
+    const records = issues
+      .filter(issue => issue?.['Issue key'] || issue?.issueKey || issue?.key)
+      .map(issue => ({
+        'Issue key': issue['Issue key'] || issue.issueKey || issue.key,
+        'Project key': issue['Project key'] || issue.projectKey || String(issue['Issue key'] || issue.issueKey || issue.key).split('-')[0],
+        Summary: issue.Summary || issue.summary || issue.title || issue.key,
+        Created: issue.Created || issue.created || '',
+        Resolved: issue.Resolved || issue.resolved || '',
+        Resolution: issue.Resolution || issue.resolution || '',
+      }));
+    const ticketCsvPath = await writeRecordsCsv(records, outputPath, [
+      { id: 'Issue key', title: 'Issue key' },
+      { id: 'Project key', title: 'Project key' },
+      { id: 'Summary', title: 'Summary' },
+      { id: 'Created', title: 'Created' },
+      { id: 'Resolved', title: 'Resolved' },
+      { id: 'Resolution', title: 'Resolution' },
+    ]);
+
+    info('Generated date patch CSV from API request', {
+      ticketCount: records.length,
+      environmentName: payload.environmentName,
+    });
+
+    res.json({
+      success: true,
+      ticketCount: records.length,
+      ticketCsvPath,
     });
   } catch (err) {
     console.error(err);

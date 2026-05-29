@@ -1605,6 +1605,7 @@ function App() {
   const [result, setResult] = useState('');
   const [isSuccess, setIsSuccess] = useState(false);
   const [progress, setProgress] = useState('');
+  const [datePatchRows, setDatePatchRows] = useState([]);
   const [openDashboardPicker, setOpenDashboardPicker] = useState(null);
 
   const [form, setForm] = useState({
@@ -1687,6 +1688,7 @@ function App() {
     setLoading(true);
     setResult('');
     setIsSuccess(false);
+    setDatePatchRows([]);
     setProgress('Preparing the demo environment plan...');
 
     try {
@@ -1776,10 +1778,12 @@ function App() {
       setProgress('');
       setResult(res.summary);
       setIsSuccess(res.success);
+      setDatePatchRows(currentState?.metadata?.historicalDatePatchIssues || []);
     } catch (err) {
       setProgress('');
       setResult('Error: ' + err.message);
       setIsSuccess(false);
+      setDatePatchRows([]);
     }
 
     setLoading(false);
@@ -1840,6 +1844,31 @@ function App() {
     borderRadius: '4px',
     boxSizing: 'border-box',
     transition: 'border-color 0.2s',
+  };
+
+  const escapeCsvValue = (value) => {
+    const text = String(value ?? '');
+    if (/[",\r\n]/.test(text)) {
+      return `"${text.replace(/"/g, '""')}"`;
+    }
+    return text;
+  };
+
+  const downloadDatePatchCsv = () => {
+    const headers = ['Issue key', 'Project key', 'Summary', 'Created', 'Resolved', 'Resolution'];
+    const csv = [
+      headers.join(','),
+      ...datePatchRows.map(row => headers.map(header => escapeCsvValue(row[header])).join(',')),
+    ].join('\r\n');
+    const blob = new Blob([csv], { type: 'text/csv;charset=utf-8' });
+    const url = URL.createObjectURL(blob);
+    const link = document.createElement('a');
+    link.href = url;
+    link.download = `${form.environmentName || 'demo'}-date-patch-tickets.csv`.replace(/[^a-z0-9_.-]+/gi, '-');
+    document.body.appendChild(link);
+    link.click();
+    document.body.removeChild(link);
+    URL.revokeObjectURL(url);
   };
 
   const selectStyle = {
@@ -2382,6 +2411,16 @@ function App() {
         </button>
 
         {progress && <div style={progressStyle}>{progress}</div>}
+
+        {datePatchRows.length > 0 && (
+          <button
+            type="button"
+            onClick={downloadDatePatchCsv}
+            style={{ ...buttonStyle, marginTop: '16px', backgroundColor: '#172b4d' }}
+          >
+            Download Historical Date Patch CSV
+          </button>
+        )}
 
         {result && <div style={resultStyle}>{result}</div>}
       </div>
