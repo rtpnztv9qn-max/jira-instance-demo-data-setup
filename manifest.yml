@@ -49,6 +49,8 @@ permissions:
     - write:space:confluence
     - read:page:confluence
     - write:page:confluence
+    - read:component:compass
+    - write:component:compass
     - storage:app
   external:
     fetch:

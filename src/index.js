@@ -35,6 +35,8 @@ const ISSUE_CREATION_MODE = process.env.ISSUE_CREATION_MODE || 'rest';
 const WORKER_FETCH_TIMEOUT_MS = 10000;
 const GITHUB_DEMO_ACTIVITY_ENABLED = String(process.env.GITHUB_DEMO_ACTIVITY_ENABLED || 'true').toLowerCase() !== 'false';
 const GITHUB_DEMO_ACTIVITY_PER_PROJECT = Math.max(1, Math.min(Number(process.env.GITHUB_DEMO_ACTIVITY_PER_PROJECT) || 3, 5));
+const COMPASS_DEMO_COMPONENTS_ENABLED = String(process.env.COMPASS_DEMO_COMPONENTS_ENABLED || 'true').toLowerCase() !== 'false';
+const GOALS_DEMO_ENABLED = String(process.env.GOALS_DEMO_ENABLED || 'true').toLowerCase() !== 'false';
 const DASHBOARD_TEMPLATE_IDS = ['10000', '10671'];
 const MANAGED_DASHBOARD_GADGET_SLOT_COUNT = 6;
 const DEMO_DATE_FIELD_DEFINITIONS = {
@@ -1383,6 +1385,62 @@ async function confluencePost(path, body) {
   }
 }
 
+async function requestAtlassianGraph(query, variables = {}) {
+  const response = await api.asUser().requestGraph(query, variables);
+
+  if (response && typeof response.json === 'function') {
+    const data = await response.json();
+    if (!response.ok) {
+      throw new Error(`GraphQL request failed: ${response.status} ${JSON.stringify(data)}`);
+    }
+    if (Array.isArray(data.errors) && data.errors.length > 0) {
+      throw new Error(data.errors.map(error => error.message || JSON.stringify(error)).join('; '));
+    }
+    return data.data || data;
+  }
+
+  if (response?.errors?.length) {
+    throw new Error(response.errors.map(error => error.message || JSON.stringify(error)).join('; '));
+  }
+
+  return response?.data || response;
+}
+
+async function getCurrentSiteDetails() {
+  const serverInfo = await jiraGet('/rest/api/3/serverInfo');
+  const baseUrl = String(serverInfo.baseUrl || process.env.ATLASSIAN_SITE_URL || '').replace(/\/$/, '');
+  const hostName = baseUrl ? new URL(baseUrl).host : String(process.env.ATLASSIAN_SITE_HOSTNAME || '').replace(/^https?:\/\//, '').replace(/\/$/, '');
+  return {
+    baseUrl,
+    hostName,
+  };
+}
+
+async function resolveAtlassianCloudId() {
+  const configuredCloudId = String(process.env.ATLASSIAN_CLOUD_ID || process.env.COMPASS_CLOUD_ID || '').trim();
+  if (configuredCloudId) {
+    return configuredCloudId;
+  }
+
+  const { hostName } = await getCurrentSiteDetails();
+  if (!hostName) {
+    throw new Error('Unable to resolve Atlassian site hostname for GraphQL cloudId lookup.');
+  }
+
+  const data = await requestAtlassianGraph(`
+    query getCloudId($hostName: String!) {
+      tenantContexts(hostNames: [$hostName]) {
+        cloudId
+      }
+    }
+  `, { hostName });
+  const cloudId = data?.tenantContexts?.[0]?.cloudId;
+  if (!cloudId) {
+    throw new Error(`Atlassian GraphQL did not return a cloudId for ${hostName}.`);
+  }
+  return cloudId;
+}
+
 function getGitHubDemoConfig() {
   const owner = String(process.env.GITHUB_OWNER || '').trim();
   const repo = String(process.env.GITHUB_REPO || '').trim();
@@ -2666,6 +2724,109 @@ function chooseSoftwareComponentNames(project, issueIndex, issueType) {
   }
 
   return names.filter(Boolean).slice(0, 2);
+}
+
+function getCompassComponentTemplates(config, project) {
+  const environmentSlug = slugifyGitHubPart(config.environmentName, 'environment');
+  const projectSlug = slugifyGitHubPart(project.key, 'project');
+  const industryName = toTitleCase(config.industry || 'Business');
+  return [
+    {
+      name: `${config.environmentName} ${project.key} Delivery Service`,
+      typeId: 'SERVICE',
+      key: `${environmentSlug}-${projectSlug}-delivery-service`,
+      description: `${industryName} delivery service for ${project.name}.`,
+    },
+    {
+      name: `${config.environmentName} ${project.key} Release Pipeline`,
+      typeId: 'APPLICATION',
+      key: `${environmentSlug}-${projectSlug}-release-pipeline`,
+      description: `${industryName} release pipeline for ${project.name}.`,
+    },
+  ];
+}
+
+async function createCompassComponent(cloudId, componentDetails) {
+  const data = await requestAtlassianGraph(`
+    mutation createComponent($cloudId: ID!, $componentDetails: CreateCompassComponentInput!) {
+      compass {
+        createComponent(cloudId: $cloudId, input: $componentDetails) {
+          success
+          componentDetails {
+            id
+            name
+            typeId
+          }
+        }
+      }
+    }
+  `, {
+    cloudId,
+    componentDetails: {
+      name: componentDetails.name,
+      typeId: componentDetails.typeId,
+    },
+  });
+
+  const result = data?.compass?.createComponent;
+  if (!result?.success) {
+    throw new Error(`Compass createComponent did not return success for ${componentDetails.name}.`);
+  }
+  return result.componentDetails;
+}
+
+function getGoalTypeAri(cloudId) {
+  const fullAri = String(process.env.ATLASSIAN_GOAL_TYPE_ARI || process.env.GOALS_GOAL_TYPE_ARI || '').trim();
+  if (fullAri) {
+    return fullAri;
+  }
+
+  const activationId = String(process.env.ATLASSIAN_GOAL_ACTIVATION_ID || process.env.GOALS_ACTIVATION_ID || '').trim();
+  const goalTypeId = String(process.env.ATLASSIAN_GOAL_TYPE_ID || process.env.GOALS_GOAL_TYPE_ID || '').trim();
+  if (activationId && goalTypeId) {
+    return `ari:cloud:goal:${cloudId}:goal-type/${activationId}/${goalTypeId}`;
+  }
+
+  return '';
+}
+
+async function createAtlassianGoal(cloudId, name, targetDate) {
+  const goalTypeAri = getGoalTypeAri(cloudId);
+  if (!goalTypeAri) {
+    throw new Error('configure ATLASSIAN_GOAL_TYPE_ARI, or ATLASSIAN_GOAL_ACTIVATION_ID and ATLASSIAN_GOAL_TYPE_ID.');
+  }
+
+  const containerId = `ari:cloud:townsquare::site/${cloudId}`;
+  const data = await requestAtlassianGraph(`
+    mutation CreateGoal($containerId: ID!, $name: String!, $goalTypeId: ID!) {
+      goals_create(
+        input: {
+          containerId: $containerId
+          name: $name
+          goalTypeId: $goalTypeId
+          targetDate: {
+            date: "${targetDate}"
+            confidence: QUARTER
+          }
+        }
+      ) {
+        goal {
+          id
+          name
+        }
+      }
+    }
+  `, {
+    containerId,
+    name,
+    goalTypeId: goalTypeAri,
+  });
+
+  const goal = data?.goals_create?.goal;
+  if (!goal?.id) {
+    throw new Error(`Goals API did not return a created goal for ${name}.`);
+  }
+  return goal;
 }
 
 async function createEpic(projectKey, epicName, options = {}) {
@@ -5587,6 +5748,8 @@ function createChunkedExecutionState(accountId) {
       githubActivity: [],
       dashboards: [],
       savedFilters: [],
+      compassComponents: [],
+      atlassianGoals: [],
       totalIncidents: 0,
       totalIssues: 0,
       dashboardId: null,
@@ -5691,6 +5854,16 @@ function buildChunkedExecutionPlan(config) {
       type: 'create-software-components',
       projectIndex,
       label: `Create components for software project ${projectIndex + 1}`,
+    });
+    steps.push({
+      type: 'create-compass-components',
+      projectIndex,
+      label: `Create Compass components for software project ${projectIndex + 1}`,
+    });
+    steps.push({
+      type: 'create-atlassian-goals',
+      projectIndex,
+      label: `Create Atlassian Goals for software project ${projectIndex + 1}`,
     });
 
     if (!csvIssueCreation) {
@@ -6353,6 +6526,91 @@ async function executeSoftwareComponentsStep(config, state, step) {
         addChunkedDiagnostics(state, [`Component ${project.key}: create skipped for ${componentName}: ${message}`]);
       }
     }
+  }
+}
+
+async function executeCompassComponentsStep(config, state, step) {
+  const project = state.results.softwareProjects[step.projectIndex];
+  if (!project?.key) {
+    addChunkedDiagnostics(state, [`Compass ${step.projectIndex + 1}: skipped because the software project was not created.`]);
+    return;
+  }
+
+  if (!COMPASS_DEMO_COMPONENTS_ENABLED) {
+    if (!state.metadata.compassConfigWarningShown) {
+      addChunkedDiagnostics(state, ['Compass components skipped: COMPASS_DEMO_COMPONENTS_ENABLED=false.']);
+      state.metadata.compassConfigWarningShown = true;
+    }
+    return;
+  }
+
+  try {
+    const cloudId = await resolveAtlassianCloudId();
+    const templates = getCompassComponentTemplates(config, project);
+
+    for (const template of templates) {
+      try {
+        const component = await createCompassComponent(cloudId, template);
+        const record = {
+          id: component.id,
+          name: component.name || template.name,
+          typeId: component.typeId || template.typeId,
+          projectKey: project.key,
+        };
+        project.compassComponents = project.compassComponents || [];
+        project.compassComponents.push(record);
+        state.results.compassComponents.push(record);
+        addChunkedDiagnostics(state, [`Compass ${project.key}: created ${record.name} (${record.typeId}).`]);
+      } catch (componentErr) {
+        addChunkedDiagnostics(state, [`Compass ${project.key}: component "${template.name}" skipped: ${componentErr.message}`]);
+      }
+    }
+  } catch (err) {
+    addChunkedDiagnostics(state, [`Compass ${project.key}: skipped: ${err.message}`]);
+  }
+}
+
+async function executeAtlassianGoalsStep(config, state, step) {
+  const project = state.results.softwareProjects[step.projectIndex];
+  if (!project?.key) {
+    addChunkedDiagnostics(state, [`Goals ${step.projectIndex + 1}: skipped because the software project was not created.`]);
+    return;
+  }
+
+  if (!GOALS_DEMO_ENABLED) {
+    if (!state.metadata.goalsConfigWarningShown) {
+      addChunkedDiagnostics(state, ['Atlassian Goals skipped: GOALS_DEMO_ENABLED=false.']);
+      state.metadata.goalsConfigWarningShown = true;
+    }
+    return;
+  }
+
+  try {
+    const cloudId = await resolveAtlassianCloudId();
+    const goalTypeAri = getGoalTypeAri(cloudId);
+    if (!goalTypeAri) {
+      if (!state.metadata.goalsConfigWarningShown) {
+        addChunkedDiagnostics(state, ['Atlassian Goals skipped: configure ATLASSIAN_GOAL_TYPE_ARI, or ATLASSIAN_GOAL_ACTIVATION_ID and ATLASSIAN_GOAL_TYPE_ID.']);
+        state.metadata.goalsConfigWarningShown = true;
+      }
+      return;
+    }
+
+    const targetDate = createShiftedDate(90 + (step.projectIndex * 30)).toISOString().split('T')[0];
+    const goalName = `${config.environmentName} ${project.key} delivery goal`;
+    const goal = await createAtlassianGoal(cloudId, goalName, targetDate);
+    const record = {
+      id: goal.id,
+      name: goal.name || goalName,
+      projectKey: project.key,
+      targetDate,
+    };
+    project.atlassianGoals = project.atlassianGoals || [];
+    project.atlassianGoals.push(record);
+    state.results.atlassianGoals.push(record);
+    addChunkedDiagnostics(state, [`Goal ${project.key}: created "${record.name}" (${targetDate}).`]);
+  } catch (err) {
+    addChunkedDiagnostics(state, [`Goal ${project.key}: skipped: ${err.message}`]);
   }
 }
 
@@ -7713,6 +7971,8 @@ function buildChunkedSummary(config, state) {
   const savedFilters = results.savedFilters?.filter(Boolean) || [];
   const confluenceSpaces = results.confluenceSpaces?.filter(space => space?.success) || [];
   const githubActivity = results.githubActivity?.filter(Boolean) || [];
+  const compassComponents = results.compassComponents?.filter(Boolean) || [];
+  const atlassianGoals = results.atlassianGoals?.filter(Boolean) || [];
   const projectKeys = [
     ...createdJsmProjects.map(project => project.key),
     ...results.softwareProjects.map(project => project.key),
@@ -7758,6 +8018,8 @@ function buildChunkedSummary(config, state) {
     `- Saved Filters: ${savedFilters.length > 0 ? `${savedFilters.length} auto-created` : 'Auto-created filter not available'}`,
     `- Knowledge Bases: ${confluenceSpaces.length > 0 ? `${confluenceSpaces.length} Confluence space(s) created` : 'Not created'}`,
     `- GitHub Development Activity: ${githubActivity.length > 0 ? `${githubActivity.length} linked branch/commit/PR/deployment item(s) created` : 'Not created or not configured'}`,
+    `- Compass Components: ${compassComponents.length > 0 ? `${compassComponents.length} created` : 'Not created or not configured'}`,
+    `- Atlassian Goals: ${atlassianGoals.length > 0 ? `${atlassianGoals.length} created` : 'Not created or not configured'}`,
     `- Dashboard Filter Wiring: ${dashboards.length > 0 && dashboards.every(dashboard => dashboard.filterApplied) ? 'Applied automatically' : 'Needs verification'}`,
     '',
   ];
@@ -7848,6 +8110,24 @@ function buildChunkedSummary(config, state) {
       lines.push('- Forge REST issue creation was skipped to avoid Jira stamping today as Created/Updated.');
     } else {
       lines.push(`- Worker dataset was not generated: ${workerDataset?.message || 'worker result not available'}`);
+    }
+    lines.push('');
+  }
+
+  if (compassComponents.length > 0) {
+    lines.push('Compass Components Created:');
+    lines.push(...compassComponents.slice(0, 20).map(component => `- ${component.projectKey}: ${component.name} (${component.typeId})`));
+    if (compassComponents.length > 20) {
+      lines.push(`- ...and ${compassComponents.length - 20} more Compass component(s).`);
+    }
+    lines.push('');
+  }
+
+  if (atlassianGoals.length > 0) {
+    lines.push('Atlassian Goals Created:');
+    lines.push(...atlassianGoals.slice(0, 20).map(goal => `- ${goal.projectKey}: ${goal.name} (target ${goal.targetDate})`));
+    if (atlassianGoals.length > 20) {
+      lines.push(`- ...and ${atlassianGoals.length - 20} more goal(s).`);
     }
     lines.push('');
   }
@@ -8006,6 +8286,12 @@ resolver.define('executeDemoEnvironmentStep', async ({ payload }) => {
       break;
     case 'create-software-components':
       await executeSoftwareComponentsStep(config, state, step);
+      break;
+    case 'create-compass-components':
+      await executeCompassComponentsStep(config, state, step);
+      break;
+    case 'create-atlassian-goals':
+      await executeAtlassianGoalsStep(config, state, step);
       break;
     case 'create-software-epics-batch':
       await executeSoftwareEpicBatchStep(config, state, step);
