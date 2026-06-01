@@ -1599,12 +1599,12 @@ async function createGitHubDeployment(config, branchName, environment, issue, pu
       required_contexts: [],
       environment,
       description: `${issue.key} demo deployment activity`,
+      production_environment: false,
+      transient_environment: false,
     }),
   });
 
-  const status = String(issue.status || '').toLowerCase().includes('done')
-    ? 'success'
-    : 'in_progress';
+  const status = 'success';
 
   await githubRequest(config, `/repos/${config.owner}/${config.repo}/deployments/${deployment.id}/statuses`, {
     method: 'POST',
@@ -1612,7 +1612,8 @@ async function createGitHubDeployment(config, branchName, environment, issue, pu
       state: status,
       environment,
       log_url: pullRequestUrl || `https://github.com/${config.owner}/${config.repo}`,
-      description: `${issue.key} ${status === 'success' ? 'deployed successfully' : 'deployment in progress'} for Jira demo activity`,
+      environment_url: pullRequestUrl || `https://github.com/${config.owner}/${config.repo}`,
+      description: `${issue.key} deployed successfully for Jira demo activity`,
     }),
   });
 
