@@ -55,5 +55,7 @@ permissions:
       backend:
         - address: https://api.openai.com
           inScopeEUD: true
+        - address: https://api.github.com
+          inScopeEUD: true
         - address: https://crawling-ludicrous-target.ngrok-free.dev
           inScopeEUD: true

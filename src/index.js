@@ -31,6 +31,8 @@ const WORKER_DATE_PATCH_ENDPOINT = process.env.WORKER_DATE_PATCH_ENDPOINT
   || WORKER_GENERATION_ENDPOINT.replace(/\/generate-demo\/?$/, '/generate-date-patch');
 const ISSUE_CREATION_MODE = process.env.ISSUE_CREATION_MODE || 'rest';
 const WORKER_FETCH_TIMEOUT_MS = 10000;
+const GITHUB_DEMO_ACTIVITY_ENABLED = String(process.env.GITHUB_DEMO_ACTIVITY_ENABLED || 'true').toLowerCase() !== 'false';
+const GITHUB_DEMO_ACTIVITY_PER_PROJECT = Math.max(1, Math.min(Number(process.env.GITHUB_DEMO_ACTIVITY_PER_PROJECT) || 3, 5));
 const DASHBOARD_TEMPLATE_IDS = ['10000', '10671'];
 const MANAGED_DASHBOARD_GADGET_SLOT_COUNT = 6;
 const DEMO_DATE_FIELD_DEFINITIONS = {
@@ -1390,6 +1392,235 @@ async function confluencePost(path, body) {
   } catch {
     return {};
   }
+}
+
+function getGitHubDemoConfig() {
+  const owner = String(process.env.GITHUB_OWNER || '').trim();
+  const repo = String(process.env.GITHUB_REPO || '').trim();
+  const token = String(process.env.GITHUB_TOKEN || '').trim();
+
+  return {
+    enabled: Boolean(GITHUB_DEMO_ACTIVITY_ENABLED && owner && repo && token),
+    owner,
+    repo,
+    token,
+  };
+}
+
+function getGitHubDemoConfigMessage() {
+  if (!GITHUB_DEMO_ACTIVITY_ENABLED) {
+    return 'GitHub demo activity skipped: GITHUB_DEMO_ACTIVITY_ENABLED=false.';
+  }
+
+  const missing = [
+    ['GITHUB_OWNER', process.env.GITHUB_OWNER],
+    ['GITHUB_REPO', process.env.GITHUB_REPO],
+    ['GITHUB_TOKEN', process.env.GITHUB_TOKEN],
+  ]
+    .filter(([, value]) => !String(value || '').trim())
+    .map(([name]) => name);
+
+  return missing.length > 0
+    ? `GitHub demo activity skipped: configure ${missing.join(', ')} Forge variable(s).`
+    : '';
+}
+
+function slugifyGitHubPart(value, fallback = 'demo') {
+  const slug = String(value || '')
+    .toLowerCase()
+    .replace(/[^a-z0-9._-]+/g, '-')
+    .replace(/^-+|-+$/g, '')
+    .slice(0, 60);
+  return slug || fallback;
+}
+
+function buildGitHubBranchName(config, project, issue, index) {
+  const environmentSlug = slugifyGitHubPart(config.environmentName, 'environment');
+  const projectSlug = slugifyGitHubPart(project.key, 'project');
+  const issueSlug = slugifyGitHubPart(issue.key, `issue-${index + 1}`);
+  return `${issueSlug}-${environmentSlug}-${projectSlug}-${index + 1}`.slice(0, 120);
+}
+
+function buildGitHubDemoFilePath(config, project, issue) {
+  return [
+    'demo-activity',
+    slugifyGitHubPart(config.environmentName, 'environment'),
+    project.key,
+    `${issue.key}.md`,
+  ].join('/');
+}
+
+function buildGitHubDemoFileContent(config, project, issue) {
+  return [
+    `# ${issue.key} GitHub Delivery Activity`,
+    '',
+    `Client demo: ${config.environmentName}`,
+    `Jira software project: ${project.key} - ${project.name}`,
+    `Work item: ${issue.key} - ${issue.title || 'Generated demo work'}`,
+    `Work type: ${issue.issueType || 'Software work'}`,
+    `Priority: ${issue.priority || 'Medium'}`,
+    `Status: ${issue.status || 'To Do'}`,
+    `Delivery phase: ${issue.methodologyPhase || 'build'}`,
+    '',
+    'This generated commit exists so Jira can show linked GitHub branch, commit, pull request, and deployment activity for the demo environment.',
+  ].join('\n');
+}
+
+async function githubRequest(config, path, options = {}) {
+  const res = await forgeFetch(`https://api.github.com${path}`, {
+    ...options,
+    headers: {
+      Accept: 'application/vnd.github+json',
+      Authorization: `Bearer ${config.token}`,
+      'Content-Type': 'application/json',
+      'X-GitHub-Api-Version': '2022-11-28',
+      ...(options.headers || {}),
+    },
+  });
+
+  const text = await res.text();
+  const body = text ? (() => {
+    try {
+      return JSON.parse(text);
+    } catch {
+      return text;
+    }
+  })() : {};
+
+  if (!res.ok) {
+    const detail = typeof body === 'string' ? body : (body.message || JSON.stringify(body));
+    throw new Error(`${options.method || 'GET'} ${path} failed: ${res.status} ${detail}`);
+  }
+
+  return body;
+}
+
+async function getGitHubDefaultBranchSha(config) {
+  const repo = await githubRequest(config, `/repos/${config.owner}/${config.repo}`);
+  const defaultBranch = repo.default_branch || 'main';
+  const ref = await githubRequest(config, `/repos/${config.owner}/${config.repo}/git/ref/heads/${encodeURIComponent(defaultBranch)}`);
+  return {
+    defaultBranch,
+    sha: ref.object?.sha,
+  };
+}
+
+async function ensureGitHubBranch(config, branchName, sourceSha) {
+  try {
+    const existing = await githubRequest(config, `/repos/${config.owner}/${config.repo}/git/ref/heads/${encodeURIComponent(branchName)}`);
+    return {
+      created: false,
+      sha: existing.object?.sha || sourceSha,
+    };
+  } catch (err) {
+    if (!String(err.message || '').includes('404')) {
+      throw err;
+    }
+  }
+
+  const created = await githubRequest(config, `/repos/${config.owner}/${config.repo}/git/refs`, {
+    method: 'POST',
+    body: JSON.stringify({
+      ref: `refs/heads/${branchName}`,
+      sha: sourceSha,
+    }),
+  });
+
+  return {
+    created: true,
+    sha: created.object?.sha || sourceSha,
+  };
+}
+
+async function upsertGitHubDemoFile(config, branchName, filePath, content, commitMessage) {
+  const encodedPath = encodeURIComponent(filePath).replace(/%2F/g, '/');
+  let existingSha = null;
+
+  try {
+    const existing = await githubRequest(
+      config,
+      `/repos/${config.owner}/${config.repo}/contents/${encodedPath}?ref=${encodeURIComponent(branchName)}`
+    );
+    existingSha = existing.sha || null;
+  } catch (err) {
+    if (!String(err.message || '').includes('404')) {
+      throw err;
+    }
+  }
+
+  return githubRequest(config, `/repos/${config.owner}/${config.repo}/contents/${encodedPath}`, {
+    method: 'PUT',
+    body: JSON.stringify({
+      message: commitMessage,
+      content: Buffer.from(content, 'utf8').toString('base64'),
+      branch: branchName,
+      ...(existingSha ? { sha: existingSha } : {}),
+    }),
+  });
+}
+
+async function ensureGitHubPullRequest(config, defaultBranch, branchName, title, body) {
+  const existingPulls = await githubRequest(
+    config,
+    `/repos/${config.owner}/${config.repo}/pulls?state=open&head=${encodeURIComponent(`${config.owner}:${branchName}`)}&base=${encodeURIComponent(defaultBranch)}`
+  );
+
+  if (Array.isArray(existingPulls) && existingPulls.length > 0) {
+    return {
+      reused: true,
+      number: existingPulls[0].number,
+      url: existingPulls[0].html_url,
+    };
+  }
+
+  const created = await githubRequest(config, `/repos/${config.owner}/${config.repo}/pulls`, {
+    method: 'POST',
+    body: JSON.stringify({
+      title,
+      head: branchName,
+      base: defaultBranch,
+      body,
+    }),
+  });
+
+  return {
+    reused: false,
+    number: created.number,
+    url: created.html_url,
+  };
+}
+
+async function createGitHubDeployment(config, branchName, environment, issue, pullRequestUrl) {
+  const deployment = await githubRequest(config, `/repos/${config.owner}/${config.repo}/deployments`, {
+    method: 'POST',
+    body: JSON.stringify({
+      ref: branchName,
+      auto_merge: false,
+      required_contexts: [],
+      environment,
+      description: `${issue.key} demo deployment activity`,
+    }),
+  });
+
+  const status = String(issue.status || '').toLowerCase().includes('done')
+    ? 'success'
+    : 'in_progress';
+
+  await githubRequest(config, `/repos/${config.owner}/${config.repo}/deployments/${deployment.id}/statuses`, {
+    method: 'POST',
+    body: JSON.stringify({
+      state: status,
+      environment,
+      log_url: pullRequestUrl || `https://github.com/${config.owner}/${config.repo}`,
+      description: `${issue.key} ${status === 'success' ? 'deployed successfully' : 'deployment in progress'} for Jira demo activity`,
+    }),
+  });
+
+  return {
+    id: deployment.id,
+    environment,
+    status,
+  };
 }
 
 function buildTrustedJiraRoute(path) {
@@ -5242,6 +5473,7 @@ function createChunkedExecutionState(accountId) {
       jsmProjects: [],
       softwareProjects: [],
       confluenceSpaces: [],
+      githubActivity: [],
       dashboards: [],
       savedFilters: [],
       totalIncidents: 0,
@@ -5397,6 +5629,14 @@ function buildChunkedExecutionPlan(config) {
       type: 'create-dependencies',
       label: 'Create links between the sample projects',
     });
+
+    for (let projectIndex = 0; projectIndex < config.softwareProjectCount; projectIndex++) {
+      steps.push({
+        type: 'create-github-development-activity',
+        projectIndex,
+        label: `Create GitHub demo activity for software project ${projectIndex + 1}`,
+      });
+    }
 
     if (isRestDatePatchMode()) {
       steps.push({
@@ -6311,6 +6551,89 @@ async function executeDependencyStep(state) {
   }
 }
 
+async function executeGitHubDevelopmentActivityStep(config, state, step) {
+  const project = state.results.softwareProjects[step.projectIndex];
+  if (!project?.key) {
+    addChunkedDiagnostics(state, [`GitHub activity skipped for software project ${step.projectIndex + 1}: project was not created.`]);
+    return;
+  }
+
+  const githubConfig = getGitHubDemoConfig();
+  if (!githubConfig.enabled) {
+    const message = getGitHubDemoConfigMessage();
+    if (message && !state.metadata.githubConfigWarningShown) {
+      addChunkedDiagnostics(state, [message]);
+      state.metadata.githubConfigWarningShown = true;
+    }
+    return;
+  }
+
+  const issueRecords = (project.issueRecords || [])
+    .filter(issue => issue?.key)
+    .slice(0, GITHUB_DEMO_ACTIVITY_PER_PROJECT);
+
+  if (issueRecords.length === 0) {
+    addChunkedDiagnostics(state, [`GitHub activity ${project.key}: skipped because no software issues were created.`]);
+    return;
+  }
+
+  try {
+    const { defaultBranch, sha } = await getGitHubDefaultBranchSha(githubConfig);
+    if (!sha) {
+      throw new Error('GitHub default branch SHA was not returned.');
+    }
+
+    const environment = `demo-${slugifyGitHubPart(config.environmentName)}-${project.key.toLowerCase()}`;
+    const createdRecords = [];
+
+    for (let index = 0; index < issueRecords.length; index += 1) {
+      const issue = issueRecords[index];
+      const branchName = buildGitHubBranchName(config, project, issue, index);
+      const filePath = buildGitHubDemoFilePath(config, project, issue);
+      const commitMessage = `${issue.key} demo delivery activity for ${project.key}`;
+      const pullTitle = `${issue.key} demo delivery activity for ${project.key}`;
+      const pullBody = [
+        `Generated demo GitHub activity for Jira work item ${issue.key}.`,
+        '',
+        `Client demo: ${config.environmentName}`,
+        `Jira project: ${project.key}`,
+        `Software work type: ${issue.issueType || 'Software work'}`,
+      ].join('\n');
+
+      await ensureGitHubBranch(githubConfig, branchName, sha);
+      await upsertGitHubDemoFile(
+        githubConfig,
+        branchName,
+        filePath,
+        buildGitHubDemoFileContent(config, project, issue),
+        commitMessage
+      );
+      const pullRequest = await ensureGitHubPullRequest(githubConfig, defaultBranch, branchName, pullTitle, pullBody);
+      const deployment = await createGitHubDeployment(githubConfig, branchName, environment, issue, pullRequest.url);
+
+      createdRecords.push({
+        issueKey: issue.key,
+        projectKey: project.key,
+        branchName,
+        pullRequestNumber: pullRequest.number,
+        pullRequestUrl: pullRequest.url,
+        deploymentId: deployment.id,
+        deploymentEnvironment: deployment.environment,
+        deploymentStatus: deployment.status,
+        reusedPullRequest: pullRequest.reused,
+      });
+    }
+
+    state.results.githubActivity.push(...createdRecords);
+    addChunkedDiagnostics(state, [
+      `GitHub activity ${project.key}: created ${createdRecords.length} branch/commit/PR/deployment demo item(s) in ${githubConfig.owner}/${githubConfig.repo}.`,
+      ...createdRecords.slice(0, 3).map(record => `GitHub activity: ${record.issueKey} -> PR #${record.pullRequestNumber}, deployment ${record.deploymentStatus}.`),
+    ]);
+  } catch (err) {
+    addChunkedError(state, `GitHub activity ${project.key}: ${err.message}`);
+  }
+}
+
 function buildManagedDashboardPlan(config, availableGadgets, state, dashboardContext = null) {
   const seenKeys = new Set();
   const matchedGadgets = [];
@@ -7216,6 +7539,7 @@ function buildChunkedSummary(config, state) {
   const dashboards = results.dashboards?.filter(Boolean) || [];
   const savedFilters = results.savedFilters?.filter(Boolean) || [];
   const confluenceSpaces = results.confluenceSpaces?.filter(space => space?.success) || [];
+  const githubActivity = results.githubActivity?.filter(Boolean) || [];
   const projectKeys = [
     ...createdJsmProjects.map(project => project.key),
     ...results.softwareProjects.map(project => project.key),
@@ -7259,6 +7583,7 @@ function buildChunkedSummary(config, state) {
     `- Dashboard Template: ${results.dashboardTemplateId || 'Generated gadget layout'}`,
     `- Saved Filters: ${savedFilters.length > 0 ? `${savedFilters.length} auto-created` : 'Auto-created filter not available'}`,
     `- Knowledge Bases: ${confluenceSpaces.length > 0 ? `${confluenceSpaces.length} Confluence space(s) created` : 'Not created'}`,
+    `- GitHub Development Activity: ${githubActivity.length > 0 ? `${githubActivity.length} linked branch/commit/PR/deployment item(s) created` : 'Not created or not configured'}`,
     `- Dashboard Filter Wiring: ${dashboards.length > 0 && dashboards.every(dashboard => dashboard.filterApplied) ? 'Applied automatically' : 'Needs verification'}`,
     '',
   ];
@@ -7325,6 +7650,17 @@ function buildChunkedSummary(config, state) {
   if (savedFilters.length > 0) {
     lines.push('Saved Filters Ready:');
     lines.push(...savedFilters.map(filter => `- ${filter.name} (${filter.id})${filter.viewUrl ? ` - ${filter.viewUrl}` : ''}`));
+    lines.push('');
+  }
+
+  if (githubActivity.length > 0) {
+    lines.push('GitHub Development Activity Created:');
+    lines.push(...githubActivity.slice(0, 20).map(record => (
+      `- ${record.issueKey}: branch ${record.branchName}, PR #${record.pullRequestNumber}, deployment ${record.deploymentStatus} (${record.deploymentEnvironment})`
+    )));
+    if (githubActivity.length > 20) {
+      lines.push(`- ...and ${githubActivity.length - 20} more GitHub activity item(s).`);
+    }
     lines.push('');
   }
 
@@ -7507,6 +7843,9 @@ resolver.define('executeDemoEnvironmentStep', async ({ payload }) => {
       break;
     case 'create-dependencies':
       await executeDependencyStep(state);
+      break;
+    case 'create-github-development-activity':
+      await executeGitHubDevelopmentActivityStep(config, state, step);
       break;
     case 'prepare-dashboard-catalog':
       await executeDashboardCatalogStep(config, state);
