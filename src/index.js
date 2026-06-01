@@ -1427,7 +1427,12 @@ function buildGitHubBranchName(config, project, issue, index) {
   const environmentSlug = slugifyGitHubPart(config.environmentName, 'environment');
   const projectSlug = slugifyGitHubPart(project.key, 'project');
   const issueSlug = slugifyGitHubPart(issue.key, `issue-${index + 1}`);
-  return `${issueSlug}-${environmentSlug}-${projectSlug}-${index + 1}`.slice(0, 120);
+  return [
+    'demo-activity',
+    environmentSlug,
+    projectSlug,
+    `${issueSlug}-delivery-${index + 1}`,
+  ].join('/').slice(0, 180);
 }
 
 function buildGitHubDemoFilePath(config, project, issue) {
