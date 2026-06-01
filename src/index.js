@@ -24,6 +24,7 @@ const projectIssueTypeCache = new Map();
 const assignableUsersByProjectCache = new Map();
 const demoDateFieldsByProjectCache = new Map();
 let demoDateFieldIdsCache = null;
+let timelineStartDateFieldIdCache = null;
 let formsDynamicSchemaRejected = false;
 const ACTIVE_TICKET_RETENTION_DAYS = 180;
 const WORKER_GENERATION_ENDPOINT = process.env.WORKER_GENERATION_ENDPOINT || 'http://localhost:4000/generate-demo';
@@ -218,26 +219,13 @@ function getWaterfallPhase(index) {
 
 function getSoftwareMethodologyLabels(project, issueIndex, issueType) {
   const template = normaliseSoftwareTemplate(project?.softwareTemplate);
-  const style = normaliseProjectManagementStyle(project?.softwareProjectStyle);
   const phase = getWaterfallPhase(issueIndex);
   const baseLabels = [
-    'demo-data',
-    `methodology-${template}`,
-    `management-${style}`,
-    `waterfall-${phase}`,
+    template === 'scrum' ? 'scrum' : 'kanban',
+    `phase-${phase}`,
   ];
 
-  if (template === 'scrum') {
-    baseLabels.push('agile-scrum', 'sprint-planning', 'velocity-tracking');
-  } else {
-    baseLabels.push('agile-kanban', 'continuous-flow', 'wip-tracking');
-  }
-
-  if (String(issueType || '').toLowerCase() === 'bug') {
-    baseLabels.push('defect-management', 'affected-version');
-  } else {
-    baseLabels.push('release-scope', 'fix-version');
-  }
+  baseLabels.push(String(issueType || '').toLowerCase() === 'bug' ? 'defect' : 'release');
 
   return baseLabels.map(label => label.replace(/[^A-Za-z0-9_-]/g, '-').toLowerCase());
 }
@@ -2637,6 +2625,8 @@ async function createVersion(projectId, name, releaseDate, released) {
 
 async function createEpic(projectKey, epicName, options = {}) {
   const dueDate = options.dueDate || null;
+  const startDate = options.startDate || null;
+  const startDateFieldId = options.startDateFieldId || null;
   const assigneeAccountId = options.assigneeAccountId || null;
   const lifecycle = options.lifecycle || null;
   const demoDateFields = options.demoDateFields || {};
@@ -2653,6 +2643,7 @@ async function createEpic(projectKey, epicName, options = {}) {
   // We still set them again after creation because some Jira screens reject
   // optional fields during create, even though the same field can be edited later.
   if (dueDate) fields.duedate = dueDate;
+  if (startDate && startDateFieldId) fields[startDateFieldId] = startDate;
   if (assigneeAccountId) fields.assignee = { accountId: assigneeAccountId };
   if (priority) fields.priority = { name: priority };
   Object.assign(fields, buildDemoDateFieldValues(demoDateFields, lifecycle));
@@ -2661,7 +2652,7 @@ async function createEpic(projectKey, epicName, options = {}) {
     const epic = await jiraPost('/rest/api/3/issue', { fields });
     await saveLifecycleProperty(epic, options, lifecycle);
     await updateIssueDemoDateFields(epic.key, demoDateFields, lifecycle, options.diagnostics);
-    await updateIssueBoardVisibleFields(epic.key, { assigneeAccountId, dueDate }, options.diagnostics);
+    await updateIssueBoardVisibleFields(epic.key, { assigneeAccountId, dueDate, startDate, startDateFieldId }, options.diagnostics);
     if (lifecycle?.targetStatus && lifecycle.targetStatus !== 'To Do') {
       await transitionIssue(epic.key, lifecycle.targetStatus);
     }
@@ -2679,7 +2670,7 @@ async function createEpic(projectKey, epicName, options = {}) {
       const epic = await jiraPost('/rest/api/3/issue', { fields: removeOptionalIssueFields(fields) });
       await saveLifecycleProperty(epic, options, lifecycle);
       await updateIssueDemoDateFields(epic.key, demoDateFields, lifecycle, options.diagnostics);
-      await updateIssueBoardVisibleFields(epic.key, { assigneeAccountId, dueDate }, options.diagnostics);
+      await updateIssueBoardVisibleFields(epic.key, { assigneeAccountId, dueDate, startDate, startDateFieldId }, options.diagnostics);
       if (lifecycle?.targetStatus && lifecycle.targetStatus !== 'To Do') {
         await transitionIssue(epic.key, lifecycle.targetStatus);
       }
@@ -2722,6 +2713,30 @@ async function getDemoDateFieldIds() {
 
   demoDateFieldIdsCache = result;
   return result;
+}
+
+async function getTimelineStartDateFieldId(diagnostics = []) {
+  if (timelineStartDateFieldIdCache !== null) {
+    return timelineStartDateFieldIdCache;
+  }
+
+  try {
+    const fields = await jiraGet('/rest/api/3/field');
+    const startDateField = (fields || []).find(field => (
+      normaliseFieldName(field.name || field.key || '') === 'startdate' &&
+      isCustomDateField(field)
+    )) || (fields || []).find(field => normaliseFieldName(field.name || field.key || '') === 'startdate');
+
+    timelineStartDateFieldIdCache = startDateField?.id || '';
+    diagnostics.push(timelineStartDateFieldIdCache
+      ? `Timeline fields: Jira Start date field resolved as ${timelineStartDateFieldIdCache}.`
+      : 'Timeline fields: Jira Start date field was not found; native timeline may use default scheduling.');
+  } catch (err) {
+    timelineStartDateFieldIdCache = '';
+    diagnostics.push(`Timeline fields: Start date lookup failed: ${err.message}`);
+  }
+
+  return timelineStartDateFieldIdCache;
 }
 
 function collectCreateMetaFieldCandidates(issueTypes) {
@@ -3633,6 +3648,7 @@ function removeOptionalIssueFields(fields) {
   delete safeFields.assignee;
   delete safeFields.duedate;
   delete safeFields.customfield_10014;
+  delete safeFields.customfield_10015;
   delete safeFields.fixVersions;
   delete safeFields.versions;
   delete safeFields.components;
@@ -3784,7 +3800,30 @@ async function updateIssueDemoDateFields(issueKey, demoDateFields, lifecycle, di
   }
 }
 
-async function updateIssueBoardVisibleFields(issueKey, { assigneeAccountId, dueDate }, diagnostics = []) {
+async function updateIssueBoardVisibleFields(issueKey, { assigneeAccountId, dueDate, startDate, startDateFieldId }, diagnostics = []) {
+  if (startDate && startDateFieldId) {
+    const fields = {
+      [startDateFieldId]: startDate,
+    };
+
+    try {
+      await jiraPut(`/rest/api/3/issue/${encodeURIComponent(issueKey)}?notifyUsers=false`, { fields });
+      diagnostics.push(`Timeline fields ${issueKey}: start date set to ${startDate}`);
+    } catch (normalErr) {
+      try {
+        await jiraPut(
+          `/rest/api/3/issue/${encodeURIComponent(issueKey)}?notifyUsers=false&overrideScreenSecurity=true&overrideEditableFlag=true`,
+          { fields }
+        );
+        diagnostics.push(`Timeline fields ${issueKey}: start date set with screen override to ${startDate}`);
+      } catch (overrideErr) {
+        const message = `Timeline fields ${issueKey}: start date update failed. Normal update: ${normalErr.message}. Override update: ${overrideErr.message}`;
+        diagnostics.push(message);
+        console.warn(message);
+      }
+    }
+  }
+
   if (dueDate) {
     try {
       // Due date is a standard Jira field and is shown directly in Software
@@ -3853,6 +3892,7 @@ async function createIssue(projectKey, title, type, epicKey, priority, dueDate, 
   if (versionId) fields.fixVersions = [{ id: String(versionId) }];
   if (options.affectsVersionId) fields.versions = [{ id: String(options.affectsVersionId) }];
   if (Array.isArray(options.labels) && options.labels.length > 0) fields.labels = options.labels;
+  if (options.startDate && options.startDateFieldId) fields[options.startDateFieldId] = options.startDate;
   if (Array.isArray(options.components) && options.components.length > 0) {
     fields.components = options.components.map(component => ({ name: String(component) }));
   }
@@ -3880,7 +3920,12 @@ async function createIssue(projectKey, title, type, epicKey, priority, dueDate, 
     }));
     await saveLifecycleProperty(issue, options, lifecycle);
     await updateIssueDemoDateFields(issue.key, demoDateFields, lifecycle, options.diagnostics);
-    await updateIssueBoardVisibleFields(issue.key, { assigneeAccountId, dueDate }, options.diagnostics);
+    await updateIssueBoardVisibleFields(issue.key, {
+      assigneeAccountId,
+      dueDate,
+      startDate: options.startDate,
+      startDateFieldId: options.startDateFieldId,
+    }, options.diagnostics);
     return issue;
   } catch (err) {
     const errorMessage = String(err?.message || '');
@@ -3916,7 +3961,12 @@ async function createIssue(projectKey, title, type, epicKey, priority, dueDate, 
       }));
       await saveLifecycleProperty(issue, options, lifecycle);
       await updateIssueDemoDateFields(issue.key, demoDateFields, lifecycle, options.diagnostics);
-      await updateIssueBoardVisibleFields(issue.key, { assigneeAccountId, dueDate }, options.diagnostics);
+      await updateIssueBoardVisibleFields(issue.key, {
+        assigneeAccountId,
+        dueDate,
+        startDate: options.startDate,
+        startDateFieldId: options.startDateFieldId,
+      }, options.diagnostics);
       return issue;
     }
 
@@ -3942,7 +3992,12 @@ async function createIssue(projectKey, title, type, epicKey, priority, dueDate, 
       }));
       await saveLifecycleProperty(issue, options, lifecycle);
       await updateIssueDemoDateFields(issue.key, demoDateFields, lifecycle, options.diagnostics);
-      await updateIssueBoardVisibleFields(issue.key, { assigneeAccountId, dueDate }, options.diagnostics);
+      await updateIssueBoardVisibleFields(issue.key, {
+        assigneeAccountId,
+        dueDate,
+        startDate: options.startDate,
+        startDateFieldId: options.startDateFieldId,
+      }, options.diagnostics);
       return issue;
     }
     throw err;
@@ -6100,6 +6155,7 @@ async function executeSoftwareProjectStep(config, state, step) {
       configuredIssueCount: softwareProjectConfig.issuesPerProject,
       demoDateFields: null,
       demoDateFieldsReady: false,
+      timelineStartDateFieldId: null,
       skipDemoDateFieldWrites: softwareProjectStyle === 'team-managed',
       smartForm: null,
     };
@@ -6114,6 +6170,8 @@ async function executeSoftwareDateFieldStep(state, step) {
     addChunkedError(state, `Software Project ${step.projectIndex + 1}: skipped date field setup because the project was not created.`);
     return;
   }
+
+  project.timelineStartDateFieldId = await getTimelineStartDateFieldId(state.results.diagnostics);
 
   if (project.skipDemoDateFieldWrites) {
     project.demoDateFields = {};
@@ -6225,7 +6283,6 @@ async function executeSoftwareEpicBatchStep(config, state, step) {
     }
 
     try {
-      const dueDate = getDateString(30 + (epicIndex * 14));
       const assigneeAccountId = chooseDemoAssigneeAccountId(assignableUsers, epicIndex, step.projectIndex);
       const epicPriorities = ['Highest', 'High', 'Medium', 'Low'];
       const epicPriority = epicPriorities[epicIndex % epicPriorities.length];
@@ -6235,14 +6292,19 @@ async function executeSoftwareEpicBatchStep(config, state, step) {
         issueType: 'Epic',
         maxAgeDays: config.dateRangeDays,
       });
+      const lifecycleForStatus = ensureResolvedLifecycleForStatus(lifecycle, lifecycle.targetStatus || 'Done');
+      const dueDate = buildDueDateFromLifecycle(lifecycleForStatus, epicPriority, epicIndex);
+      const startDate = lifecycleForStatus?.createdAt ? toJiraDateOnly(lifecycleForStatus.createdAt) : null;
       const epic = await createEpic(project.key, epicName, {
         assigneeAccountId,
         dueDate,
+        startDate,
+        startDateFieldId: project.timelineStartDateFieldId,
         priority: epicPriority,
         demoDateFields,
         diagnostics: state.results.diagnostics,
         environmentName: config.environmentName,
-        lifecycle,
+        lifecycle: lifecycleForStatus,
         projectKind: 'software',
         retentionPeriodDays: config.retentionPeriodDays,
       });
@@ -6250,8 +6312,8 @@ async function executeSoftwareEpicBatchStep(config, state, step) {
       addHistoricalDatePatchIssue(state, {
         key: epic.key,
         summary: epicName,
-        lifecycle,
-        status: lifecycle.targetStatus,
+        lifecycle: lifecycleForStatus,
+        status: lifecycleForStatus.targetStatus,
       });
     } catch (err) {
       addChunkedError(state, `Epic "${epicName}" for ${project.key}: ${err.message}`);
@@ -6317,6 +6379,7 @@ async function executeSoftwareIssueBatchStep(config, state, step) {
       const status = getDemoDevStatus(issueIndex);
       const lifecycleForStatus = ensureResolvedLifecycleForStatus(lifecycle, status);
       const dueDate = buildDueDateFromLifecycle(lifecycleForStatus, priority, issueIndex);
+      const startDate = lifecycleForStatus?.createdAt ? toJiraDateOnly(lifecycleForStatus.createdAt) : null;
       const releaseVersions = chooseReleaseVersionIds(project, issueIndex, template.type);
       const methodologyDescription = getSoftwareMethodologyDescription(project, issueIndex);
       const epicKey = softwareTemplate === 'kanban'
@@ -6339,6 +6402,8 @@ async function executeSoftwareIssueBatchStep(config, state, step) {
           lifecycle: lifecycleForStatus,
           projectKind: 'software',
           retentionPeriodDays: config.retentionPeriodDays,
+          startDate,
+          startDateFieldId: project.timelineStartDateFieldId,
           description: [template.description || '', methodologyDescription].filter(Boolean).join('\n\n'),
           skipEpicLink: softwareTemplate === 'kanban',
           labels: getSoftwareMethodologyLabels(project, issueIndex, template.type),
