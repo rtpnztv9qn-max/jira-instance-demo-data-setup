@@ -29,7 +29,7 @@ const ACTIVE_TICKET_RETENTION_DAYS = 180;
 const WORKER_GENERATION_ENDPOINT = process.env.WORKER_GENERATION_ENDPOINT || 'http://localhost:4000/generate-demo';
 const WORKER_DATE_PATCH_ENDPOINT = process.env.WORKER_DATE_PATCH_ENDPOINT
   || WORKER_GENERATION_ENDPOINT.replace(/\/generate-demo\/?$/, '/generate-date-patch');
-const ISSUE_CREATION_MODE = process.env.ISSUE_CREATION_MODE || 'rest-date-csv';
+const ISSUE_CREATION_MODE = process.env.ISSUE_CREATION_MODE || 'rest';
 const WORKER_FETCH_TIMEOUT_MS = 10000;
 const DASHBOARD_TEMPLATE_IDS = ['10000', '10671'];
 const MANAGED_DASHBOARD_GADGET_SLOT_COUNT = 6;
@@ -210,6 +210,101 @@ function getDemoDevStatus(index) {
   return ['To Do', 'In Progress', 'Done'][index % 3];
 }
 
+function getWaterfallPhase(index) {
+  return ['requirements', 'design', 'build', 'test', 'release'][index % 5];
+}
+
+function getSoftwareMethodologyLabels(project, issueIndex, issueType) {
+  const template = normaliseSoftwareTemplate(project?.softwareTemplate);
+  const style = normaliseProjectManagementStyle(project?.softwareProjectStyle);
+  const phase = getWaterfallPhase(issueIndex);
+  const baseLabels = [
+    'demo-data',
+    `methodology-${template}`,
+    `management-${style}`,
+    `waterfall-${phase}`,
+  ];
+
+  if (template === 'scrum') {
+    baseLabels.push('agile-scrum', 'sprint-planning', 'velocity-tracking');
+  } else {
+    baseLabels.push('agile-kanban', 'continuous-flow', 'wip-tracking');
+  }
+
+  if (String(issueType || '').toLowerCase() === 'bug') {
+    baseLabels.push('defect-management', 'affected-version');
+  } else {
+    baseLabels.push('release-scope', 'fix-version');
+  }
+
+  return baseLabels.map(label => label.replace(/[^A-Za-z0-9_-]/g, '-').toLowerCase());
+}
+
+function getSoftwareMethodologyDescription(project, issueIndex) {
+  const template = normaliseSoftwareTemplate(project?.softwareTemplate);
+  const phase = getWaterfallPhase(issueIndex);
+  const agileMethod = template === 'scrum'
+    ? 'Scrum delivery: backlog refinement, sprint planning, sprint execution, review, and retrospective.'
+    : 'Kanban delivery: continuous intake, WIP control, flow monitoring, cycle time, and throughput tracking.';
+
+  return [
+    agileMethod,
+    `Waterfall traceability overlay: this work is tagged to the ${phase} phase so the demo can show requirements-to-release governance alongside agile execution.`,
+    'Release governance: fix versions, affected versions, dependencies, due dates, and sprint or flow state are populated for dashboard and report visibility.',
+  ].join(' ');
+}
+
+function getSoftwareReleasePlan(project, releaseIndex) {
+  const template = normaliseSoftwareTemplate(project?.softwareTemplate);
+  const offsets = [-150, -90, -30, 14, 45, 90];
+  const stage = releaseIndex <= 1
+    ? 'past'
+    : releaseIndex === 2
+      ? 'current'
+      : 'upcoming';
+  const versionNumber = `${Math.floor(releaseIndex / 2) + 1}.${releaseIndex % 2}`;
+  const releaseDate = getDateString(offsets[releaseIndex] ?? (30 + (releaseIndex * 30)));
+  const label = stage === 'past'
+    ? 'Past Release'
+    : stage === 'current'
+      ? 'Current Release'
+      : 'Upcoming Release';
+
+  return {
+    name: `${project.key} ${label} ${versionNumber}`,
+    releaseDate,
+    released: stage === 'past',
+    stage,
+    methodology: template === 'scrum' ? 'Scrum release train' : 'Kanban flow release',
+  };
+}
+
+function chooseReleaseVersionIds(project, issueIndex, issueType) {
+  const versions = project?.versions || [];
+  if (versions.length === 0) {
+    return {
+      fixVersionId: null,
+      affectsVersionId: null,
+    };
+  }
+
+  const pastVersions = versions.filter(version => version.releaseStage === 'past');
+  const currentVersions = versions.filter(version => version.releaseStage === 'current');
+  const upcomingVersions = versions.filter(version => version.releaseStage === 'upcoming');
+  const isBug = String(issueType || '').toLowerCase() === 'bug';
+  const fixPool = isBug
+    ? [...currentVersions, ...upcomingVersions, ...versions]
+    : [...upcomingVersions, ...currentVersions, ...versions];
+  const affectedPool = isBug
+    ? [...pastVersions, ...currentVersions, ...versions]
+    : [...currentVersions, ...pastVersions, ...versions];
+
+  return {
+    fixVersionId: fixPool[issueIndex % fixPool.length]?.id || null,
+    affectsVersionId: affectedPool[issueIndex % affectedPool.length]?.id || null,
+  };
+}
+
 function getPriorityName(p) {
   return { 'P1 - Critical': 'Highest', 'P2 - High': 'High', 'P3 - Medium': 'Medium', 'P4 - Low': 'Lowest' }[p] || 'Medium';
 }
@@ -225,19 +320,15 @@ function buildADF(paragraphs) {
 }
 
 function generateKey(prefix, index) {
-  // The demo requirement is to keep Jira project keys to three letters, such as
-  // MOB for "Mobile application". Jira still requires keys to be unique, so the
-  // first attempt uses the readable three-letter prefix and later retries rotate
-  // the final letter while staying at three characters.
-  const base = prefix.toUpperCase().replace(/[^A-Z]/g, '').substring(0, 3).padEnd(3, 'X') || 'DEM';
+  const base = prefix.toUpperCase().replace(/[^A-Z]/g, '').substring(0, 8).padEnd(3, 'X') || 'DEM';
   const letters = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ';
 
   if (index === 0) {
     return base;
   }
 
-  const fallbackLetters = letters.split('').filter(letter => letter !== base[2]);
-  return `${base.substring(0, 2)}${fallbackLetters[(index - 1) % fallbackLetters.length] || 'Z'}`;
+  const fallbackLetters = letters.split('').filter(letter => letter !== base[base.length - 1]);
+  return `${base.substring(0, Math.max(2, base.length - 1))}${fallbackLetters[(index - 1) % fallbackLetters.length] || 'Z'}`;
 }
 
 function deriveProjectKeyPrefix(environmentName, fallback = 'DEM') {
@@ -250,6 +341,19 @@ function deriveProjectKeyPrefix(environmentName, fallback = 'DEM') {
   }
 
   return (words.join('') || fallback).replace(/[^A-Z]/g, '').substring(0, 3).padEnd(3, 'X');
+}
+
+function createRunKeySuffix(seed) {
+  const letters = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ';
+  const number = Math.abs(Number(seed) || Date.now());
+  return `${letters[number % 26]}${letters[Math.floor(number / 26) % 26]}`;
+}
+
+function deriveRunProjectKeyPrefix(config, fallback = 'DEM', projectIndex = 0) {
+  const base = deriveProjectKeyPrefix(config.environmentName, fallback).substring(0, 3);
+  const suffix = createRunKeySuffix(config.runSeed);
+  const indexLetter = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ'[projectIndex % 26] || 'A';
+  return `${base}${suffix}${indexLetter}`;
 }
 
 function pad(num) {
@@ -516,8 +620,8 @@ async function generateAiDemoContent(config) {
   const requestedCounts = {
     incidents: config.itsmWorkCounts?.incidentRequestsPerProject || 1,
     serviceRequests: config.itsmWorkCounts?.serviceRequestsPerProject || 1,
-    changes: config.itsmWorkCounts?.changeRequestsPerProject || 0,
-    problems: config.itsmWorkCounts?.problemRequestsPerProject || 0,
+    changes: config.itsmWorkCounts?.changeRequestsPerProject || 1,
+    problems: config.itsmWorkCounts?.problemRequestsPerProject || 1,
     softwareIssues: Math.max(...(config.softwareProjects || []).map(project => project.issuesPerProject || 0), config.issuesPerProject || 10),
   };
   const boundedCounts = {
@@ -737,7 +841,7 @@ function isCsvIssueCreationMode() {
 }
 
 function isRestDatePatchMode() {
-  return ['rest-date-csv', 'hybrid', 'rest-csv-dates'].includes(String(ISSUE_CREATION_MODE || '').toLowerCase());
+  return false;
 }
 
 function formatCsvDateTime(value) {
@@ -898,9 +1002,8 @@ async function executeWorkerDatePatchGenerationStep(config, state) {
     browserDownload: true,
   };
   addChunkedDiagnostics(state, [
-    `Historical date patch CSV prepared in the app: ${issues.length} existing issue row(s).`,
-    'Use the Download Historical Date Patch CSV button in the app result.',
-    'Jira Cloud does not reliably allow importing the system Updated date; CSV import sets Updated to the import time.',
+    `Legacy historical date patch CSV generation skipped: ${issues.length} existing issue row(s) were available, but the CSV patch flow is disabled.`,
+    'Forge REST now populates custom historical Created Date and Resolved Date fields for dashboards instead.',
   ]);
 }
 
@@ -1425,7 +1528,7 @@ async function createJSMProject(name, leadAccountId, keyPrefix, diagnostics = []
     leadAccountId,
     keyPrefix,
     projectTypeKey: 'service_desk',
-    maxAttempts: 8,
+    maxAttempts: 3,
     templateKeys: getJsmItsmTemplateKeys(),
     allowTemplateOmission: false,
     diagnostics,
@@ -1436,6 +1539,19 @@ async function createJSMProject(name, leadAccountId, keyPrefix, diagnostics = []
     serviceDeskAvailable: true,
     projectTypeKey: 'service_desk',
   };
+}
+
+async function getProjectByKeyIfExists(projectKey) {
+  try {
+    return await jiraGet(`/rest/api/3/project/${encodeURIComponent(projectKey)}`);
+  } catch (err) {
+    const message = String(err.message || '');
+    if (message.includes('404')) {
+      return null;
+    }
+
+    throw err;
+  }
 }
 
 function getJsmItsmTemplateKeys() {
@@ -1458,6 +1574,31 @@ async function getServiceDeskId(projectKey) {
   const data = await jiraGet('/rest/servicedeskapi/servicedesk');
   const sd = (data.values || []).find(s => s.projectKey === projectKey);
   return sd ? sd.id : null;
+}
+
+async function getServiceDeskIdWithRetry(projectKey, {
+  attempts = 8,
+  delayMs = 1500,
+  diagnostics = [],
+  label = 'Service desk lookup',
+} = {}) {
+  for (let attempt = 1; attempt <= attempts; attempt += 1) {
+    const serviceDeskId = await getServiceDeskId(projectKey);
+
+    if (serviceDeskId) {
+      if (attempt > 1) {
+        diagnostics.push(`${label} ${projectKey}: service desk became available on attempt ${attempt}.`);
+      }
+      return serviceDeskId;
+    }
+
+    if (attempt < attempts) {
+      diagnostics.push(`${label} ${projectKey}: service desk not available yet; waiting for Jira provisioning (${attempt}/${attempts}).`);
+      await wait(delayMs);
+    }
+  }
+
+  return null;
 }
 
 async function getServiceDeskRequestTypes(serviceDeskId) {
@@ -1583,7 +1724,11 @@ function buildFallbackFormPayloadAttempts(projectName, requestType) {
 }
 
 async function ensureDefaultSmartIntakeForm(projectKey, projectName, industry) {
-  const serviceDeskId = await getServiceDeskId(projectKey);
+  const serviceDeskId = await getServiceDeskIdWithRetry(projectKey, {
+    attempts: 6,
+    delayMs: 1500,
+    label: 'Forms service desk lookup',
+  });
   if (!serviceDeskId) {
     return {
       success: false,
@@ -2030,11 +2175,18 @@ function chooseRequestTypeForItsmWork(project, workType) {
 
 async function createJsmRequestWorkItem(project, workItem, options) {
   const diagnostics = options.diagnostics || [];
-  const serviceDeskId = project.serviceDeskId || await getServiceDeskId(project.key);
+  const serviceDeskId = project.serviceDeskId || await getServiceDeskIdWithRetry(project.key, {
+    attempts: 3,
+    delayMs: 1000,
+    diagnostics,
+    label: 'ITSM work service desk lookup',
+  });
 
   if (!serviceDeskId) {
     throw new Error(`Service desk id was not available for ${project.key}.`);
   }
+
+  project.serviceDeskId = serviceDeskId;
 
   if (!project.requestTypes?.length) {
     const requestTypes = await getServiceDeskRequestTypes(serviceDeskId);
@@ -2139,9 +2291,6 @@ async function createProjectWithRetries({ name, leadAccountId, keyPrefix, projec
   const createProjectRequests = projectTypeKey === 'service_desk'
     ? [
         { path: '/rest/api/2/project', actor: 'user' },
-        { path: '/rest/api/3/project', actor: 'user' },
-        { path: '/rest/api/2/project', actor: 'app' },
-        { path: '/rest/api/3/project', actor: 'app' },
       ]
     : [{ path: '/rest/api/3/project', actor: 'user' }];
 
@@ -3253,6 +3402,9 @@ function removeOptionalIssueFields(fields) {
   delete safeFields.duedate;
   delete safeFields.customfield_10014;
   delete safeFields.fixVersions;
+  delete safeFields.versions;
+  delete safeFields.components;
+  delete safeFields.labels;
 
   for (const fieldKey of Object.keys(safeFields)) {
     if (fieldKey.startsWith('customfield_')) {
@@ -3467,6 +3619,11 @@ async function createIssue(projectKey, title, type, epicKey, priority, dueDate, 
   // through the Agile API after the issue exists.
   if (epicKey && !options.skipEpicLink) fields.customfield_10014 = epicKey;
   if (versionId) fields.fixVersions = [{ id: String(versionId) }];
+  if (options.affectsVersionId) fields.versions = [{ id: String(options.affectsVersionId) }];
+  if (Array.isArray(options.labels) && options.labels.length > 0) fields.labels = options.labels;
+  if (Array.isArray(options.components) && options.components.length > 0) {
+    fields.components = options.components.map(component => ({ name: String(component) }));
+  }
   if (assigneeAccountId) fields.assignee = { accountId: assigneeAccountId };
 
   // These are customer-created date fields, not Jira's immutable system Created
@@ -3540,6 +3697,9 @@ async function createIssue(projectKey, title, type, epicKey, priority, dueDate, 
       lowerError.includes('duedate') ||
       lowerError.includes('cannot be assigned issues') ||
       lowerError.includes('fixversions') ||
+      lowerError.includes('versions') ||
+      lowerError.includes('components') ||
+      lowerError.includes('labels') ||
       lowerError.includes('not on the appropriate screen')
     ) {
       console.warn(`DEMO_DATE_DIAGNOSTIC Retrying issue creation with only safe fields for "${title}" because Jira rejected optional/custom fields: ${errorMessage}`);
@@ -3660,22 +3820,35 @@ async function updateSprint(sprintId, body) {
 
 function getSprintSchedule(sprintIndex) {
   // Jira only allows one active sprint per board. We model a realistic cadence:
-  // sprint 1 is current, later sprints are future and spaced two weeks apart.
+  // sprint 1 is completed, sprint 2 is current, later sprints are future.
   if (sprintIndex === 0) {
+    const startDate = createShiftedDate(-35);
+    const endDate = createShiftedDate(-21);
+    return {
+      startDate: startDate.toISOString().split('T')[0],
+      endDate: endDate.toISOString().split('T')[0],
+      targetState: 'closed',
+      shouldActivate: false,
+    };
+  }
+
+  if (sprintIndex === 1) {
     const startDate = createShiftedDate(-7);
     const endDate = createShiftedDate(7);
     return {
       startDate: startDate.toISOString().split('T')[0],
       endDate: endDate.toISOString().split('T')[0],
+      targetState: 'active',
       shouldActivate: true,
     };
   }
 
-  const startDate = createShiftedDate(7 + ((sprintIndex - 1) * 14));
-  const endDate = createShiftedDate(21 + ((sprintIndex - 1) * 14));
+  const startDate = createShiftedDate(7 + ((sprintIndex - 2) * 14));
+  const endDate = createShiftedDate(21 + ((sprintIndex - 2) * 14));
   return {
     startDate: startDate.toISOString().split('T')[0],
     endDate: endDate.toISOString().split('T')[0],
+    targetState: 'future',
     shouldActivate: false,
   };
 }
@@ -3685,15 +3858,21 @@ async function moveIssuesToSprint(sprintId, issueKeys) {
   await jiraPost(`/rest/agile/1.0/sprint/${sprintId}/issue`, { issues: issueKeys });
 }
 
-async function createIssueLink(inwardKey, outwardKey) {
+async function createIssueLink(inwardKey, outwardKey, typeName = 'Blocks') {
+  if (!inwardKey || !outwardKey || inwardKey === outwardKey) {
+    return false;
+  }
+
   try {
     await jiraPost('/rest/api/3/issueLink', {
-      type: { name: 'Blocks' },
+      type: { name: typeName },
       inwardIssue: { key: inwardKey },
       outwardIssue: { key: outwardKey },
     });
+    return true;
   } catch (err) {
-    console.error(`Link ${inwardKey} -> ${outwardKey}: ${err.message}`);
+    console.error(`Link ${inwardKey} -> ${outwardKey} (${typeName}): ${err.message}`);
+    return false;
   }
 }
 
@@ -3711,8 +3890,8 @@ function buildEnvironmentFilterDefinition(config, state) {
   const runLabel = state.metadata.runLabel || createRunLabel();
   const filterName = `${config.environmentName} - Open Work (${runLabel})`;
   const filterDescription = `Auto-generated by the Cprime Demo Environment Creator for ${config.environmentName} run ${runLabel}.`;
-  const jql = `project in (${projectClause}) AND statusCategory != Done ORDER BY priority DESC, created DESC`;
-  const allWorkJql = `project in (${projectClause}) ORDER BY priority DESC, created DESC`;
+  const jql = `project in (${projectClause}) AND statusCategory != Done ORDER BY priority DESC, duedate ASC`;
+  const allWorkJql = `project in (${projectClause}) ORDER BY priority DESC, duedate ASC`;
 
   return {
     name: filterName,
@@ -4807,6 +4986,7 @@ const INCIDENT_BATCH_SIZE = 2;
 const ISSUE_BATCH_SIZE = 2;
 const VERSION_BATCH_SIZE = 2;
 const EPIC_BATCH_SIZE = 2;
+const SOFTWARE_VERSION_COUNT = 6;
 const MAX_INCIDENTS_PER_PROJECT = 60;
 const MAX_ISSUES_PER_PROJECT = 60;
 const MIN_SOFTWARE_SPRINTS_PER_PROJECT = 4;
@@ -4826,8 +5006,8 @@ const ACTIVE_ITSM_WORK_COUNT_KEYS = [
 
 const ITSM_WORK_COUNT_DEFAULTS = {
   incidentRequestsPerProject: 1,
-  problemRequestsPerProject: 0,
-  changeRequestsPerProject: 0,
+  problemRequestsPerProject: 1,
+  changeRequestsPerProject: 1,
   serviceRequestsPerProject: 1,
   postIncidentReviewsPerProject: 0,
 };
@@ -4861,8 +5041,8 @@ function normaliseItsmWorkCounts(payload = {}) {
 
   return {
     incidentRequestsPerProject: normalisePositiveInteger(payload.incidentRequestsPerProject, ITSM_WORK_COUNT_DEFAULTS.incidentRequestsPerProject, 1, MAX_INCIDENTS_PER_PROJECT),
-    problemRequestsPerProject: normalisePositiveInteger(payload.problemRequestsPerProject, ITSM_WORK_COUNT_DEFAULTS.problemRequestsPerProject, 0, MAX_INCIDENTS_PER_PROJECT),
-    changeRequestsPerProject: normalisePositiveInteger(payload.changeRequestsPerProject, ITSM_WORK_COUNT_DEFAULTS.changeRequestsPerProject, 0, MAX_INCIDENTS_PER_PROJECT),
+    problemRequestsPerProject: normalisePositiveInteger(payload.problemRequestsPerProject, ITSM_WORK_COUNT_DEFAULTS.problemRequestsPerProject, 1, MAX_INCIDENTS_PER_PROJECT),
+    changeRequestsPerProject: normalisePositiveInteger(payload.changeRequestsPerProject, ITSM_WORK_COUNT_DEFAULTS.changeRequestsPerProject, 1, MAX_INCIDENTS_PER_PROJECT),
     serviceRequestsPerProject: normalisePositiveInteger(payload.serviceRequestsPerProject, ITSM_WORK_COUNT_DEFAULTS.serviceRequestsPerProject, 1, MAX_INCIDENTS_PER_PROJECT),
     // The user-facing form no longer asks for post-incident reviews. Force the
     // value to zero even if a stale Custom UI bundle or browser cache sends it.
@@ -5006,6 +5186,7 @@ function normalisePayload(payload) {
     dashboardIntent: inferDashboardIntent(opsDashboardPrompt, industry),
     opsDashboardIntent: inferDashboardIntent(opsDashboardPrompt, industry),
     softwareDashboardIntent: inferDashboardIntent(softwareDashboardPrompt, industry),
+    runSeed: payload.runSeed || null,
     dateRange: String(payload.dateRange || '6 months'),
     dateRangeDays: parseDateRangeDays(payload.dateRange),
     jsmProjectCount: normalisePositiveInteger(payload.jsmProjectCount, 1, 0, 10),
@@ -5079,6 +5260,7 @@ function createChunkedExecutionState(accountId) {
 
 function buildChunkedExecutionPlan(config) {
   const content = getConfiguredContent(config);
+  const runSeed = config.runSeed || Date.now();
   const steps = [{
     type: 'generate-ai-content',
     label: 'Generate AI demo content',
@@ -5090,6 +5272,8 @@ function buildChunkedExecutionPlan(config) {
     steps.push({
       type: 'create-business-project',
       projectIndex,
+      projectName: `${config.environmentName} - ${config.industry} Ops ${projectIndex + 1} (${runSeed})`,
+      projectKeyPrefix: deriveRunProjectKeyPrefix({ ...config, runSeed }, config.industry, projectIndex),
       label: `Create JSM ITSM project ${projectIndex + 1} of ${config.jsmProjectCount}`,
     });
 
@@ -5100,15 +5284,15 @@ function buildChunkedExecutionPlan(config) {
     });
 
     steps.push({
-      type: 'create-business-form',
-      projectIndex,
-      label: `Create default form for JSM project ${projectIndex + 1}`,
-    });
-
-    steps.push({
       type: 'configure-itsm-foundation',
       projectIndex,
       label: `Configure queues, request types, and knowledge base for JSM project ${projectIndex + 1}`,
+    });
+
+    steps.push({
+      type: 'create-business-form',
+      projectIndex,
+      label: `Create default form for JSM project ${projectIndex + 1}`,
     });
 
     if (!csvIssueCreation) {
@@ -5133,6 +5317,8 @@ function buildChunkedExecutionPlan(config) {
     steps.push({
       type: 'create-software-project-shell',
       projectIndex,
+      projectName: `${config.environmentName} - ${config.industry} Dev ${projectIndex + 1} (${runSeed})`,
+      projectKeyPrefix: deriveRunProjectKeyPrefix({ ...config, runSeed }, config.industry, projectIndex + config.jsmProjectCount),
       label: `Create software project ${projectIndex + 1} of ${config.softwareProjectCount}`,
     });
 
@@ -5148,12 +5334,12 @@ function buildChunkedExecutionPlan(config) {
       label: `Check form support for software project ${projectIndex + 1}`,
     });
 
-    for (let start = 2; start <= 5; start += VERSION_BATCH_SIZE) {
+    for (let start = 0; start < SOFTWARE_VERSION_COUNT; start += VERSION_BATCH_SIZE) {
       steps.push({
         type: 'create-software-versions-batch',
         projectIndex,
-        startMonth: start,
-        count: Math.min(VERSION_BATCH_SIZE, 6 - start),
+        startRelease: start,
+        count: Math.min(VERSION_BATCH_SIZE, SOFTWARE_VERSION_COUNT - start),
         label: `Create versions batch for software project ${projectIndex + 1}`,
       });
     }
@@ -5370,12 +5556,25 @@ async function validateAdminAccess() {
 
 async function executeBusinessProjectStep(config, state, step) {
   const timestamp = Date.now();
-  const projectName = `${config.environmentName} - ${config.industry} Ops ${step.projectIndex + 1} (${timestamp})`;
-  const projectKeyPrefix = deriveProjectKeyPrefix(config.environmentName, config.industry);
+  const projectName = step.projectName || `${config.environmentName} - ${config.industry} Ops ${step.projectIndex + 1} (${timestamp})`;
+  const projectKeyPrefix = step.projectKeyPrefix || deriveRunProjectKeyPrefix(config, config.industry, step.projectIndex);
 
   try {
     addChunkedDiagnostics(state, [`JSM Project ${step.projectIndex + 1}: creating Jira Service Management ITSM project using template ${getJsmItsmTemplateKeys()[0]}.`]);
-    const project = await createJSMProject(projectName, state.metadata.accountId, projectKeyPrefix, state.results.diagnostics);
+    const expectedKey = generateKey(projectKeyPrefix, 0);
+    const existingProject = await getProjectByKeyIfExists(expectedKey);
+    const project = existingProject
+      ? {
+          id: existingProject.id,
+          key: existingProject.key,
+          serviceDeskAvailable: true,
+          projectTypeKey: existingProject.projectTypeKey || 'service_desk',
+        }
+      : await createJSMProject(projectName, state.metadata.accountId, projectKeyPrefix, state.results.diagnostics);
+
+    if (existingProject) {
+      addChunkedDiagnostics(state, [`JSM Project ${step.projectIndex + 1}: reused existing project ${existingProject.key} after a prior create attempt.`]);
+    }
 
     state.results.jsmProjects[step.projectIndex] = {
       id: project.id,
@@ -5466,7 +5665,12 @@ async function executeItsmFoundationStep(config, state, step) {
     return;
   }
 
-  const serviceDeskId = await getServiceDeskId(project.key);
+  const serviceDeskId = await getServiceDeskIdWithRetry(project.key, {
+    attempts: 8,
+    delayMs: 1500,
+    diagnostics: state.results.diagnostics,
+    label: 'ITSM foundation service desk lookup',
+  });
   if (!serviceDeskId) {
     addChunkedDiagnostics(state, [`ITSM foundation ${project.key}: service desk id was not found yet. Jira may still be provisioning the ITSM project.`]);
   } else {
@@ -5518,6 +5722,14 @@ async function executeBusinessIncidentBatchStep(config, state, step) {
   const boardStatusCycle = ['To Do', 'In Progress', 'Done'];
   const demoDateFields = project.demoDateFields || await getProjectDemoDateFieldIds(project.key, state.results.diagnostics);
   project.demoDateFields = demoDateFields;
+  if (!project.serviceDeskId) {
+    project.serviceDeskId = await getServiceDeskIdWithRetry(project.key, {
+      attempts: 4,
+      delayMs: 1000,
+      diagnostics: state.results.diagnostics,
+      label: 'ITSM batch service desk lookup',
+    });
+  }
   const assignableUsers = await getAssignableUsers(project.key, state.metadata.accountId);
   addChunkedDiagnostics(state, [`Assignable users ${project.key}: ${assignableUsers.length} available for ITSM work assignment.`]);
 
@@ -5612,15 +5824,23 @@ async function executeBusinessIncidentBatchStep(config, state, step) {
 
 async function executeSoftwareProjectStep(config, state, step) {
   const timestamp = Date.now();
-  const projectName = `${config.environmentName} - ${config.industry} Dev ${step.projectIndex + 1} (${timestamp})`;
-  const projectKeyPrefix = deriveProjectKeyPrefix(config.environmentName, config.industry);
+  const projectName = step.projectName || `${config.environmentName} - ${config.industry} Dev ${step.projectIndex + 1} (${timestamp})`;
+  const projectKeyPrefix = step.projectKeyPrefix || deriveRunProjectKeyPrefix(config, config.industry, step.projectIndex + config.jsmProjectCount);
   const softwareProjectConfig = getSoftwareProjectConfig(config, step.projectIndex);
   const softwareTemplate = normaliseSoftwareTemplate(softwareProjectConfig.softwareTemplate);
   const softwareProjectStyle = normaliseProjectManagementStyle(softwareProjectConfig.softwareProjectStyle);
 
   try {
     addChunkedDiagnostics(state, [`Software Project ${step.projectIndex + 1}: creating ${getProjectManagementStyleLabel(softwareProjectStyle)} ${softwareTemplate === 'kanban' ? 'Kanban' : 'Scrum'} project from selected dropdown values.`]);
-    const project = await createSoftwareProject(projectName, state.metadata.accountId, projectKeyPrefix, softwareTemplate, softwareProjectStyle);
+    const expectedKey = generateKey(projectKeyPrefix, 0);
+    const existingProject = await getProjectByKeyIfExists(expectedKey);
+    const project = existingProject
+      ? existingProject
+      : await createSoftwareProject(projectName, state.metadata.accountId, projectKeyPrefix, softwareTemplate, softwareProjectStyle);
+
+    if (existingProject) {
+      addChunkedDiagnostics(state, [`Software Project ${step.projectIndex + 1}: reused existing project ${existingProject.key} after a prior create attempt.`]);
+    }
 
     state.results.softwareProjects[step.projectIndex] = {
       id: project.id,
@@ -5628,6 +5848,7 @@ async function executeSoftwareProjectStep(config, state, step) {
       name: projectName,
       issueCount: 0,
       issueKeys: [],
+      issueRecords: [],
       firstIssueKey: null,
       versions: [],
       epicKeys: [],
@@ -5719,18 +5940,23 @@ async function executeSoftwareVersionBatchStep(state, step) {
     return;
   }
 
-  const currentMonth = new Date().getMonth() + 1;
-
   for (let offset = 0; offset < step.count; offset++) {
-    const month = step.startMonth + offset;
+    const releaseIndex = (step.startRelease ?? step.startMonth ?? 0) + offset;
+    const releasePlan = getSoftwareReleasePlan(project, releaseIndex);
 
     try {
-      const released = month < currentMonth;
-      const releaseDate = `2026-${pad(month)}-28`;
-      const createdVersion = await createVersion(project.id, `Version-2026.${pad(month)}`, releaseDate, released);
-      project.versions.push(createdVersion);
+      const createdVersion = await createVersion(project.id, releasePlan.name, releasePlan.releaseDate, releasePlan.released);
+      project.versions.push({
+        ...createdVersion,
+        name: createdVersion.name || releasePlan.name,
+        releaseDate: createdVersion.releaseDate || releasePlan.releaseDate,
+        released: Boolean(createdVersion.released ?? releasePlan.released),
+        releaseStage: releasePlan.stage,
+        methodology: releasePlan.methodology,
+      });
+      addChunkedDiagnostics(state, [`Version ${project.key}: created ${releasePlan.stage} ${releasePlan.name} (${releasePlan.releaseDate}).`]);
     } catch (err) {
-      addChunkedError(state, `Version 2026.${pad(month)} for ${project.key}: ${err.message}`);
+      addChunkedError(state, `Version ${releasePlan.name} for ${project.key}: ${err.message}`);
     }
   }
 }
@@ -5850,30 +6076,46 @@ async function executeSoftwareIssueBatchStep(config, state, step) {
       const status = getDemoDevStatus(issueIndex);
       const lifecycleForStatus = ensureResolvedLifecycleForStatus(lifecycle, status);
       const dueDate = buildDueDateFromLifecycle(lifecycleForStatus, priority, issueIndex);
+      const releaseVersions = chooseReleaseVersionIds(project, issueIndex, template.type);
+      const methodologyDescription = getSoftwareMethodologyDescription(project, issueIndex);
+      const epicKey = softwareTemplate === 'kanban'
+        ? null
+        : project.epicKeys[issueIndex % (project.epicKeys.length || 1)] || null;
       const issue = await createIssue(
         project.key,
         template.title,
         template.type,
-        softwareTemplate === 'kanban'
-          ? null
-          : project.epicKeys[issueIndex % (project.epicKeys.length || 1)] || null,
+        epicKey,
         priority,
         dueDate,
-        project.versions[issueIndex % (project.versions.length || 1)]?.id,
+        releaseVersions.fixVersionId,
         {
           assigneeAccountId,
+          affectsVersionId: releaseVersions.affectsVersionId,
           demoDateFields,
           diagnostics: state.results.diagnostics,
           environmentName: config.environmentName,
           lifecycle: lifecycleForStatus,
           projectKind: 'software',
           retentionPeriodDays: config.retentionPeriodDays,
-          description: template.description,
+          description: [template.description || '', methodologyDescription].filter(Boolean).join('\n\n'),
           skipEpicLink: softwareTemplate === 'kanban',
+          labels: getSoftwareMethodologyLabels(project, issueIndex, template.type),
         }
       );
 
       project.issueKeys.push(issue.key);
+      project.issueRecords.push({
+        key: issue.key,
+        title: template.title,
+        issueType: template.type,
+        status,
+        priority,
+        epicKey,
+        fixVersionId: releaseVersions.fixVersionId,
+        affectsVersionId: releaseVersions.affectsVersionId,
+        methodologyPhase: getWaterfallPhase(issueIndex),
+      });
       project.issueCount++;
       state.results.totalIssues++;
 
@@ -5944,14 +6186,37 @@ async function executeSoftwareSprintStep(config, state, step) {
       addChunkedDiagnostics(state, [`Sprint ${sprint.id}: moved ${issueChunk.length} issue(s) into ${sprint.name}.`]);
     }
 
-    if (schedule.shouldActivate) {
-      await updateSprint(sprint.id, {
-        name: sprint.name,
-        startDate: formatDateForJira(schedule.startDate),
-        endDate: formatDateForJira(schedule.endDate),
-        state: 'active',
-      });
-      addChunkedDiagnostics(state, [`Sprint ${sprint.id}: started active sprint ${sprint.name}.`]);
+    if (schedule.targetState === 'closed') {
+      try {
+        await updateSprint(sprint.id, {
+          name: sprint.name,
+          startDate: formatDateForJira(schedule.startDate),
+          endDate: formatDateForJira(schedule.endDate),
+          state: 'active',
+        });
+        await updateSprint(sprint.id, {
+          name: sprint.name,
+          startDate: formatDateForJira(schedule.startDate),
+          endDate: formatDateForJira(schedule.endDate),
+          completeDate: formatDateForJira(schedule.endDate),
+          state: 'closed',
+        });
+        addChunkedDiagnostics(state, [`Sprint ${sprint.id}: completed historical sprint ${sprint.name}.`]);
+      } catch (sprintStateErr) {
+        addChunkedDiagnostics(state, [`Sprint ${sprint.id}: historical closed-state update skipped: ${sprintStateErr.message}`]);
+      }
+    } else if (schedule.shouldActivate) {
+      try {
+        await updateSprint(sprint.id, {
+          name: sprint.name,
+          startDate: formatDateForJira(schedule.startDate),
+          endDate: formatDateForJira(schedule.endDate),
+          state: 'active',
+        });
+        addChunkedDiagnostics(state, [`Sprint ${sprint.id}: started active sprint ${sprint.name}.`]);
+      } catch (sprintStateErr) {
+        addChunkedDiagnostics(state, [`Sprint ${sprint.id}: active-state update skipped: ${sprintStateErr.message}`]);
+      }
     }
 
     project.sprints.push({
@@ -5959,7 +6224,7 @@ async function executeSoftwareSprintStep(config, state, step) {
       name: sprint.name,
       startDate: schedule.startDate,
       endDate: schedule.endDate,
-      state: schedule.shouldActivate ? 'active' : 'future',
+      state: schedule.targetState || (schedule.shouldActivate ? 'active' : 'future'),
       issueCount: issueChunk.length,
     });
   } catch (err) {
@@ -5968,23 +6233,78 @@ async function executeSoftwareSprintStep(config, state, step) {
 }
 
 async function executeDependencyStep(state) {
+  const linked = [];
+
+  const linkAndTrack = async (fromKey, toKey, typeName, label) => {
+    const ok = await createIssueLink(fromKey, toKey, typeName);
+    if (ok) {
+      linked.push(label || `${fromKey} ${typeName} ${toKey}`);
+    }
+  };
+
   try {
+    for (const project of state.results.softwareProjects || []) {
+      const records = project?.issueRecords || [];
+
+      for (let index = 1; index < Math.min(records.length, 8); index += 1) {
+        const current = records[index];
+        const previous = records[index - 1];
+
+        if (!current?.key || !previous?.key) {
+          continue;
+        }
+
+        if (String(current.issueType || '').toLowerCase() === 'bug') {
+          await linkAndTrack(current.key, previous.key, 'Blocks', `Software dependency: defect ${current.key} blocks ${previous.key}.`);
+        } else if (current.epicKey) {
+          await linkAndTrack(current.key, current.epicKey, 'Relates', `Software traceability: ${current.key} relates to epic ${current.epicKey}.`);
+        } else if (index % 3 === 0) {
+          await linkAndTrack(current.key, previous.key, 'Relates', `Software dependency: ${current.key} relates to ${previous.key}.`);
+        }
+      }
+    }
+
     if (state.results.softwareProjects.length >= 2) {
       const firstSoftwareIssue = state.results.softwareProjects[0]?.firstIssueKey;
       const secondSoftwareIssue = state.results.softwareProjects[1]?.firstIssueKey;
 
       if (firstSoftwareIssue && secondSoftwareIssue) {
-        await createIssueLink(firstSoftwareIssue, secondSoftwareIssue);
+        await linkAndTrack(firstSoftwareIssue, secondSoftwareIssue, 'Blocks', `Cross-project software dependency: ${firstSoftwareIssue} blocks ${secondSoftwareIssue}.`);
+      }
+    }
+
+    for (const jsmProject of state.results.jsmProjects || []) {
+      const workItems = jsmProject?.itsmWorkItems || jsmProject?.incidents || [];
+      const firstIncident = workItems.find(item => item.workType === 'Incident')?.key;
+      const firstProblem = workItems.find(item => item.workType === 'Problem')?.key;
+      const firstChange = workItems.find(item => item.workType === 'Change')?.key;
+      const firstServiceRequest = workItems.find(item => item.workType === 'Service Request')?.key;
+
+      if (firstIncident && firstProblem) {
+        await linkAndTrack(firstProblem, firstIncident, 'Relates', `ITSM relationship: problem ${firstProblem} relates to incident ${firstIncident}.`);
+      }
+
+      if (firstProblem && firstChange) {
+        await linkAndTrack(firstChange, firstProblem, 'Relates', `ITSM relationship: change ${firstChange} relates to problem ${firstProblem}.`);
+      }
+
+      if (firstServiceRequest && firstChange) {
+        await linkAndTrack(firstServiceRequest, firstChange, 'Relates', `ITSM relationship: service request ${firstServiceRequest} relates to change ${firstChange}.`);
       }
     }
 
     if (state.results.jsmProjects.length > 0 && state.results.softwareProjects.length > 0) {
-      const firstIncident = state.results.jsmProjects[0]?.incidents?.[0]?.key;
+      const firstIncident = state.results.jsmProjects[0]?.itsmWorkItems?.find(item => item.workType === 'Incident')?.key
+        || state.results.jsmProjects[0]?.incidents?.[0]?.key;
       const firstSoftwareIssue = state.results.softwareProjects[0]?.firstIssueKey;
 
       if (firstIncident && firstSoftwareIssue) {
-        await createIssueLink(firstSoftwareIssue, firstIncident);
+        await linkAndTrack(firstSoftwareIssue, firstIncident, 'Blocks', `DevOps relationship: software issue ${firstSoftwareIssue} blocks incident ${firstIncident}.`);
       }
+    }
+
+    if (linked.length > 0) {
+      addChunkedDiagnostics(state, linked.slice(0, 12));
     }
   } catch (err) {
     addChunkedError(state, `Dependencies: ${err.message}`);
@@ -6219,7 +6539,7 @@ async function searchDemoDashboardIssues(jql, customDateFields = {}) {
     // not Jira's native Created / Resolved system fields. Native Created reflects
     // the actual API insertion time, which would make every demo trend bunch up
     // around the run time instead of the selected ticket data duration.
-    fields: ['summary', 'status', 'priority', 'assignee', 'issuetype', 'statuscategorychangedate', 'duedate', 'project', 'fixVersions', ...customFieldIds],
+    fields: ['summary', 'status', 'priority', 'assignee', 'issuetype', 'duedate', 'project', 'fixVersions', ...customFieldIds],
   });
   return Array.isArray(data.issues) ? data.issues : [];
 }
@@ -6393,10 +6713,9 @@ function buildAverageTimeInStatus(issues, config = {}) {
 
   for (const issue of issues) {
     const statusName = issue.fields?.status?.name || 'Unknown';
-    // Prefer the status transition timestamp when Jira supplies it. If it is
-    // absent, fall back only to the app-created custom Created Date field.
-    // Do not use Jira's native Created system field for demo dashboard visuals.
-    const statusStartedAt = issue.fields?.statuscategorychangedate || getDemoCreatedDate(issue, config);
+    // Use the generated custom Created Date only. Jira's native status category
+    // timestamp changes during this demo run and makes the chart look current.
+    const statusStartedAt = getDemoCreatedDate(issue, config);
     const ageInDays = getWholeDaysBetween(statusStartedAt);
     if (ageInDays === null) {
       continue;
@@ -6882,6 +7201,18 @@ function buildChunkedSummary(config, state) {
     ? getProjectManagementStyleLabel(config.softwareProjectStyle)
     : softwareStyles.join(', ');
   const scrumProjectCount = (config.softwareProjects || []).filter(project => normaliseSoftwareTemplate(project.softwareTemplate) === 'scrum').length;
+  const softwareVersions = results.softwareProjects.flatMap(project => project.versions || []);
+  const softwareSprints = results.softwareProjects.flatMap(project => project.sprints || []);
+  const releaseStageCounts = softwareVersions.reduce((counts, version) => {
+    const stage = version.releaseStage || (version.released ? 'past' : 'upcoming');
+    counts[stage] = (counts[stage] || 0) + 1;
+    return counts;
+  }, {});
+  const sprintStateCounts = softwareSprints.reduce((counts, sprint) => {
+    const state = sprint.state || 'future';
+    counts[state] = (counts[state] || 0) + 1;
+    return counts;
+  }, {});
   const dashboards = results.dashboards?.filter(Boolean) || [];
   const savedFilters = results.savedFilters?.filter(Boolean) || [];
   const confluenceSpaces = results.confluenceSpaces?.filter(space => space?.success) || [];
@@ -6907,8 +7238,17 @@ function buildChunkedSummary(config, state) {
     `- Software Templates: ${softwareTemplateSummary}`,
     `- Dev Project Management: ${softwareStyleSummary}`,
     `- Sprints per Scrum Software Project: ${scrumProjectCount > 0 ? config.sprintsPerProject : 0}`,
+    `- Software Release Coverage: ${softwareVersions.length} version(s) modelled (${releaseStageCounts.past || 0} past, ${releaseStageCounts.current || 0} current, ${releaseStageCounts.upcoming || 0} upcoming); fix versions and affected versions are populated where Jira allows them.`,
+    `- Sprint Coverage: ${softwareSprints.length} sprint(s) modelled (${sprintStateCounts.closed || 0} completed, ${sprintStateCounts.active || 0} active, ${sprintStateCounts.future || 0} upcoming).`,
+    '- Delivery Method Coverage: Scrum/Kanban execution plus waterfall phase labels for requirements, design, build, test, and release traceability.',
     `- Ticket Lifecycle: archive generated tickets after 6 months, then delete them after 1 year in archived state`,
     `- Issue Creation Mode: ${isCsvIssueCreationMode() ? 'CSV-first historical import' : isRestDatePatchMode() ? 'Forge REST creation + CSV date patch' : 'Forge REST issue creation'}`,
+    ...(isCsvIssueCreationMode()
+      ? []
+      : [
+          '- Historical Date Strategy: generated Created Date and Resolved Date custom fields are populated from the selected ticket duration.',
+          '- Native Jira Created/Updated: Jira REST keeps these as Jira audit fields from the actual create/update time.',
+        ]),
     ...(isCsvIssueCreationMode()
       ? [
           `- Historical CSV Rows Generated: ${workerDataset?.success ? (workerDataset.ticketCount || 0) : 'Not generated'}`,
@@ -6948,7 +7288,25 @@ function buildChunkedSummary(config, state) {
 
   if (results.softwareProjects.length > 0) {
     lines.push('Software Projects Created:');
-    lines.push(...results.softwareProjects.map(project => `- ${project.key}: ${project.name} (${isCsvIssueCreationMode() ? 'CSV import pending' : `${project.issueCount} issues`}, ${getProjectManagementStyleLabel(project.softwareProjectStyle)}, board ${project.boardId || 'pending'})`));
+    lines.push(...results.softwareProjects.map(project => {
+      const versions = project.versions || [];
+      const sprints = project.sprints || [];
+      const projectReleaseCounts = versions.reduce((counts, version) => {
+        const stage = version.releaseStage || (version.released ? 'past' : 'upcoming');
+        counts[stage] = (counts[stage] || 0) + 1;
+        return counts;
+      }, {});
+      const projectSprintCounts = sprints.reduce((counts, sprint) => {
+        const state = sprint.state || 'future';
+        counts[state] = (counts[state] || 0) + 1;
+        return counts;
+      }, {});
+      const releaseSummary = `${versions.length} versions: ${projectReleaseCounts.past || 0} past, ${projectReleaseCounts.current || 0} current, ${projectReleaseCounts.upcoming || 0} upcoming`;
+      const sprintSummary = normaliseSoftwareTemplate(project.softwareTemplate) === 'scrum'
+        ? `; sprints ${projectSprintCounts.closed || 0} done, ${projectSprintCounts.active || 0} active, ${projectSprintCounts.future || 0} upcoming`
+        : '; Kanban flow/WIP labels applied';
+      return `- ${project.key}: ${project.name} (${isCsvIssueCreationMode() ? 'CSV import pending' : `${project.issueCount} issues`}, ${getProjectManagementStyleLabel(project.softwareProjectStyle)}, board ${project.boardId || 'pending'}; ${releaseSummary}${sprintSummary})`;
+    }));
     const softwareProjectsWithForms = results.softwareProjects.filter(project => project.smartForm?.name);
     if (softwareProjectsWithForms.length > 0) {
       lines.push('');
@@ -7051,6 +7409,7 @@ resolver.define('prepareDemoEnvironment', async ({ payload }) => {
   console.log('prepareDemoEnvironment started', JSON.stringify(payload));
 
   const config = normalisePayload(payload);
+  config.runSeed = config.runSeed || Date.now();
   if (!config.environmentName) {
     return {
       success: false,

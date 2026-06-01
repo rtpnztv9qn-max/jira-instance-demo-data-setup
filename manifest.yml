@@ -24,7 +24,7 @@ modules:
       interval: week
 resources:
   - key: main
-    path: static/hello-world/build
+    path: static/hello-world/build-itsm-required
 app:
   runtime:
     name: nodejs24.x

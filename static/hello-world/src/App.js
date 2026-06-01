@@ -1605,7 +1605,6 @@ function App() {
   const [result, setResult] = useState('');
   const [isSuccess, setIsSuccess] = useState(false);
   const [progress, setProgress] = useState('');
-  const [datePatchRows, setDatePatchRows] = useState([]);
   const [openDashboardPicker, setOpenDashboardPicker] = useState(null);
 
   const [form, setForm] = useState({
@@ -1619,8 +1618,8 @@ function App() {
     dateRange: '6 months',
     jsmProjectCount: 0,
     incidentRequestsPerProject: 1,
-    problemRequestsPerProject: 0,
-    changeRequestsPerProject: 0,
+    problemRequestsPerProject: 1,
+    changeRequestsPerProject: 1,
     serviceRequestsPerProject: 1,
     softwareProjects: [],
     retentionPeriodDays: 180,
@@ -1656,6 +1655,31 @@ function App() {
     });
   };
 
+  const invokeDemoStepWithRetry = async ({ currentConfig, currentState, step }) => {
+    const maxAttempts = ['create-business-project', 'create-software-project-shell'].includes(step.type) ? 2 : 1;
+    let lastError = null;
+
+    for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
+      try {
+        return await invoke('executeDemoEnvironmentStep', {
+          config: currentConfig,
+          state: currentState,
+          step,
+        });
+      } catch (err) {
+        lastError = err;
+        if (!/timed out|timeout/i.test(String(err?.message || '')) || attempt >= maxAttempts) {
+          throw err;
+        }
+
+        setProgress(`Retrying ${step.label} after Jira project creation took too long...`);
+        await new Promise(resolve => setTimeout(resolve, 8000));
+      }
+    }
+
+    throw lastError;
+  };
+
   const handleSubmit = async () => {
     if (!form.industry) {
       setResult('Please select a Domain');
@@ -1674,6 +1698,23 @@ function App() {
       return;
     }
 
+    if (parseInt(form.jsmProjectCount, 10) > 0) {
+      const requiredItsmFields = [
+        ['incidentRequestsPerProject', 'Incidents'],
+        ['serviceRequestsPerProject', 'Service Requests'],
+        ['changeRequestsPerProject', 'Changes'],
+        ['problemRequestsPerProject', 'Problems'],
+      ];
+      const missingItsmField = requiredItsmFields.find(([fieldName]) => (
+        !Number.isFinite(parseInt(form[fieldName], 10)) || parseInt(form[fieldName], 10) < 1
+      ));
+
+      if (missingItsmField) {
+        setResult(`Please enter at least 1 ${missingItsmField[1]} item for JSM ITSM linking.`);
+        return;
+      }
+    }
+
     const incompleteSoftwareProjectIndex = form.softwareProjects.findIndex(project => (
       !project.softwareTemplate
       || !project.softwareProjectStyle
@@ -1688,7 +1729,6 @@ function App() {
     setLoading(true);
     setResult('');
     setIsSuccess(false);
-    setDatePatchRows([]);
     setProgress('Preparing the demo environment plan...');
 
     try {
@@ -1754,9 +1794,9 @@ function App() {
         const step = preparation.plan[index];
         setProgress(`Step ${index + 1} of ${totalSteps}: ${step.label}`);
 
-        const stepResult = await invoke('executeDemoEnvironmentStep', {
-          config: currentConfig,
-          state: currentState,
+        const stepResult = await invokeDemoStepWithRetry({
+          currentConfig,
+          currentState,
           step,
         });
 
@@ -1778,12 +1818,10 @@ function App() {
       setProgress('');
       setResult(res.summary);
       setIsSuccess(res.success);
-      setDatePatchRows(currentState?.metadata?.historicalDatePatchIssues || []);
     } catch (err) {
       setProgress('');
       setResult('Error: ' + err.message);
       setIsSuccess(false);
-      setDatePatchRows([]);
     }
 
     setLoading(false);
@@ -1844,31 +1882,6 @@ function App() {
     borderRadius: '4px',
     boxSizing: 'border-box',
     transition: 'border-color 0.2s',
-  };
-
-  const escapeCsvValue = (value) => {
-    const text = String(value ?? '');
-    if (/[",\r\n]/.test(text)) {
-      return `"${text.replace(/"/g, '""')}"`;
-    }
-    return text;
-  };
-
-  const downloadDatePatchCsv = () => {
-    const headers = ['Issue key', 'Project key', 'Summary', 'Created', 'Resolved', 'Resolution'];
-    const csv = [
-      headers.join(','),
-      ...datePatchRows.map(row => headers.map(header => escapeCsvValue(row[header])).join(',')),
-    ].join('\r\n');
-    const blob = new Blob([csv], { type: 'text/csv;charset=utf-8' });
-    const url = URL.createObjectURL(blob);
-    const link = document.createElement('a');
-    link.href = url;
-    link.download = `${form.environmentName || 'demo'}-date-patch-tickets.csv`.replace(/[^a-z0-9_.-]+/gi, '-');
-    document.body.appendChild(link);
-    link.click();
-    document.body.removeChild(link);
-    URL.revokeObjectURL(url);
   };
 
   const selectStyle = {
@@ -2304,8 +2317,8 @@ function App() {
                 </div>
                 {renderItsmCountField('incidentRequestsPerProject', 'Incidents', 1)}
                 {renderItsmCountField('serviceRequestsPerProject', 'Service Requests', 1)}
-                {renderItsmCountField('changeRequestsPerProject', 'Changes', 0)}
-                {renderItsmCountField('problemRequestsPerProject', 'Problems', 0)}
+                {renderItsmCountField('changeRequestsPerProject', 'Changes', 1)}
+                {renderItsmCountField('problemRequestsPerProject', 'Problems', 1)}
                 <button type="button" onClick={removeJsmProject} style={removeButtonStyle}>
                   Remove
                 </button>
@@ -2411,16 +2424,6 @@ function App() {
         </button>
 
         {progress && <div style={progressStyle}>{progress}</div>}
-
-        {datePatchRows.length > 0 && (
-          <button
-            type="button"
-            onClick={downloadDatePatchCsv}
-            style={{ ...buttonStyle, marginTop: '16px', backgroundColor: '#172b4d' }}
-          >
-            Download Historical Date Patch CSV
-          </button>
-        )}
 
         {result && <div style={resultStyle}>{result}</div>}
       </div>
