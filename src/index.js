@@ -23,6 +23,7 @@ const resolver = new Resolver();
 const projectIssueTypeCache = new Map();
 const assignableUsersByProjectCache = new Map();
 const demoDateFieldsByProjectCache = new Map();
+let issueLinkTypesCache = null;
 let demoDateFieldIdsCache = null;
 let timelineStartDateFieldIdCache = null;
 let formsDynamicSchemaRejected = false;
@@ -283,7 +284,7 @@ function chooseReleaseVersionIds(project, issueIndex, issueType) {
   const upcomingVersions = versions.filter(version => version.releaseStage === 'upcoming');
   const isBug = String(issueType || '').toLowerCase() === 'bug';
   const fixPool = isBug
-    ? [...currentVersions, ...upcomingVersions, ...versions]
+    ? [...upcomingVersions, ...currentVersions, ...versions]
     : [...upcomingVersions, ...currentVersions, ...versions];
   const affectedPool = isBug
     ? [...pastVersions, ...currentVersions, ...versions]
@@ -2623,6 +2624,45 @@ async function createVersion(projectId, name, releaseDate, released) {
   });
 }
 
+async function createProjectComponent(projectKey, name, description) {
+  return await jiraPost('/rest/api/3/component', {
+    project: projectKey,
+    name,
+    description,
+  });
+}
+
+function getSoftwareComponentCatalog(project, industry) {
+  const template = normaliseSoftwareTemplate(project?.softwareTemplate);
+  const industrySlug = slugifyGitHubPart(industry, 'business');
+  const deliveryComponent = template === 'kanban' ? 'Flow Intake' : 'Sprint Delivery';
+
+  return [
+    deliveryComponent,
+    `${industrySlug}-platform`,
+  ].slice(0, 2).map(name => name
+    .split('-')
+    .map(part => part ? `${part.charAt(0).toUpperCase()}${part.slice(1)}` : part)
+    .join(' '));
+}
+
+function chooseSoftwareComponentNames(project, issueIndex, issueType) {
+  const components = project?.components || [];
+  if (components.length === 0) {
+    return [];
+  }
+
+  const primary = components[issueIndex % components.length]?.name;
+  const releaseComponent = components.find(component => /release/i.test(component.name))?.name;
+  const names = [primary];
+
+  if (String(issueType || '').toLowerCase() === 'bug' && releaseComponent && releaseComponent !== primary) {
+    names.push(releaseComponent);
+  }
+
+  return names.filter(Boolean).slice(0, 2);
+}
+
 async function createEpic(projectKey, epicName, options = {}) {
   const dueDate = options.dueDate || null;
   const startDate = options.startDate || null;
@@ -4106,20 +4146,7 @@ async function updateSprint(sprintId, body) {
 }
 
 function getSprintSchedule(sprintIndex) {
-  // Jira only allows one active sprint per board. We model a realistic cadence:
-  // sprint 1 is completed, sprint 2 is current, later sprints are future.
   if (sprintIndex === 0) {
-    const startDate = createShiftedDate(-35);
-    const endDate = createShiftedDate(-21);
-    return {
-      startDate: startDate.toISOString().split('T')[0],
-      endDate: endDate.toISOString().split('T')[0],
-      targetState: 'closed',
-      shouldActivate: false,
-    };
-  }
-
-  if (sprintIndex === 1) {
     const startDate = createShiftedDate(-7);
     const endDate = createShiftedDate(7);
     return {
@@ -4130,8 +4157,8 @@ function getSprintSchedule(sprintIndex) {
     };
   }
 
-  const startDate = createShiftedDate(7 + ((sprintIndex - 2) * 14));
-  const endDate = createShiftedDate(21 + ((sprintIndex - 2) * 14));
+  const startDate = createShiftedDate(7 + ((sprintIndex - 1) * 14));
+  const endDate = createShiftedDate(21 + ((sprintIndex - 1) * 14));
   return {
     startDate: startDate.toISOString().split('T')[0],
     endDate: endDate.toISOString().split('T')[0],
@@ -4145,21 +4172,44 @@ async function moveIssuesToSprint(sprintId, issueKeys) {
   await jiraPost(`/rest/agile/1.0/sprint/${sprintId}/issue`, { issues: issueKeys });
 }
 
+async function getIssueLinkTypeName(preferredTypeName = 'Blocks') {
+  if (!issueLinkTypesCache) {
+    const data = await jiraGet('/rest/api/3/issueLinkType');
+    issueLinkTypesCache = Array.isArray(data.issueLinkTypes) ? data.issueLinkTypes : [];
+  }
+
+  const preferred = String(preferredTypeName || '').toLowerCase();
+  const aliases = {
+    blocks: ['blocks', 'blocker'],
+    relates: ['relates', 'relates to', 'related'],
+    dependency: ['dependency', 'depends'],
+  };
+  const candidates = aliases[preferred] || [preferred];
+  const match = issueLinkTypesCache.find(type => candidates.some(candidate => (
+    String(type.name || '').toLowerCase() === candidate ||
+    String(type.inward || '').toLowerCase().includes(candidate) ||
+    String(type.outward || '').toLowerCase().includes(candidate)
+  )));
+
+  return match?.name || preferredTypeName;
+}
+
 async function createIssueLink(inwardKey, outwardKey, typeName = 'Blocks') {
   if (!inwardKey || !outwardKey || inwardKey === outwardKey) {
-    return false;
+    return { ok: false, message: 'Missing or duplicate issue key.' };
   }
 
   try {
+    const resolvedTypeName = await getIssueLinkTypeName(typeName);
     await jiraPost('/rest/api/3/issueLink', {
-      type: { name: typeName },
+      type: { name: resolvedTypeName },
       inwardIssue: { key: inwardKey },
       outwardIssue: { key: outwardKey },
     });
-    return true;
+    return { ok: true, typeName: resolvedTypeName };
   } catch (err) {
     console.error(`Link ${inwardKey} -> ${outwardKey} (${typeName}): ${err.message}`);
-    return false;
+    return { ok: false, message: err.message };
   }
 }
 
@@ -5632,6 +5682,12 @@ function buildChunkedExecutionPlan(config) {
       });
     }
 
+    steps.push({
+      type: 'create-software-components',
+      projectIndex,
+      label: `Create components for software project ${projectIndex + 1}`,
+    });
+
     if (!csvIssueCreation) {
       const epicCount = getConfiguredContent(config).epics.length;
       for (let start = 0; start < epicCount; start += EPIC_BATCH_SIZE) {
@@ -6147,6 +6203,7 @@ async function executeSoftwareProjectStep(config, state, step) {
       issueRecords: [],
       firstIssueKey: null,
       versions: [],
+      components: [],
       epicKeys: [],
       sprints: [],
       boardId: null,
@@ -6256,6 +6313,40 @@ async function executeSoftwareVersionBatchStep(state, step) {
       addChunkedDiagnostics(state, [`Version ${project.key}: created ${releasePlan.stage} ${releasePlan.name} (${releasePlan.releaseDate}).`]);
     } catch (err) {
       addChunkedError(state, `Version ${releasePlan.name} for ${project.key}: ${err.message}`);
+    }
+  }
+}
+
+async function executeSoftwareComponentsStep(config, state, step) {
+  const project = state.results.softwareProjects[step.projectIndex];
+  if (!project?.key) {
+    addChunkedError(state, `Software Project ${step.projectIndex + 1}: skipped components because the project was not created.`);
+    return;
+  }
+
+  const componentNames = getSoftwareComponentCatalog(project, config.industry);
+  project.components = project.components || [];
+
+  for (const componentName of componentNames) {
+    try {
+      const component = await createProjectComponent(
+        project.key,
+        componentName,
+        `${componentName} demo ownership area for ${project.name}. Used for release, dependency, and defect triage demos.`
+      );
+      project.components.push({
+        id: component.id || null,
+        name: component.name || componentName,
+      });
+      addChunkedDiagnostics(state, [`Component ${project.key}: created ${component.name || componentName}.`]);
+    } catch (err) {
+      const message = String(err.message || '');
+      if (message.toLowerCase().includes('already exists')) {
+        project.components.push({ id: null, name: componentName });
+        addChunkedDiagnostics(state, [`Component ${project.key}: reused existing ${componentName}.`]);
+      } else {
+        addChunkedDiagnostics(state, [`Component ${project.key}: create skipped for ${componentName}: ${message}`]);
+      }
     }
   }
 }
@@ -6407,6 +6498,7 @@ async function executeSoftwareIssueBatchStep(config, state, step) {
           description: [template.description || '', methodologyDescription].filter(Boolean).join('\n\n'),
           skipEpicLink: softwareTemplate === 'kanban',
           labels: getSoftwareMethodologyLabels(project, issueIndex, template.type),
+          components: chooseSoftwareComponentNames(project, issueIndex, template.type),
         }
       );
 
@@ -6540,11 +6632,14 @@ async function executeSoftwareSprintStep(config, state, step) {
 
 async function executeDependencyStep(state) {
   const linked = [];
+  const failedLinks = [];
 
   const linkAndTrack = async (fromKey, toKey, typeName, label) => {
-    const ok = await createIssueLink(fromKey, toKey, typeName);
-    if (ok) {
+    const result = await createIssueLink(fromKey, toKey, typeName);
+    if (result.ok) {
       linked.push(label || `${fromKey} ${typeName} ${toKey}`);
+    } else {
+      failedLinks.push(`${fromKey} -> ${toKey} (${typeName}): ${result.message}`);
     }
   };
 
@@ -6611,6 +6706,12 @@ async function executeDependencyStep(state) {
 
     if (linked.length > 0) {
       addChunkedDiagnostics(state, linked.slice(0, 12));
+    }
+    if (failedLinks.length > 0) {
+      addChunkedDiagnostics(state, [
+        `Dependency linking warnings (${failedLinks.length}):`,
+        ...failedLinks.slice(0, 8),
+      ]);
     }
   } catch (err) {
     addChunkedError(state, `Dependencies: ${err.message}`);
@@ -7592,6 +7693,7 @@ function buildChunkedSummary(config, state) {
   const scrumProjectCount = (config.softwareProjects || []).filter(project => normaliseSoftwareTemplate(project.softwareTemplate) === 'scrum').length;
   const softwareVersions = results.softwareProjects.flatMap(project => project.versions || []);
   const softwareSprints = results.softwareProjects.flatMap(project => project.sprints || []);
+  const softwareComponents = results.softwareProjects.flatMap(project => project.components || []);
   const releaseStageCounts = softwareVersions.reduce((counts, version) => {
     const stage = version.releaseStage || (version.released ? 'past' : 'upcoming');
     counts[stage] = (counts[stage] || 0) + 1;
@@ -7629,6 +7731,7 @@ function buildChunkedSummary(config, state) {
     `- Dev Project Management: ${softwareStyleSummary}`,
     `- Sprints per Scrum Software Project: ${scrumProjectCount > 0 ? config.sprintsPerProject : 0}`,
     `- Software Release Coverage: ${softwareVersions.length} version(s) modelled (${releaseStageCounts.past || 0} past, ${releaseStageCounts.current || 0} current, ${releaseStageCounts.upcoming || 0} upcoming); fix versions and affected versions are populated where Jira allows them.`,
+    `- Software Components: ${softwareComponents.length} project component(s) created and assigned to generated software issues.`,
     `- Sprint Coverage: ${softwareSprints.length} sprint(s) modelled (${sprintStateCounts.closed || 0} completed, ${sprintStateCounts.active || 0} active, ${sprintStateCounts.future || 0} upcoming).`,
     '- Delivery Method Coverage: Scrum/Kanban execution plus waterfall phase labels for requirements, design, build, test, and release traceability.',
     `- Ticket Lifecycle: archive generated tickets after 6 months, then delete them after 1 year in archived state`,
@@ -7693,10 +7796,11 @@ function buildChunkedSummary(config, state) {
         return counts;
       }, {});
       const releaseSummary = `${versions.length} versions: ${projectReleaseCounts.past || 0} past, ${projectReleaseCounts.current || 0} current, ${projectReleaseCounts.upcoming || 0} upcoming`;
+      const componentSummary = `${(project.components || []).length} components`;
       const sprintSummary = normaliseSoftwareTemplate(project.softwareTemplate) === 'scrum'
         ? `; sprints ${projectSprintCounts.closed || 0} done, ${projectSprintCounts.active || 0} active, ${projectSprintCounts.future || 0} upcoming`
         : '; Kanban flow/WIP labels applied';
-      return `- ${project.key}: ${project.name} (${isCsvIssueCreationMode() ? 'CSV import pending' : `${project.issueCount} issues`}, ${getProjectManagementStyleLabel(project.softwareProjectStyle)}, board ${project.boardId || 'pending'}; ${releaseSummary}${sprintSummary})`;
+      return `- ${project.key}: ${project.name} (${isCsvIssueCreationMode() ? 'CSV import pending' : `${project.issueCount} issues`}, ${getProjectManagementStyleLabel(project.softwareProjectStyle)}, board ${project.boardId || 'pending'}; ${releaseSummary}; ${componentSummary}${sprintSummary})`;
     }));
     const softwareProjectsWithForms = results.softwareProjects.filter(project => project.smartForm?.name);
     if (softwareProjectsWithForms.length > 0) {
@@ -7894,6 +7998,9 @@ resolver.define('executeDemoEnvironmentStep', async ({ payload }) => {
       break;
     case 'create-software-versions-batch':
       await executeSoftwareVersionBatchStep(state, step);
+      break;
+    case 'create-software-components':
+      await executeSoftwareComponentsStep(config, state, step);
       break;
     case 'create-software-epics-batch':
       await executeSoftwareEpicBatchStep(config, state, step);
