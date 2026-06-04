@@ -1,5 +1,6 @@
 const DEFAULT_GADGET_TITLES = {
   'forge-environment': 'Dashboard Summary',
+  'forge-summary': 'Summary',
   'forge-open-work': 'Open Work Details',
   'forge-status': 'Work by Status',
   'forge-priority': 'Work by Priority',
@@ -17,6 +18,7 @@ const DEFAULT_GADGET_TITLES = {
 
 const DEFAULT_GADGET_VISUALS = {
   'forge-environment': 'kpi-scorecard',
+  'forge-summary': 'summary-grid',
   'forge-open-work': 'issue-table',
   'forge-status': 'stacked-bars',
   'forge-priority': 'donut',
@@ -34,6 +36,7 @@ const DEFAULT_GADGET_VISUALS = {
 
 const ROLE_SECTION_LABELS = {
   'forge-environment': 'Executive KPI Header',
+  'forge-summary': 'Service Project Summary',
   'forge-open-work': 'Action Queue',
   'forge-status': 'Lifecycle Distribution',
   'forge-priority': 'Risk and Severity Mix',
@@ -741,7 +744,8 @@ export function inferDashboardIntent(prompt, industry, selectedValue = '') {
 }
 
 export function orderDashboardGadgetPlans(plans, dashboardIntent) {
-  const roles = dashboardIntent?.priorityRoles || DASHBOARD_PROFILES.operational.priorityRoles;
+  const intentRoles = dashboardIntent?.priorityRoles || DASHBOARD_PROFILES.operational.priorityRoles;
+  const roles = ['forge-summary', ...intentRoles.filter(role => role !== 'forge-summary')];
   const byRole = new Map(plans.map(plan => [plan.role, plan]));
 
   return roles

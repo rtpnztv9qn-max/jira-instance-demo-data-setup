@@ -58,6 +58,13 @@ function filterDashboardValues(options, values) {
 }
 
 const chartColors = ['#6b9fe8', '#ef5b52', '#c29500', '#2ca46f', '#2f9db7', '#a957dc', '#f5c04d', '#43328a'];
+const defaultSummaryFilters = {
+  assignee: 'all',
+  issueType: 'all',
+  status: 'all',
+  priority: 'all',
+  creationDate: 'last-6-months',
+};
 
 function formatDisplayDate(dateValue) {
   if (!dateValue) {
@@ -88,12 +95,33 @@ function getRetainUntilDate(generatedAt, retentionPeriodDays) {
   return startDate.toISOString().split('T')[0];
 }
 
-function DashboardGadget({ context }) {
+function DashboardGadget({ context, source = 'dashboard' }) {
   const [data, setData] = useState(null);
   const [error, setError] = useState('');
   const [hoveredChartItem, setHoveredChartItem] = useState(null);
+  const [selectedGeneratedReport, setSelectedGeneratedReport] = useState(null);
+  const [reportSearchTerm, setReportSearchTerm] = useState('');
+  const [reportListView, setReportListView] = useState(false);
+  const [projectInsightTab, setProjectInsightTab] = useState('summary');
+  const [summaryFilters, setSummaryFilters] = useState(defaultSummaryFilters);
+  const [openSummaryFilter, setOpenSummaryFilter] = useState(null);
 
   useEffect(() => {
+    if (source === 'project') {
+      const projectKey = context?.extension?.project?.key;
+
+      invoke('getProjectInsightsData', { projectKey })
+        .then((response) => {
+          if (!response.success) {
+            setError(response.message || 'Unable to load project Summary & Reports.');
+            return;
+          }
+          setData(response);
+        })
+        .catch((err) => setError(err.message));
+      return;
+    }
+
     const dashboardId = context?.extension?.dashboard?.id;
     const gadgetId = context?.extension?.gadget?.id;
 
@@ -106,7 +134,7 @@ function DashboardGadget({ context }) {
         setData(response);
       })
       .catch((err) => setError(err.message));
-  }, [context]);
+  }, [context, source]);
 
   if (error) {
     return <div style={{ padding: '16px', color: '#bf2600', fontSize: '13px' }}>{error}</div>;
@@ -443,12 +471,26 @@ function DashboardGadget({ context }) {
     return null;
   };
 
+  const isDuplicateGadgetTitle = (title) => (
+    String(title || '').trim().toLowerCase() === String(config.title || '').trim().toLowerCase()
+  );
+
+  const renderInlineVisualTitle = (title, fallbackTitle) => {
+    const displayTitle = title || fallbackTitle;
+
+    if (!displayTitle || isDuplicateGadgetTitle(displayTitle)) {
+      return null;
+    }
+
+    return <div style={{ fontSize: '15px', fontWeight: 800, textAlign: 'left', marginBottom: '10px' }}>{displayTitle}</div>;
+  };
+
   const renderHeader = (title, subtitle) => (
     <>
       <div style={headerStyle}>
         <div style={{ minWidth: 0 }}>
           {config.sectionLabel && <div style={sectionLabelStyle}>{config.sectionLabel}</div>}
-          <h3 style={titleStyle}>{title}</h3>
+          {!isDuplicateGadgetTitle(title) && <h3 style={titleStyle}>{title}</h3>}
           <div style={{ ...mutedStyle, marginTop: '3px' }}>{config.subtitle || subtitle || 'Interactive dashboard gadget'}</div>
         </div>
       </div>
@@ -535,7 +577,7 @@ function DashboardGadget({ context }) {
 
     return (
       <div style={{ ...visualPanelStyle, margin: '0 16px 14px', padding: '18px' }}>
-        <div style={{ fontSize: '15px', fontWeight: 800, marginBottom: '4px' }}>{config.dashboardProfile || config.title || 'Dashboard KPIs'}</div>
+        {renderInlineVisualTitle(config.dashboardProfile, 'Dashboard KPIs')}
         <div style={{ ...mutedStyle, marginBottom: '14px' }}>KPI comparison by generated ticket data</div>
         {chartGroups.map(renderChartGroup)}
       </div>
@@ -641,7 +683,7 @@ function DashboardGadget({ context }) {
         style={{ ...visualPanelStyle, margin: '0 16px 14px', position: 'relative', minHeight: '250px', padding: '18px 18px 14px' }}
       >
         {hoveredChartItem && <div style={chartTooltipStyle}>{typeof hoveredChartItem === 'string' ? hoveredChartItem : hoveredChartItem.label}</div>}
-        <div style={{ fontSize: '15px', fontWeight: 800, textAlign: 'left', marginBottom: '10px' }}>{config.title || 'Bar Chart'}</div>
+        {renderInlineVisualTitle(config.title, 'Bar Chart')}
         <div style={{ display: 'grid', gridTemplateColumns: '34px 1fr', gap: '10px' }}>
           <div style={{ display: 'flex', flexDirection: 'column', justifyContent: 'space-between', height: '160px', color: '#7a869a', fontSize: '11px', textAlign: 'right' }}>
             {yAxisTicks.map(tick => <span key={tick}>{tick}</span>)}
@@ -878,6 +920,8 @@ function DashboardGadget({ context }) {
     const recentItems = items;
     const maxTotal = Math.max(...recentItems.map((item) => item.created + item.resolved), 1);
     const chartHeight = 170;
+    const axisBucketWidth = 74;
+    const chartMinWidth = Math.max(560, recentItems.length * axisBucketWidth);
     const points = recentItems.map((item, index) => {
       const x = recentItems.length === 1 ? 0 : (index / (recentItems.length - 1)) * 100;
       const yCreated = 100 - ((item.created / maxTotal) * 100);
@@ -896,43 +940,711 @@ function DashboardGadget({ context }) {
 
     return (
       <div style={{ ...visualPanelStyle, margin: '0 16px 14px', padding: '18px' }}>
-        <div style={{ fontSize: '15px', fontWeight: 800, textAlign: 'left', marginBottom: '10px' }}>{config.title || 'Custom Created Date vs Resolved Date'}</div>
-        <div style={{ display: 'grid', gridTemplateColumns: '34px 1fr', gap: '10px' }}>
-          <div style={{ display: 'flex', flexDirection: 'column', justifyContent: 'space-between', height: `${chartHeight}px`, color: '#7a869a', fontSize: '11px', textAlign: 'right' }}>
-            {[maxTotal, Math.round(maxTotal * 0.75), Math.round(maxTotal * 0.5), Math.round(maxTotal * 0.25), 0].map(tick => <span key={tick}>{tick}</span>)}
-          </div>
-          <div style={{ position: 'relative', height: `${chartHeight}px`, borderLeft: '1px solid #dfe1e6', borderBottom: '1px solid #dfe1e6' }}>
-            {[0, 25, 50, 75, 100].map(line => (
-              <div key={line} style={{ position: 'absolute', left: 0, right: 0, bottom: `${line}%`, borderTop: '1px solid #ebecf0' }} />
-            ))}
-            <svg viewBox="0 0 100 100" preserveAspectRatio="none" style={{ position: 'absolute', inset: 0, width: '100%', height: '100%', overflow: 'visible' }}>
-              <polygon points={createdArea} fill="rgba(222, 53, 11, 0.72)" stroke="none" />
-              <polyline points={createdPolyline} fill="none" stroke="#de350b" strokeWidth="1.5" vectorEffect="non-scaling-stroke" />
-              <polyline points={resolvedPolyline} fill="none" stroke="#36b37e" strokeWidth="1.5" vectorEffect="non-scaling-stroke" />
-              {points.map((point) => (
-                <circle key={`${point.name}-resolved`} cx={point.x} cy={point.yResolved} r="1.2" fill="#36b37e" vectorEffect="non-scaling-stroke" />
-              ))}
-            </svg>
-            <div style={{ position: 'absolute', inset: 0, display: 'flex', alignItems: 'flex-end', gap: '6px', padding: '0 8px', pointerEvents: 'none' }}>
-              {recentItems.map((item, index) => (
-                <div key={`${item.name}-bars`} style={{ flex: 1, minWidth: 0, display: 'flex', alignItems: 'flex-end', justifyContent: 'center', gap: '2px', height: '100%' }}>
-                  <div style={{ width: '32%', height: `${Math.max(2, Math.round((item.created / maxTotal) * chartHeight))}px`, background: 'rgba(222, 53, 11, 0.25)' }} />
-                  <div style={{ width: '32%', height: `${Math.max(2, Math.round((item.resolved / maxTotal) * chartHeight))}px`, background: 'rgba(54, 179, 126, 0.35)' }} />
+        {renderInlineVisualTitle(config.title, 'Custom Created Date vs Resolved Date')}
+        <div style={{ overflowX: 'auto', overflowY: 'hidden', paddingBottom: '4px' }}>
+          <div style={{ minWidth: `${chartMinWidth}px` }}>
+            <div style={{ display: 'grid', gridTemplateColumns: '34px minmax(0, 1fr)', gap: '10px' }}>
+              <div style={{ display: 'flex', flexDirection: 'column', justifyContent: 'space-between', height: `${chartHeight}px`, color: '#7a869a', fontSize: '11px', textAlign: 'right' }}>
+                {[maxTotal, Math.round(maxTotal * 0.75), Math.round(maxTotal * 0.5), Math.round(maxTotal * 0.25), 0].map(tick => <span key={tick}>{tick}</span>)}
+              </div>
+              <div style={{ position: 'relative', height: `${chartHeight}px`, borderLeft: '1px solid #dfe1e6', borderBottom: '1px solid #dfe1e6' }}>
+                {[0, 25, 50, 75, 100].map(line => (
+                  <div key={line} style={{ position: 'absolute', left: 0, right: 0, bottom: `${line}%`, borderTop: '1px solid #ebecf0' }} />
+                ))}
+                <svg viewBox="0 0 100 100" preserveAspectRatio="none" style={{ position: 'absolute', inset: 0, width: '100%', height: '100%', overflow: 'visible' }}>
+                  <polygon points={createdArea} fill="rgba(222, 53, 11, 0.72)" stroke="none" />
+                  <polyline points={createdPolyline} fill="none" stroke="#de350b" strokeWidth="1.5" vectorEffect="non-scaling-stroke" />
+                  <polyline points={resolvedPolyline} fill="none" stroke="#36b37e" strokeWidth="1.5" vectorEffect="non-scaling-stroke" />
+                  {points.map((point) => (
+                    <circle key={`${point.name}-resolved`} cx={point.x} cy={point.yResolved} r="1.2" fill="#36b37e" vectorEffect="non-scaling-stroke" />
+                  ))}
+                </svg>
+                <div style={{ position: 'absolute', inset: 0, display: 'flex', alignItems: 'flex-end', gap: '6px', padding: '0 8px', pointerEvents: 'none' }}>
+                  {recentItems.map((item, index) => (
+                    <div key={`${item.name}-bars`} style={{ flex: 1, minWidth: `${axisBucketWidth - 20}px`, display: 'flex', alignItems: 'flex-end', justifyContent: 'center', gap: '2px', height: '100%' }}>
+                      <div style={{ width: '32%', height: `${Math.max(2, Math.round((item.created / maxTotal) * chartHeight))}px`, background: 'rgba(222, 53, 11, 0.25)' }} />
+                      <div style={{ width: '32%', height: `${Math.max(2, Math.round((item.resolved / maxTotal) * chartHeight))}px`, background: 'rgba(54, 179, 126, 0.35)' }} />
+                    </div>
+                  ))}
+                </div>
+              </div>
+            </div>
+            <div style={{ display: 'grid', gridTemplateColumns: `34px repeat(${recentItems.length}, minmax(${axisBucketWidth - 14}px, 1fr))`, gap: '6px', marginTop: '10px', alignItems: 'start' }}>
+              <span />
+              {recentItems.map(item => (
+                <div
+                  key={`${item.name}-axis`}
+                  title={item.name}
+                  style={{
+                    ...mutedStyle,
+                    minHeight: '34px',
+                    lineHeight: '14px',
+                    textAlign: 'center',
+                    whiteSpace: 'normal',
+                    overflowWrap: 'anywhere',
+                  }}
+                >
+                  {item.name}
                 </div>
               ))}
             </div>
           </div>
         </div>
-        <div style={{ display: 'grid', gridTemplateColumns: `34px repeat(${recentItems.length}, minmax(0, 1fr))`, gap: '6px', marginTop: '8px' }}>
-          <span />
-          {recentItems.map(item => (
-            <div key={`${item.name}-axis`} style={{ ...mutedStyle, textAlign: 'left', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{item.name}</div>
-          ))}
-        </div>
         <div style={{ display: 'flex', gap: '14px', justifyContent: 'flex-start', marginTop: '10px', ...mutedStyle }}>
           <span><span style={{ display: 'inline-block', width: '10px', height: '10px', background: '#de350b', marginRight: '5px' }} />Created</span>
           <span><span style={{ display: 'inline-block', width: '10px', height: '10px', background: '#36b37e', marginRight: '5px' }} />Resolved</span>
         </div>
+      </div>
+    );
+  };
+
+  const renderReportSparkline = (items) => {
+    const trendItems = (items || []).filter(item => item.created > 0 || item.resolved > 0).slice(-12);
+    const maxTotal = Math.max(...trendItems.map(item => Math.max(item.created, item.resolved)), 1);
+
+    if (trendItems.length === 0) {
+      return <div style={{ ...mutedStyle, minHeight: '48px', display: 'flex', alignItems: 'center' }}>No custom date trend data found.</div>;
+    }
+
+    const points = trendItems.map((item, index) => {
+      const x = trendItems.length === 1 ? 0 : (index / (trendItems.length - 1)) * 100;
+      return {
+        ...item,
+        x,
+        yCreated: 100 - ((item.created / maxTotal) * 100),
+        yResolved: 100 - ((item.resolved / maxTotal) * 100),
+      };
+    });
+    const createdLine = points.map(point => `${point.x},${point.yCreated}`).join(' ');
+    const resolvedLine = points.map(point => `${point.x},${point.yResolved}`).join(' ');
+
+    return (
+      <div style={{ height: '54px', borderLeft: '1px solid #dfe1e6', borderBottom: '1px solid #dfe1e6', position: 'relative' }}>
+        <svg viewBox="0 0 100 100" preserveAspectRatio="none" style={{ position: 'absolute', inset: 0, width: '100%', height: '100%' }}>
+          <polyline points={createdLine} fill="none" stroke="#de350b" strokeWidth="2" vectorEffect="non-scaling-stroke" />
+          <polyline points={resolvedLine} fill="none" stroke="#36b37e" strokeWidth="2" vectorEffect="non-scaling-stroke" />
+        </svg>
+      </div>
+    );
+  };
+
+  const countIssuesForSummary = (items, field, fallback = 'None') => {
+    const counts = (items || []).reduce((acc, issue) => {
+      const key = issue[field] || fallback;
+      acc[key] = (acc[key] || 0) + 1;
+      return acc;
+    }, {});
+    return Object.entries(counts).map(([name, count]) => ({ name, count }));
+  };
+
+  const renderSummaryPanel = (title, items = [], mode = 'trend') => {
+    const trendItems = data.createdResolvedTrend || [];
+    const maxValue = Math.max(...trendItems.map(item => Math.max(item.created || 0, item.resolved || 0)), 1);
+    const createdPoints = trendItems.map((item, index) => {
+      const x = trendItems.length <= 1 ? 0 : (index / (trendItems.length - 1)) * 100;
+      const y = 100 - (((item.created || 0) / maxValue) * 100);
+      return `${x},${y}`;
+    }).join(' ');
+    const resolvedPoints = trendItems.map((item, index) => {
+      const x = trendItems.length <= 1 ? 0 : (index / (trendItems.length - 1)) * 100;
+      const y = 100 - (((item.resolved || 0) / maxValue) * 100);
+      return `${x},${y}`;
+    }).join(' ');
+    const barItems = (items || []).filter(item => item.count > 0).slice(0, 12);
+    const barMax = Math.max(...barItems.map(item => item.count), 1);
+
+    return (
+      <div style={{ border: '1px solid #dfe1e6', borderRadius: '3px', background: '#ffffff', minHeight: '190px', padding: '12px', boxSizing: 'border-box' }}>
+        <div style={{ fontSize: '12px', fontWeight: 800, color: '#172b4d', marginBottom: '8px' }}>{title}</div>
+        <div style={{ height: '132px', position: 'relative', borderLeft: '1px solid #6b778c', borderBottom: '1px solid #6b778c' }}>
+          {[25, 50, 75].map(line => (
+            <div key={line} style={{ position: 'absolute', left: 0, right: 0, bottom: `${line}%`, borderTop: '1px solid #dfe1e6' }} />
+          ))}
+          {mode === 'bars' ? (
+            <div style={{ position: 'absolute', inset: '8px 10px 0', display: 'flex', alignItems: 'flex-end', gap: '8px' }}>
+              {barItems.map(item => (
+                <div key={item.name} title={`${item.name}: ${item.count}`} style={{ flex: 1, minWidth: '8px', height: `${Math.max(4, Math.round((item.count / barMax) * 100))}%`, background: '#b3d4ff' }} />
+              ))}
+            </div>
+          ) : (
+            <svg viewBox="0 0 100 100" preserveAspectRatio="none" style={{ position: 'absolute', inset: '8px 10px 0 10px', width: 'calc(100% - 20px)', height: 'calc(100% - 8px)' }}>
+              <polyline points={createdPoints} fill="none" stroke="#de350b" strokeWidth="2" vectorEffect="non-scaling-stroke" />
+              <polyline points={resolvedPoints} fill="none" stroke="#36b37e" strokeWidth="2" vectorEffect="non-scaling-stroke" />
+            </svg>
+          )}
+        </div>
+        <div style={{ ...mutedStyle, textAlign: 'center', marginTop: '6px' }}>{mode === 'bars' ? 'Count of work items' : 'Work item custom date trend'}</div>
+      </div>
+    );
+  };
+
+  const renderGeneratedSummaryDashboard = () => {
+    const normaliseFilterValue = value => String(value || 'none');
+    const buildIssueOptions = (field, fallback) => {
+      const names = Array.from(new Set(issues.map(issue => normaliseFilterValue(issue[field] || fallback)))).filter(Boolean).sort();
+      return [
+        { value: 'all', label: `All ${fallback.toLowerCase()}s` },
+        ...names.map(name => ({ value: name, label: name })),
+      ];
+    };
+    const creationDateOptions = [
+      { value: 'all', label: 'All time' },
+      { value: 'last-30-days', label: 'Last 30 days' },
+      { value: 'last-90-days', label: 'Last 90 days' },
+      { value: 'last-6-months', label: 'Last 6 months' },
+    ];
+    const generatedDate = new Date(`${config.generatedAt || new Date().toISOString().split('T')[0]}T00:00:00`);
+    const creationDateCutoff = (() => {
+      const cutoff = new Date(generatedDate);
+      if (summaryFilters.creationDate === 'last-30-days') cutoff.setDate(cutoff.getDate() - 30);
+      if (summaryFilters.creationDate === 'last-90-days') cutoff.setDate(cutoff.getDate() - 90);
+      if (summaryFilters.creationDate === 'last-6-months') cutoff.setMonth(cutoff.getMonth() - 6);
+      return summaryFilters.creationDate === 'all' ? null : cutoff;
+    })();
+    const filteredIssues = issues.filter(issue => {
+      const created = issue.createdAt ? new Date(`${issue.createdAt}T00:00:00`) : null;
+      return (summaryFilters.assignee === 'all' || normaliseFilterValue(issue.assignee || 'Unassigned') === summaryFilters.assignee)
+        && (summaryFilters.issueType === 'all' || normaliseFilterValue(issue.issueType || 'Request type') === summaryFilters.issueType)
+        && (summaryFilters.status === 'all' || normaliseFilterValue(issue.status || 'Status') === summaryFilters.status)
+        && (summaryFilters.priority === 'all' || normaliseFilterValue(issue.priority || 'Priority') === summaryFilters.priority)
+        && (!creationDateCutoff || (created && !Number.isNaN(created.getTime()) && created >= creationDateCutoff));
+    });
+    const openIssues = filteredIssues.filter(issue => issue.status !== 'Done');
+    const doneIssues = filteredIssues.filter(issue => issue.status === 'Done');
+    const highPriorityIssues = filteredIssues.filter(issue => ['Critical', 'Highest', 'High'].includes(issue.priority));
+    const issueTypeItems = countIssuesForSummary(openIssues, 'issueType', 'Request type').sort((a, b) => b.count - a.count);
+    const priorityItems = countIssuesForSummary(filteredIssues, 'priority', 'Priority').sort((a, b) => b.count - a.count);
+    const statusItems = countIssuesForSummary(filteredIssues, 'status', 'Status').sort((a, b) => b.count - a.count);
+    const today = new Date(`${config.generatedAt || new Date().toISOString().split('T')[0]}T00:00:00`);
+    const durations = doneIssues.map(issue => {
+      const start = issue.createdAt ? new Date(`${issue.createdAt}T00:00:00`) : null;
+      const end = issue.resolvedAt ? new Date(`${issue.resolvedAt}T00:00:00`) : null;
+      if (!start || !end || Number.isNaN(start.getTime()) || Number.isNaN(end.getTime())) return null;
+      return Math.max(0, Math.round((end - start) / 86400000));
+    }).filter(value => value !== null);
+    const avgResolutionDays = durations.length === 0 ? 0 : Math.round(durations.reduce((sum, value) => sum + value, 0) / durations.length);
+    const median = values => {
+      if (!values.length) return 0;
+      const sorted = [...values].sort((a, b) => a - b);
+      const middle = Math.floor(sorted.length / 2);
+      return sorted.length % 2 ? sorted[middle] : Math.round((sorted[middle - 1] + sorted[middle]) / 2);
+    };
+    const ageByPriority = priorityItems.map(priority => {
+      const ages = filteredIssues.filter(issue => issue.priority === priority.name).map(issue => {
+        const start = issue.createdAt ? new Date(`${issue.createdAt}T00:00:00`) : null;
+        if (!start || Number.isNaN(start.getTime()) || Number.isNaN(today.getTime())) return null;
+        const end = issue.resolvedAt ? new Date(`${issue.resolvedAt}T00:00:00`) : today;
+        if (Number.isNaN(end.getTime())) return null;
+        return Math.max(0, Math.round((end - start) / 86400000));
+      }).filter(value => value !== null);
+      return { name: priority.name, count: median(ages) };
+    });
+    const slaItems = [
+      { name: 'Within SLA', count: Math.max(0, filteredIssues.length - highPriorityIssues.length) },
+      { name: 'At risk', count: highPriorityIssues.length },
+    ];
+    const firstContactItems = [
+      { name: 'Resolved', count: doneIssues.length },
+      { name: 'Open', count: openIssues.length },
+    ];
+    const recentIssues = [...filteredIssues].sort((a, b) => String(b.resolvedAt || b.createdAt || '').localeCompare(String(a.resolvedAt || a.createdAt || ''))).slice(0, 4);
+    const baseTrendItems = data.createdResolvedTrend || [];
+    const trendMode = baseTrendItems.some(item => String(item.key || '').length === 7)
+      ? 'month'
+      : baseTrendItems.some(item => String(item.name || '').startsWith('Week of '))
+        ? 'week'
+        : 'day';
+    const getSummaryTrendKey = dateValue => {
+      const value = new Date(`${dateValue}T00:00:00.000Z`);
+      if (!dateValue || Number.isNaN(value.getTime())) return null;
+      if (trendMode === 'month') {
+        return `${value.getUTCFullYear()}-${String(value.getUTCMonth() + 1).padStart(2, '0')}`;
+      }
+      if (trendMode === 'week') {
+        const day = value.getUTCDay();
+        const mondayOffset = day === 0 ? -6 : 1 - day;
+        value.setUTCDate(value.getUTCDate() + mondayOffset);
+        return value.toISOString().split('T')[0];
+      }
+      return value.toISOString().split('T')[0];
+    };
+    const summaryTrendItems = baseTrendItems.map(bucket => ({
+      ...bucket,
+      created: filteredIssues.filter(issue => getSummaryTrendKey(issue.createdAt) === bucket.key).length,
+      resolved: filteredIssues.filter(issue => issue.status === 'Done' && getSummaryTrendKey(issue.resolvedAt) === bucket.key).length,
+    }));
+    const summaryFilterConfigs = [
+      { id: 'assignee', label: 'Work item assignee', options: buildIssueOptions('assignee', 'Assignee') },
+      { id: 'issueType', label: 'Request type', options: buildIssueOptions('issueType', 'Request type') },
+      { id: 'status', label: 'Work item status', options: buildIssueOptions('status', 'Status') },
+      { id: 'priority', label: 'Work item priority', options: buildIssueOptions('priority', 'Priority') },
+      { id: 'creationDate', label: 'Work item creation date', options: creationDateOptions },
+    ];
+    const getSelectedFilterLabel = filter => (
+      filter.options.find(option => option.value === summaryFilters[filter.id])?.label || filter.options[0]?.label || 'All'
+    );
+    const updateSummaryFilter = (id, value) => {
+      setSummaryFilters(current => ({ ...current, [id]: value }));
+      setOpenSummaryFilter(null);
+      hideSummaryTooltip();
+    };
+    const resetSummaryFilters = () => {
+      setSummaryFilters(defaultSummaryFilters);
+      setOpenSummaryFilter(null);
+      hideSummaryTooltip();
+    };
+    const summaryTooltipStyle = {
+      ...chartTooltipStyle,
+      top: '12px',
+      left: '50%',
+      transform: 'translateX(-50%)',
+      maxWidth: 'min(360px, calc(100% - 28px))',
+      whiteSpace: 'pre-line',
+      textAlign: 'left',
+      zIndex: 5,
+    };
+    const showSummaryTooltip = label => setHoveredChartItem({ label });
+    const hideSummaryTooltip = () => setHoveredChartItem(null);
+    const formatSummaryValue = (value, unit = 'work item') => `${value} ${unit}${value === 1 ? '' : 's'}`;
+    const panelTitleStyle = { fontSize: '12px', lineHeight: '16px', fontWeight: 700, color: '#172b4d', marginBottom: '8px' };
+    const axisLabelStyle = { color: '#5e6c84', fontSize: '10px', fontWeight: 700, lineHeight: '12px' };
+    const gadgetStyle = {
+      background: '#ffffff',
+      border: '1px solid #dfe1e6',
+      borderRadius: '3px',
+      minHeight: '232px',
+      padding: '12px 14px',
+      boxSizing: 'border-box',
+      position: 'relative',
+      overflow: 'hidden',
+    };
+    const filterButton = filter => {
+      const selectedLabel = getSelectedFilterLabel(filter);
+      const isDefaultValue = summaryFilters[filter.id] === defaultSummaryFilters[filter.id];
+      const buttonText = isDefaultValue && filter.id !== 'creationDate'
+        ? filter.label
+        : `${filter.label}: ${selectedLabel}`;
+      return (
+        <div key={filter.id} style={{ position: 'relative' }}>
+          <button
+            type="button"
+            onClick={() => setOpenSummaryFilter(openSummaryFilter === filter.id ? null : filter.id)}
+            style={{ height: '32px', border: '1px solid #dfe1e6', borderRadius: '3px', background: isDefaultValue ? '#ffffff' : '#deebff', color: '#172b4d', padding: '0 10px', fontSize: '12px', display: 'inline-flex', alignItems: 'center', gap: '6px', cursor: 'pointer' }}
+          >
+            <span style={{ color: '#0052cc', fontWeight: 800 }}>v</span>{buttonText}
+          </button>
+          {openSummaryFilter === filter.id && (
+            <div style={{ position: 'absolute', top: '36px', left: 0, zIndex: 10, minWidth: '220px', maxHeight: '240px', overflowY: 'auto', background: '#ffffff', border: '1px solid #dfe1e6', borderRadius: '3px', boxShadow: '0 8px 18px rgba(9,30,66,0.18)', padding: '6px' }}>
+              {filter.options.map(option => (
+                <button
+                  key={option.value}
+                  type="button"
+                  onClick={() => updateSummaryFilter(filter.id, option.value)}
+                  style={{ width: '100%', border: 0, background: summaryFilters[filter.id] === option.value ? '#deebff' : '#ffffff', color: '#172b4d', minHeight: '30px', padding: '6px 8px', textAlign: 'left', borderRadius: '3px', cursor: 'pointer', fontSize: '12px' }}
+                >
+                  {option.label}
+                </button>
+              ))}
+            </div>
+          )}
+        </div>
+      );
+    };
+    const emptyChart = (title, yAxis, xAxis, options = {}) => (
+      <div style={{ ...gadgetStyle, minHeight: options.tall ? '284px' : '232px' }}>
+        <div style={panelTitleStyle}>{title}</div>
+        <div style={{ display: 'grid', gridTemplateColumns: '28px minmax(0, 1fr)', gap: '10px', height: options.tall ? '228px' : '176px', alignItems: 'stretch' }}>
+          <div style={{ ...axisLabelStyle, writingMode: 'vertical-rl', transform: 'rotate(180deg)', textAlign: 'center', alignSelf: 'center' }}>{yAxis}</div>
+          <div style={{ position: 'relative', borderLeft: '1px solid #6b778c', borderBottom: '1px solid #6b778c' }}>
+            <div style={{ position: 'absolute', inset: 0, backgroundImage: 'linear-gradient(to right, #dfe1e6 1px, transparent 1px), linear-gradient(to bottom, #dfe1e6 1px, transparent 1px)', backgroundSize: '48px 100%, 100% 44px', opacity: 0.85 }} />
+            {options.children}
+          </div>
+        </div>
+        <div style={{ ...axisLabelStyle, textAlign: 'center', marginLeft: '38px', marginTop: '8px' }}>{xAxis}</div>
+      </div>
+    );
+    const barChart = (title, items, yAxis, xAxis, color, options = {}) => {
+      const visible = items.filter(item => item.count > 0).slice(0, options.maxItems || 7);
+      const maxCount = Math.max(...visible.map(item => item.count), 1);
+      const unit = options.unit || 'work item';
+      return emptyChart(title, yAxis, xAxis, {
+        tall: options.tall,
+        children: visible.length > 0 && (
+          <div style={{ position: 'absolute', inset: '10px 10px 0 10px', display: options.horizontal ? 'grid' : 'flex', gap: '8px', alignItems: options.horizontal ? 'center' : 'end' }}>
+            {visible.map(item => {
+              const size = Math.max(4, Math.round((item.count / maxCount) * 100));
+              const label = `${title}\n${options.horizontal ? yAxis : xAxis}: ${item.name}\n${options.horizontal ? xAxis : yAxis}: ${formatSummaryValue(item.count, unit)}`;
+              return (
+                <div key={item.name} tabIndex="0" title={label} onMouseEnter={() => showSummaryTooltip(label)} onFocus={() => showSummaryTooltip(label)} onClick={() => showSummaryTooltip(label)} onBlur={hideSummaryTooltip} style={options.horizontal ? { display: 'grid', gridTemplateColumns: 'minmax(72px, 22%) minmax(0, 1fr)', alignItems: 'center', gap: '8px', outline: 'none', cursor: 'pointer' } : { flex: 1, minWidth: '16px', alignSelf: 'stretch', display: 'flex', alignItems: 'end', justifyContent: 'center', outline: 'none', cursor: 'pointer' }}>
+                  {options.horizontal && <span style={{ ...axisLabelStyle, writingMode: 'initial', transform: 'none', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{item.name}</span>}
+                  <span style={options.horizontal ? { display: 'block', width: `${size}%`, height: '18px', background: color } : { display: 'block', width: '100%', height: `${size}%`, background: color }} />
+                </div>
+              );
+            })}
+          </div>
+        ),
+      });
+    };
+    const lineChart = (title, yAxis, xAxis, color, useResolved) => {
+      const trend = summaryTrendItems.slice(-8);
+      const maxValue = Math.max(...trend.map(item => Math.max(item.created || 0, item.resolved || 0)), avgResolutionDays || 1, 1);
+      const pointData = trend.map((item, index) => {
+        const x = trend.length === 1 ? 8 : 8 + ((index / (trend.length - 1)) * 84);
+        const metric = useResolved ? item.resolved || 0 : item.created || 0;
+        const y = 92 - ((metric / maxValue) * 76);
+        return {
+          x,
+          y,
+          metric,
+          name: item.name,
+          label: `${title}\n${xAxis}: ${item.name}\n${yAxis}: ${formatSummaryValue(metric)}${useResolved ? `\nAverage time to resolution: ${avgResolutionDays} day${avgResolutionDays === 1 ? '' : 's'}` : ''}`,
+        };
+      });
+      const points = pointData.map(point => `${point.x},${point.y}`).join(' ');
+      return emptyChart(title, yAxis, xAxis, {
+        children: points && (
+          <svg viewBox="0 0 100 100" preserveAspectRatio="none" style={{ position: 'absolute', inset: '0', width: '100%', height: '100%' }}>
+            <polyline points={points} fill="none" stroke={color} strokeWidth="2" vectorEffect="non-scaling-stroke" />
+            {pointData.map(point => (
+              <g key={`${title}-${point.name}`}>
+                <circle cx={point.x} cy={point.y} r="1.6" fill={color} vectorEffect="non-scaling-stroke" />
+                <circle
+                  cx={point.x}
+                  cy={point.y}
+                  r="6"
+                  fill="transparent"
+                  stroke="transparent"
+                  tabIndex="0"
+                  onMouseEnter={() => showSummaryTooltip(point.label)}
+                  onFocus={() => showSummaryTooltip(point.label)}
+                  onClick={() => showSummaryTooltip(point.label)}
+                  onBlur={hideSummaryTooltip}
+                  style={{ cursor: 'pointer', outline: 'none' }}
+                />
+              </g>
+            ))}
+          </svg>
+        ),
+      });
+    };
+    const stackedChart = () => {
+      const maxCount = Math.max(...priorityItems.map(item => item.count), ...statusItems.map(item => item.count), 1);
+      return emptyChart('Priority and status breakdown', 'Work item status', 'Count of work items', {
+        children: (
+          <div style={{ position: 'absolute', inset: '12px 10px 0 10px', display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(32px, 1fr))', gap: '8px', alignItems: 'end' }}>
+            {priorityItems.slice(0, 6).map((item, index) => {
+              const status = statusItems[index % Math.max(statusItems.length, 1)] || { name: 'Status', count: 0 };
+              const priorityLabel = `Priority and status breakdown\nWork item priority: ${item.name}\nCount of work items: ${formatSummaryValue(item.count)}`;
+              const statusLabel = `Priority and status breakdown\nWork item status: ${status.name}\nCount of work items: ${formatSummaryValue(status.count)}`;
+              return (
+                <div key={item.name} style={{ display: 'flex', gap: '3px', height: '100%', alignItems: 'end' }}>
+                  <span tabIndex="0" title={priorityLabel} onMouseEnter={() => showSummaryTooltip(priorityLabel)} onFocus={() => showSummaryTooltip(priorityLabel)} onClick={() => showSummaryTooltip(priorityLabel)} onBlur={hideSummaryTooltip} style={{ flex: 1, height: `${Math.max(4, Math.round((item.count / maxCount) * 92))}%`, background: '#0052cc', cursor: 'pointer', outline: 'none' }} />
+                  <span tabIndex="0" title={statusLabel} onMouseEnter={() => showSummaryTooltip(statusLabel)} onFocus={() => showSummaryTooltip(statusLabel)} onClick={() => showSummaryTooltip(statusLabel)} onBlur={hideSummaryTooltip} style={{ flex: 1, height: `${Math.max(4, Math.round((status.count / maxCount) * 92))}%`, background: '#36b37e', cursor: 'pointer', outline: 'none' }} />
+                </div>
+              );
+            })}
+          </div>
+        ),
+      });
+    };
+    const recentActivity = () => (
+      <div style={{ ...gadgetStyle, minHeight: '232px' }}>
+        <div style={panelTitleStyle}>Recent Activity</div>
+        <div style={{ ...mutedStyle, marginBottom: '8px' }}>Today</div>
+        <div style={{ display: 'grid', gap: '10px' }}>
+          {recentIssues.length === 0 ? <div style={mutedStyle}>No recent activity.</div> : recentIssues.map((issue, index) => (
+            <div key={issue.key} style={{ display: 'grid', gridTemplateColumns: '22px minmax(0, 1fr)', gap: '8px', alignItems: 'start' }}>
+              <div style={{ width: '18px', height: '18px', borderRadius: '50%', background: '#deebff', color: '#0052cc', fontWeight: 800, display: 'flex', alignItems: 'center', justifyContent: 'center', fontSize: '11px' }}>+</div>
+              <div style={{ minWidth: 0 }}>
+                <div style={{ fontSize: '12px', color: '#172b4d' }}>Work item was updated {index + 3} minutes ago</div>
+                <div style={{ fontSize: '12px', color: '#0052cc', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{issue.summary}</div>
+                <div style={mutedStyle}>{issue.key} - {issue.status}</div>
+              </div>
+            </div>
+          ))}
+        </div>
+      </div>
+    );
+
+    return (
+      <div onMouseLeave={clearChartTooltip} style={{ margin: '0', background: '#ffffff', color: '#172b4d', position: 'relative', overflow: 'visible' }}>
+        {hoveredChartItem && <div style={summaryTooltipStyle}>{typeof hoveredChartItem === 'string' ? hoveredChartItem : hoveredChartItem.label}</div>}
+        <div style={{ display: 'flex', gap: '8px', flexWrap: 'wrap', alignItems: 'center', padding: '12px 16px', borderBottom: '1px solid #dfe1e6', background: '#ffffff' }}>
+          {summaryFilterConfigs.map(filterButton)}
+          <button type="button" onClick={resetSummaryFilters} style={{ border: 0, background: 'transparent', color: '#5e6c84', fontSize: '12px', marginLeft: '4px', cursor: 'pointer', padding: '6px 4px' }}>Reset to default</button>
+        </div>
+        <div style={{ padding: '22px 16px', background: '#ffffff', display: 'grid', gridTemplateColumns: 'repeat(2, minmax(0, 1fr))', gap: '16px' }}>
+          {lineChart('Customer satisfaction', 'Average satisfaction rating', 'Work item resolution date', '#6554c0', false)}
+          {lineChart('Average time to resolution', 'Average elapsed time in seconds', 'Work item resolution date', '#0052cc', true)}
+          {barChart('First contact resolution rate', firstContactItems, '% of work items resolved on first contact', 'Request types', '#0052cc', { tall: true })}
+          {barChart('Unresolved work items by request types', issueTypeItems, 'Request types', 'Count of work items', '#0052cc', { horizontal: true, tall: true })}
+          {stackedChart()}
+          {barChart('Median work item age by priority', ageByPriority, 'Median age of items (seconds)', 'Work item priority', '#0052cc', { unit: 'day' })}
+          {barChart('SLA compliance', slaItems, '% of work items within SLA', 'SLA status', '#36b37e', { tall: true })}
+          {recentActivity()}
+        </div>
+      </div>
+    );
+  };
+
+  const renderGeneratedReports = () => {
+    const reportFilters = config.reportFilters || [];
+    const fallbackBaseJql = (config.allWorkJql || config.jql || '').replace(/\s+ORDER\s+BY\s+.+$/i, '').trim();
+    const fallbackReportUrl = (suffix) => fallbackBaseJql
+      ? `/issues/?jql=${encodeURIComponent(`${fallbackBaseJql}${suffix}`)}`
+      : data.drilldowns?.allWork?.url;
+    const findReport = (type) => reportFilters.find(report => report.reportType === type);
+    const completedTrendReport = findReport('Completed Trend');
+    const urgentWorkReport = findReport('Urgent Work');
+    const doneIssues = issues.filter(issue => issue.status === 'Done');
+    const openIssues = issues.filter(issue => issue.status !== 'Done');
+    const highPriorityIssues = issues.filter(issue => ['Highest', 'Critical', 'High'].includes(issue.priority));
+    const serviceRequestIssues = issues.filter(issue => String(issue.issueType || '').toLowerCase().includes('service request'));
+    const incidentIssues = issues.filter(issue => String(issue.issueType || '').toLowerCase().includes('incident') || String(issue.issueType || '').toLowerCase().includes('bug'));
+    const problemIssues = issues.filter(issue => String(issue.issueType || '').toLowerCase().includes('problem'));
+    const changeIssues = issues.filter(issue => String(issue.issueType || '').toLowerCase().includes('change'));
+    const avgResolutionDays = (() => {
+      const durations = doneIssues
+        .map(issue => {
+          const start = issue.createdAt ? new Date(`${issue.createdAt}T00:00:00`) : null;
+          const end = issue.resolvedAt ? new Date(`${issue.resolvedAt}T00:00:00`) : null;
+          if (!start || !end || Number.isNaN(start.getTime()) || Number.isNaN(end.getTime())) return null;
+          return Math.max(0, Math.round((end - start) / 86400000));
+        })
+        .filter(value => value !== null);
+      return durations.length === 0 ? 'N/A' : `${Math.round(durations.reduce((sum, value) => sum + value, 0) / durations.length)}d`;
+    })();
+    const reportCatalog = [
+      {
+        section: 'Default',
+        reports: [
+          { id: 'workload', title: 'Workload', value: openIssues.length, type: 'bars', detail: 'Open work by assignee from generated Jira data.' },
+          { id: 'satisfaction', title: 'Satisfaction', value: 'N/A', type: 'rating', detail: 'CSAT is not generated; shown as not captured.' },
+          { id: 'requests-deflected', title: 'Requests deflected', value: 'N/A', type: 'line', detail: 'Portal deflection analytics are not available to the generator.' },
+          { id: 'requests-resolved', title: 'Requests resolved', value: doneIssues.length, type: 'line-check', detail: 'Resolved count from generated custom Resolved Date values.' },
+          { id: 'atlassian-analytics', title: 'Atlassian Analytics', value: issues.length, type: 'analytics', detail: 'Generated project totals and trend signals.' },
+        ],
+      },
+      {
+        section: 'Custom',
+        reports: [
+          {
+            id: 'created-resolved',
+            title: 'Created vs Resolved',
+            value: `${issues.length}/${doneIssues.length}`,
+            type: 'analytics',
+            detail: 'Custom Created Date and Resolved Date trend.',
+            url: completedTrendReport?.viewUrl || fallbackReportUrl(''),
+            hasSavedReportFilter: Boolean(completedTrendReport?.viewUrl),
+            customDateFilterApplied: completedTrendReport?.customDateFilterApplied,
+          },
+          { id: 'time-resolution', title: 'Time to resolution', value: avgResolutionDays, type: 'analytics', detail: 'Custom Created Date to custom Resolved Date duration.' },
+          {
+            id: 'sla-met-breached',
+            title: 'SLA met vs breached',
+            value: highPriorityIssues.length,
+            type: 'analytics',
+            detail: 'High-priority pressure proxy from generated issues.',
+            url: urgentWorkReport?.viewUrl || fallbackReportUrl(' AND priority in (Highest, High, Critical)'),
+            hasSavedReportFilter: Boolean(urgentWorkReport?.viewUrl),
+            customDateFilterApplied: urgentWorkReport?.customDateFilterApplied,
+          },
+          { id: 'incidents-priority', title: 'Incidents by priority', value: incidentIssues.length, type: 'analytics', detail: 'Incident and defect mix by priority.' },
+          { id: 'sla-success-rate', title: 'SLA success rate', value: issues.length === 0 ? '0%' : `${Math.round(((issues.length - highPriorityIssues.length) / issues.length) * 100)}%`, type: 'analytics', detail: 'Demo SLA success proxy using priority pressure.' },
+          { id: 'service-requests', title: 'Service requests', value: serviceRequestIssues.length, type: 'analytics', detail: 'Generated service request volume.' },
+          { id: 'problems-priority', title: 'Problems by priority', value: problemIssues.length, type: 'analytics', detail: 'Problem records grouped by priority.' },
+          { id: 'change-type', title: 'Change by type', value: changeIssues.length, type: 'analytics', detail: 'Generated change records and delivery change work.' },
+        ],
+      },
+    ];
+    const allReports = reportCatalog.flatMap(section => section.reports.map(report => ({ ...report, section: section.section })));
+    const selectedReport = selectedGeneratedReport
+      ? allReports.find(report => report.id === selectedGeneratedReport) || allReports[0]
+      : null;
+    const search = reportSearchTerm.trim().toLowerCase();
+    const filteredCatalog = reportCatalog.map(section => ({
+      ...section,
+      reports: section.reports.filter(report => report.title.toLowerCase().includes(search)),
+    })).filter(section => section.reports.length > 0);
+
+    const countBy = (items, field, fallback = 'None') => {
+      const counts = items.reduce((acc, issue) => {
+        const key = issue[field] || fallback;
+        acc[key] = (acc[key] || 0) + 1;
+        return acc;
+      }, {});
+      return Object.entries(counts).map(([name, count]) => ({ name, count }));
+    };
+    const getReportItems = (report) => {
+      if (report.id === 'workload') return countBy(openIssues, 'assignee', 'Unassigned');
+      if (report.id === 'incidents-priority') return countBy(incidentIssues, 'priority', 'None');
+      if (report.id === 'problems-priority') return countBy(problemIssues, 'priority', 'None');
+      if (report.id === 'change-type') return countBy(changeIssues, 'status', 'Unknown');
+      if (report.id === 'service-requests') return countBy(serviceRequestIssues, 'status', 'Unknown');
+      if (report.id === 'sla-met-breached') return [
+        { name: 'Met', count: Math.max(0, issues.length - highPriorityIssues.length) },
+        { name: 'Breached risk', count: highPriorityIssues.length },
+      ];
+      if (report.id === 'sla-success-rate') return [
+        { name: 'Within SLA', count: Math.max(0, issues.length - highPriorityIssues.length) },
+        { name: 'At risk', count: highPriorityIssues.length },
+      ];
+      if (report.id === 'requests-resolved') return countBy(doneIssues, 'status', 'Done');
+      return countBy(issues, 'status', 'Unknown');
+    };
+    const getReportLinkLabel = (report) => (
+      report.hasSavedReportFilter ? 'Open saved filter' : 'Open issue search'
+    );
+    const getReportLinkNote = (report) => {
+      if (!report.hasSavedReportFilter) {
+        return 'Issue search uses Jira-native JQL; chart uses custom date fields';
+      }
+
+      return report.customDateFilterApplied === false
+        ? 'Saved filter uses Jira-native JQL; chart uses custom date fields'
+        : 'Saved filter uses generated custom date-field JQL';
+    };
+
+    const renderReportThumbnail = (type) => (
+      <div style={{ height: '78px', background: type === 'analytics' ? '#deebff' : '#eae6ff', borderBottom: '1px solid #dfe1e6', padding: '12px 14px', boxSizing: 'border-box' }}>
+        <div style={{ display: 'flex', gap: '7px', marginBottom: '12px' }}>
+          <span style={{ width: '32px', height: '8px', borderRadius: '4px', background: '#ffffff', opacity: 0.85 }} />
+          <span style={{ width: '12px', height: '8px', borderRadius: '4px', background: '#ffffff', opacity: 0.65 }} />
+          <span style={{ width: '12px', height: '8px', borderRadius: '4px', background: '#ffffff', opacity: 0.65 }} />
+        </div>
+        {type === 'rating' ? (
+          <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '6px', alignItems: 'end' }}>
+            <div style={{ height: '8px', background: '#ffffff', borderRadius: '4px' }} />
+            <div style={{ color: '#8777d9', letterSpacing: '2px', fontWeight: 800 }}>***</div>
+            <div style={{ height: '8px', background: '#ffffff', borderRadius: '4px' }} />
+            <div style={{ color: '#8777d9', letterSpacing: '2px', fontWeight: 800 }}>*****</div>
+          </div>
+        ) : type === 'line' || type === 'line-check' ? (
+          <svg viewBox="0 0 120 42" preserveAspectRatio="none" style={{ width: '100%', height: '42px' }}>
+            <polyline points={type === 'line' ? '0,16 35,16 70,30 120,30' : '0,30 35,30 70,16 120,16'} fill="none" stroke="#9f8fef" strokeWidth="4" />
+            {type === 'line-check' && <circle cx="104" cy="28" r="7" fill="#9f8fef" />}
+          </svg>
+        ) : (
+          <div style={{ display: 'flex', gap: '8px', alignItems: 'end', height: '42px' }}>
+            <div style={{ width: '34px', height: '34px', borderRadius: '50%', background: '#b3d4ff' }} />
+            {[14, 22, 34, 26].map((height, index) => <span key={height + index} style={{ width: '13px', height: `${height}px`, background: '#b3d4ff', borderRadius: '2px 2px 0 0' }} />)}
+          </div>
+        )}
+      </div>
+    );
+
+    const renderReportTile = (report) => (
+      <button
+        key={report.id}
+        type="button"
+        onClick={() => setSelectedGeneratedReport(report.id)}
+        style={{
+          padding: 0,
+          border: '1px solid #dfe1e6',
+          borderRadius: '3px',
+          background: '#ffffff',
+          textAlign: 'left',
+          cursor: 'pointer',
+          overflow: 'hidden',
+          minHeight: '112px',
+        }}
+      >
+        {renderReportThumbnail(report.type)}
+        <div style={{ padding: '9px 10px', fontWeight: 700, fontSize: '12px', color: '#172b4d' }}>{report.title}</div>
+      </button>
+    );
+
+    if (selectedReport) {
+      const detailItems = getReportItems(selectedReport);
+      const detailIssues = selectedReport.id === 'service-requests'
+        ? serviceRequestIssues
+        : selectedReport.id === 'incidents-priority'
+          ? incidentIssues
+          : selectedReport.id === 'problems-priority'
+            ? problemIssues
+            : selectedReport.id === 'change-type'
+              ? changeIssues
+              : selectedReport.id === 'requests-resolved' || selectedReport.id === 'time-resolution'
+                ? doneIssues
+                : issues;
+
+      return (
+        <div style={{ margin: '0 16px 14px' }}>
+          <button
+            type="button"
+            onClick={() => setSelectedGeneratedReport(null)}
+            style={{ border: '1px solid #dfe1e6', background: '#ffffff', borderRadius: '3px', padding: '7px 10px', cursor: 'pointer', marginBottom: '12px', color: '#172b4d' }}
+          >
+            Back to reports
+          </button>
+          <div style={{ ...visualPanelStyle, padding: '18px', marginBottom: '12px' }}>
+            <div style={{ display: 'flex', justifyContent: 'space-between', gap: '14px', alignItems: 'start', marginBottom: '12px' }}>
+              <div>
+                <div style={{ fontSize: '20px', fontWeight: 800, color: '#172b4d' }}>{selectedReport.title}</div>
+                <div style={{ ...mutedStyle, marginTop: '4px' }}>{selectedReport.detail}</div>
+              </div>
+              <div style={{ fontSize: '26px', fontWeight: 800, color: '#0052cc' }}>{selectedReport.value}</div>
+            </div>
+            {selectedReport.id === 'created-resolved'
+              ? renderCreatedResolvedTrend(data.createdResolvedTrend || [])
+              : selectedReport.id === 'time-resolution'
+                ? renderAverageTimeBars(data.averageTimeInStatus || [])
+                : renderHorizontalBars(detailItems, 'No report data found.', 'reports')}
+            <div style={{ display: 'flex', gap: '14px', justifyContent: 'flex-start', marginTop: '10px', ...mutedStyle }}>
+              <span><span style={{ display: 'inline-block', width: '10px', height: '10px', background: '#de350b', marginRight: '5px' }} />Created Date</span>
+              <span><span style={{ display: 'inline-block', width: '10px', height: '10px', background: '#36b37e', marginRight: '5px' }} />Resolved Date</span>
+            </div>
+          </div>
+          {selectedReport.url && renderDrilldownLink(selectedReport.url, (
+            <div style={{ ...compactRowStyle, border: '1px solid #dfe1e6', marginBottom: '12px', cursor: 'pointer' }}>
+              <strong>{getReportLinkLabel(selectedReport)}</strong>
+              <span style={mutedStyle}>{getReportLinkNote(selectedReport)}</span>
+            </div>
+          ), { display: 'block' })}
+          {renderIssueCards(detailIssues, 'No matching work found.')}
+        </div>
+      );
+    }
+
+    return (
+      <div style={{ margin: '0 16px 14px' }}>
+        <div style={{ display: 'flex', justifyContent: 'space-between', gap: '12px', alignItems: 'center', marginBottom: '16px' }}>
+          <input
+            type="search"
+            value={reportSearchTerm}
+            onChange={event => setReportSearchTerm(event.target.value)}
+            placeholder="Search for reports"
+            style={{ width: '248px', maxWidth: '100%', border: '1px solid #dfe1e6', borderRadius: '3px', padding: '8px 10px', fontSize: '13px' }}
+          />
+          <button
+            type="button"
+            onClick={() => setReportListView(!reportListView)}
+            style={{ border: '1px solid #dfe1e6', background: '#ffffff', borderRadius: '3px', padding: '8px 10px', cursor: 'pointer', color: '#172b4d' }}
+          >
+            {reportListView ? 'Switch to card view' : 'Switch to list view'}
+          </button>
+        </div>
+        {filteredCatalog.map(section => (
+          <div key={section.section} style={{ marginBottom: '18px' }}>
+            <div style={{ fontSize: '14px', fontWeight: 800, marginBottom: '8px', color: '#172b4d' }}>{section.section}</div>
+            <div style={reportListView
+              ? { display: 'grid', gridTemplateColumns: '1fr', gap: '8px' }
+              : { display: 'grid', gridTemplateColumns: 'repeat(auto-fill, minmax(142px, 1fr))', gap: '10px' }}
+            >
+              {section.reports.map(report => reportListView ? (
+                <button
+                  key={report.id}
+                  type="button"
+                  onClick={() => setSelectedGeneratedReport(report.id)}
+                  style={{ ...compactRowStyle, border: '1px solid #dfe1e6', background: '#ffffff', cursor: 'pointer', textAlign: 'left' }}
+                >
+                  <span style={{ fontWeight: 700 }}>{report.title}</span>
+                  <span style={mutedStyle}>{report.value}</span>
+                </button>
+              ) : renderReportTile(report))}
+            </div>
+          </div>
+        ))}
       </div>
     );
   };
@@ -1317,8 +2029,11 @@ function DashboardGadget({ context }) {
     if (viewType === 'environment') {
       return 'Top-level KPIs for health, SLA risk, delivery, and completion.';
     }
+    if (viewType === 'summary') {
+      return 'Replicates the service project summary using generated custom Created Date and Resolved Date fields.';
+    }
     if (viewType === 'created-resolved') {
-      return 'Trend uses the generated custom Created Date and Resolved Date fields only.';
+      return 'Trend uses generated Created Date and Resolved Date demo values, preferring the custom fields when Jira allows them.';
     }
     if (viewType === 'status') {
       return 'Shows where work is sitting across the workflow so bottlenecks are visible.';
@@ -1326,7 +2041,10 @@ function DashboardGadget({ context }) {
     if (viewType === 'priority') {
       return 'Shows risk mix so high-priority work is easy to spot.';
     }
-    if (viewType === 'open-work' || viewType === 'reports') {
+    if (viewType === 'reports') {
+      return 'Shows generated report drilldowns using the generated Created Date and Resolved Date demo values.';
+    }
+    if (viewType === 'open-work') {
       return 'Lists the records that need follow-up; click any ticket to open it.';
     }
     if (viewType === 'escalations') {
@@ -1357,6 +2075,9 @@ function DashboardGadget({ context }) {
     if (viewType === 'created-resolved') {
       return 'Created higher than resolved means demand is outpacing completion.';
     }
+    if (viewType === 'summary') {
+      return 'Use the custom-date fluctuations to explain generated work intake and completion over time.';
+    }
     if (viewType === 'priority') {
       return 'Start with Critical, Highest, and High items first.';
     }
@@ -1366,7 +2087,10 @@ function DashboardGadget({ context }) {
     if (viewType === 'escalations') {
       return 'Review breached and near-breach tickets before healthy work.';
     }
-    if (viewType === 'open-work' || viewType === 'reports') {
+    if (viewType === 'reports') {
+      return 'Open a report card to inspect the saved filter behind that trend.';
+    }
+    if (viewType === 'open-work') {
       return 'Open a row to inspect the source Jira ticket.';
     }
     if (viewType === 'ticket-aging') {
@@ -1397,7 +2121,7 @@ function DashboardGadget({ context }) {
         background: '#fafbfc',
         padding: '10px 12px',
         display: 'grid',
-        gridTemplateColumns: 'minmax(0, 1fr) minmax(0, 1fr)',
+        gridTemplateColumns: 'repeat(auto-fit, minmax(min(100%, 260px), 1fr))',
         gap: '12px',
       }}>
         <div style={{ minWidth: 0 }}>
@@ -1535,11 +2259,72 @@ function DashboardGadget({ context }) {
     );
   }
 
+  if (viewType === 'summary') {
+    return (
+      <div style={shellStyle}>
+        {renderVisualSummary()}
+        {renderGeneratedSummaryDashboard()}
+      </div>
+    );
+  }
+
+  if (viewType === 'project-insights') {
+    const tabButton = (tab, label) => (
+      <button
+        type="button"
+        onClick={() => {
+          setProjectInsightTab(tab);
+          setSelectedGeneratedReport(null);
+          clearChartTooltip();
+        }}
+        style={{
+          border: 'none',
+          borderBottom: projectInsightTab === tab ? '3px solid #0c66e4' : '3px solid transparent',
+          background: 'transparent',
+          color: projectInsightTab === tab ? '#0c66e4' : '#172b4d',
+          fontWeight: 700,
+          padding: '11px 12px 8px',
+          cursor: 'pointer',
+          fontSize: '14px',
+        }}
+      >
+        {label}
+      </button>
+    );
+
+    return (
+      <div style={{ ...shellStyle, border: 'none', borderRadius: 0, minHeight: 'calc(100vh - 120px)' }}>
+        <div style={{ padding: '18px 20px 8px', borderBottom: '1px solid #dfe1e6', background: '#ffffff' }}>
+          <div style={{ ...mutedStyle, marginBottom: '4px' }}>{config.environmentName || 'Project'}</div>
+          <h1 style={{ margin: 0, fontSize: '24px', lineHeight: '30px', color: '#172b4d' }}>Summary & Reports</h1>
+        </div>
+        <div style={{ display: 'flex', gap: '4px', borderBottom: '1px solid #dfe1e6', background: '#ffffff', paddingLeft: '8px' }}>
+          {tabButton('summary', 'Summary')}
+          {tabButton('reports', 'Reports')}
+        </div>
+        <div style={{ paddingTop: '14px' }}>
+          {projectInsightTab === 'summary' ? (
+            <>
+              {renderVisualSummary()}
+              {renderGeneratedSummaryDashboard()}
+            </>
+          ) : (
+            <>
+              {renderVisualSummary()}
+              {renderGeneratedReports()}
+            </>
+          )}
+        </div>
+      </div>
+    );
+  }
+
   if (viewType === 'reports') {
     return (
       <div style={shellStyle}>
-        {renderHeader(config.title, 'High-demand request detail')}
+        {renderHeader(config.title, 'Custom date-field report drilldowns')}
         {renderVisualSummary()}
+        {renderGeneratedReports()}
         {renderIssueCards(issues, 'No matching work found.')}
       </div>
     );
@@ -1633,6 +2418,10 @@ function App() {
     return <DashboardGadget context={context} />;
   }
 
+  if (context?.extension?.type === 'jira:projectPage') {
+    return <DashboardGadget context={context} source="project" />;
+  }
+
   const handleChange = (e) => {
     const { name, value } = e.target;
     setForm({
@@ -1656,7 +2445,15 @@ function App() {
   };
 
   const invokeDemoStepWithRetry = async ({ currentConfig, currentState, step }) => {
-    const maxAttempts = ['create-business-project', 'create-software-project-shell'].includes(step.type) ? 2 : 1;
+    const isProjectCreationStep = ['create-business-project', 'create-software-project-shell'].includes(step.type);
+    const isTransientStep = [
+      'create-business-incidents-batch',
+      'create-software-issues-batch',
+      'create-software-sprint',
+      'populate-kanban-board',
+      'create-dependencies',
+    ].includes(step.type);
+    const maxAttempts = isProjectCreationStep ? 3 : isTransientStep ? 3 : 1;
     let lastError = null;
 
     for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
@@ -1668,16 +2465,18 @@ function App() {
         });
       } catch (err) {
         lastError = err;
-        if (!/timed out|timeout/i.test(String(err?.message || '')) || attempt >= maxAttempts) {
-          throw err;
+        const message = String(err?.message || '');
+        const isRetryable = /timed out|timeout|502|503|504|upstream_failure|upstream|temporarily unavailable/i.test(message);
+        if (!isRetryable || attempt >= maxAttempts) {
+          throw new Error(`${step.label || step.type} failed: ${err.message}`);
         }
 
-        setProgress(`Retrying ${step.label} after Jira project creation took too long...`);
-        await new Promise(resolve => setTimeout(resolve, 8000));
+        setProgress(`Retrying ${step.label || step.type} after a temporary Forge/Jira response (${attempt + 1} of ${maxAttempts})...`);
+        await new Promise(resolve => setTimeout(resolve, 6000 * attempt));
       }
     }
 
-    throw lastError;
+    throw new Error(`${step.label || step.type} failed: ${lastError?.message || 'Unknown error'}`);
   };
 
   const handleSubmit = async () => {
@@ -1774,7 +2573,7 @@ function App() {
         softwareTemplate: form.softwareProjects[0]?.softwareTemplate || 'scrum',
         softwareProjectStyle: form.softwareProjects[0]?.softwareProjectStyle || 'team-managed',
         issuesPerProject: parseInt(form.softwareProjects[0]?.issuesPerProject || 10, 10),
-        sprintsPerProject: 4,
+        sprintsPerProject: 6,
         retentionPeriodDays: parseInt(form.retentionPeriodDays, 10),
       });
 
@@ -2184,18 +2983,30 @@ function App() {
       {openDashboardPicker === id && !disabled && (
         <div style={pickerMenuStyle}>
           {options.filter(option => option.value).map(option => (
-            <label key={option.value} style={pickerOptionStyle}>
+            <label
+              key={option.value}
+              style={{ ...pickerOptionStyle, cursor: 'pointer' }}
+              onClick={(event) => {
+                event.preventDefault();
+                toggleDashboardSelection(fieldName, promptFieldName, options, option.value);
+              }}
+            >
               <input
                 type="checkbox"
                 checked={selectedValues.includes(option.value)}
-                onChange={() => toggleDashboardSelection(fieldName, promptFieldName, options, option.value)}
+                readOnly
+                tabIndex={-1}
+                style={{ pointerEvents: 'none' }}
               />
               <span style={{ flex: 1 }}>{option.label}</span>
               <span
                 title={option.prompt}
                 aria-label={`Information about ${option.label}`}
                 style={infoIconStyle}
-                onClick={(event) => event.preventDefault()}
+                onClick={(event) => {
+                  event.preventDefault();
+                  event.stopPropagation();
+                }}
               >
                 i
               </span>

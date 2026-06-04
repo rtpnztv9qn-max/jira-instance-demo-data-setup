@@ -13,6 +13,12 @@ modules:
       resource: main
       resolver:
         function: resolver
+  jira:projectPage:
+    - key: cprime-demo-project-insights
+      title: Summary & Reports
+      resource: main
+      resolver:
+        function: resolver
   function:
     - key: resolver
       handler: index.handler
@@ -58,6 +64,8 @@ permissions:
         - address: https://api.openai.com
           inScopeEUD: true
         - address: https://api.github.com
+          inScopeEUD: true
+        - address: https://*.atlassian.net
           inScopeEUD: true
         - address: https://crawling-ludicrous-target.ngrok-free.dev
           inScopeEUD: true

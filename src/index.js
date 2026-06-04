@@ -26,6 +26,7 @@ const demoDateFieldsByProjectCache = new Map();
 let issueLinkTypesCache = null;
 let demoDateFieldIdsCache = null;
 let timelineStartDateFieldIdCache = null;
+let sprintFieldIdCache = null;
 let formsDynamicSchemaRejected = false;
 const ACTIVE_TICKET_RETENTION_DAYS = 180;
 const WORKER_GENERATION_ENDPOINT = process.env.WORKER_GENERATION_ENDPOINT || 'http://localhost:4000/generate-demo';
@@ -34,11 +35,13 @@ const WORKER_DATE_PATCH_ENDPOINT = process.env.WORKER_DATE_PATCH_ENDPOINT
 const ISSUE_CREATION_MODE = process.env.ISSUE_CREATION_MODE || 'rest';
 const WORKER_FETCH_TIMEOUT_MS = 10000;
 const GITHUB_DEMO_ACTIVITY_ENABLED = String(process.env.GITHUB_DEMO_ACTIVITY_ENABLED || 'true').toLowerCase() !== 'false';
-const GITHUB_DEMO_ACTIVITY_PER_PROJECT = Math.max(1, Math.min(Number(process.env.GITHUB_DEMO_ACTIVITY_PER_PROJECT) || 3, 5));
+const GITHUB_DEMO_ACTIVITY_PER_PROJECT = Math.max(1, Math.min(Number(process.env.GITHUB_DEMO_ACTIVITY_PER_PROJECT) || 1, 1));
+const GITHUB_FETCH_TIMEOUT_MS = 6000;
 const COMPASS_DEMO_COMPONENTS_ENABLED = String(process.env.COMPASS_DEMO_COMPONENTS_ENABLED || 'true').toLowerCase() !== 'false';
 const GOALS_DEMO_ENABLED = String(process.env.GOALS_DEMO_ENABLED || 'true').toLowerCase() !== 'false';
 const DASHBOARD_TEMPLATE_IDS = ['10000', '10671'];
-const MANAGED_DASHBOARD_GADGET_SLOT_COUNT = 6;
+const MANAGED_DASHBOARD_GADGET_SLOT_COUNT = 7;
+const DEMO_DATE_ISSUE_PROPERTY_KEY = 'cprime-demo-dates';
 const DEMO_DATE_FIELD_DEFINITIONS = {
   created: {
     name: 'Created Date',
@@ -58,15 +61,15 @@ const MANAGED_DASHBOARD_GADGET_PLANS = [
     allowDuplicate: true,
   },
   {
-    role: 'forge-open-work',
-    titleSuffix: 'Open Work',
+    role: 'forge-summary',
+    title: 'Summary',
     keywords: ['cprime demo gadget'],
     required: true,
     allowDuplicate: true,
   },
   {
-    role: 'forge-status',
-    title: 'Work by Status',
+    role: 'forge-open-work',
+    titleSuffix: 'Open Work',
     keywords: ['cprime demo gadget'],
     required: true,
     allowDuplicate: true,
@@ -216,6 +219,26 @@ function getDemoDevStatus(index) {
   return ['To Do', 'In Progress', 'Done'][index % 3];
 }
 
+function isBugIssueType(issueType) {
+  return String(issueType || '').toLowerCase() === 'bug';
+}
+
+function isDueDateCompleted(dueDate) {
+  if (!dueDate) {
+    return false;
+  }
+
+  const today = new Date();
+  today.setHours(0, 0, 0, 0);
+  const due = new Date(`${dueDate}T00:00:00.000Z`);
+  due.setHours(0, 0, 0, 0);
+  return due <= today;
+}
+
+function getDemoBugStatusFromDueDate(dueDate) {
+  return isDueDateCompleted(dueDate) ? 'Done' : 'In Progress';
+}
+
 function getWaterfallPhase(index) {
   return ['requirements', 'design', 'build', 'test', 'release'][index % 5];
 }
@@ -245,6 +268,21 @@ function getSoftwareMethodologyDescription(project, issueIndex) {
     `Waterfall traceability overlay: this work is tagged to the ${phase} phase so the demo can show requirements-to-release governance alongside agile execution.`,
     'Release governance: fix versions, affected versions, dependencies, due dates, and sprint or flow state are populated for dashboard and report visibility.',
   ].join(' ');
+}
+
+function getSoftwareProjectVariantSeed(project, fallbackIndex = 0) {
+  const source = [
+    project?.key,
+    project?.softwareTemplate,
+    project?.softwareProjectStyle,
+    fallbackIndex,
+  ].filter(value => value !== undefined && value !== null).join('|');
+  const hash = Array.from(String(source || fallbackIndex)).reduce((total, char, index) => (
+    total + (char.charCodeAt(0) * (index + 3))
+  ), 0);
+  const templateOffset = normaliseSoftwareTemplate(project?.softwareTemplate) === 'kanban' ? 11 : 3;
+  const styleOffset = normaliseProjectManagementStyle(project?.softwareProjectStyle) === 'company-managed' ? 17 : 5;
+  return hash + templateOffset + styleOffset;
 }
 
 function getSoftwareReleasePlan(project, releaseIndex) {
@@ -1213,51 +1251,112 @@ function getContent(industry) {
 
 // ── JIRA API ──────────────────────────────────────────────────────────────────
 
-async function jiraGet(path) {
-  const res = await api.asUser().requestJira(buildTrustedJiraRoute(path));
+async function readJiraJsonResponse(res, method, path) {
   if (!res.ok) {
     const text = await res.text();
-    throw new Error(`GET ${path} failed: ${res.status} ${text}`);
+    const err = new Error(`${method} ${path} failed: ${res.status} ${text}`);
+    err.status = res.status;
+    err.body = text;
+    throw err;
   }
-  return res.json();
+  const text = await res.text();
+  if (!text || text.trim() === '') return {};
+  try {
+    return JSON.parse(text);
+  } catch {
+    return {};
+  }
+}
+
+function shouldRetryJiraAgileWithBasicAuth(path, err) {
+  const body = String(err?.body || err?.message || '').toLowerCase();
+  return String(path || '').startsWith('/rest/agile/1.0/')
+    && (err?.status === 401 || err?.status === 403 || body.includes('authentication required'));
+}
+
+function isTransientJiraRequestError(err) {
+  const message = String(err?.body || err?.message || '').toLowerCase();
+  return [408, 429, 500, 502, 503, 504].includes(Number(err?.status))
+    || message.includes('upstream_failure')
+    || message.includes('upstream failure')
+    || message.includes('temporarily unavailable')
+    || message.includes('timeout')
+    || message.includes('timed out');
+}
+
+async function requestJiraWithBasicAuth(path, options = {}) {
+  const authConfig = getAtlassianGraphBasicAuthConfig();
+  if (!authConfig.enabled) {
+    throw new Error('configure ATLASSIAN_EMAIL/ATLASSIAN_API_TOKEN so Jira Software Agile board and sprint APIs can use the Basic Auth fallback.');
+  }
+
+  const { baseUrl } = await getCurrentSiteDetails();
+  if (!baseUrl) {
+    throw new Error('unable to resolve Atlassian site URL for Jira Software Agile API fallback.');
+  }
+
+  const credentials = Buffer.from(`${authConfig.email}:${authConfig.apiToken}`, 'utf8').toString('base64');
+  const res = await forgeFetch(`${baseUrl}${path}`, {
+    ...options,
+    headers: {
+      Accept: 'application/json',
+      Authorization: `Basic ${credentials}`,
+      ...(options.body ? { 'Content-Type': 'application/json' } : {}),
+      ...(options.headers || {}),
+    },
+  });
+
+  return readJiraJsonResponse(res, options.method || 'GET', path);
+}
+
+async function jiraRequest(path, options = {}) {
+  const method = options.method || 'GET';
+  let lastErr = null;
+
+  for (let attempt = 0; attempt < 3; attempt += 1) {
+    try {
+      const res = await api.asUser().requestJira(buildTrustedJiraRoute(path), options);
+      return await readJiraJsonResponse(res, method, path);
+    } catch (err) {
+      lastErr = err;
+
+      if (shouldRetryJiraAgileWithBasicAuth(path, err)) {
+        try {
+          return await requestJiraWithBasicAuth(path, options);
+        } catch (fallbackErr) {
+          lastErr = new Error(`${err.message}. Jira Software Agile Basic Auth fallback also failed: ${fallbackErr.message}`);
+        }
+      }
+
+      if (!isTransientJiraRequestError(lastErr) || attempt >= 2) {
+        throw lastErr;
+      }
+
+      await wait(800 * (attempt + 1));
+    }
+  }
+
+  throw lastErr;
+}
+
+async function jiraGet(path) {
+  return jiraRequest(path);
 }
 
 async function jiraPost(path, body) {
-  const res = await api.asUser().requestJira(buildTrustedJiraRoute(path), {
+  return jiraRequest(path, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify(body),
   });
-  if (!res.ok) {
-    const text = await res.text();
-    throw new Error(`POST ${path} failed: ${res.status} ${text}`);
-  }
-  const text = await res.text();
-  if (!text || text.trim() === '') return {};
-  try {
-    return JSON.parse(text);
-  } catch {
-    return {};
-  }
 }
 
 async function jiraPut(path, body) {
-  const res = await api.asUser().requestJira(buildTrustedJiraRoute(path), {
+  return jiraRequest(path, {
     method: 'PUT',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify(body),
   });
-  if (!res.ok) {
-    const text = await res.text();
-    throw new Error(`PUT ${path} failed: ${res.status} ${text}`);
-  }
-  const text = await res.text();
-  if (!text || text.trim() === '') return {};
-  try {
-    return JSON.parse(text);
-  } catch {
-    return {};
-  }
 }
 
 async function jiraFormsGet(resourcePath) {
@@ -1386,24 +1485,90 @@ async function confluencePost(path, body) {
 }
 
 async function requestAtlassianGraph(query, variables = {}) {
-  const response = await api.asUser().requestGraph(query, variables);
+  let forgeGraphError = null;
 
-  if (response && typeof response.json === 'function') {
-    const data = await response.json();
-    if (!response.ok) {
-      throw new Error(`GraphQL request failed: ${response.status} ${JSON.stringify(data)}`);
+  try {
+    const response = await api.asUser().requestGraph(query, variables);
+
+    if (response && typeof response.json === 'function') {
+      const data = await response.json();
+      if (!response.ok) {
+        throw new Error(`GraphQL request failed: ${response.status} ${JSON.stringify(data)}`);
+      }
+      if (Array.isArray(data.errors) && data.errors.length > 0) {
+        throw new Error(data.errors.map(error => error.message || JSON.stringify(error)).join('; '));
+      }
+      return data.data || data;
     }
-    if (Array.isArray(data.errors) && data.errors.length > 0) {
-      throw new Error(data.errors.map(error => error.message || JSON.stringify(error)).join('; '));
+
+    if (response?.errors?.length) {
+      throw new Error(response.errors.map(error => error.message || JSON.stringify(error)).join('; '));
     }
-    return data.data || data;
+
+    return response?.data || response;
+  } catch (err) {
+    forgeGraphError = err;
   }
 
-  if (response?.errors?.length) {
-    throw new Error(response.errors.map(error => error.message || JSON.stringify(error)).join('; '));
+  try {
+    return await requestAtlassianGraphWithBasicAuth(query, variables);
+  } catch (basicAuthErr) {
+    throw new Error(`Forge GraphQL failed: ${forgeGraphError.message}. Basic-auth GraphQL failed: ${basicAuthErr.message}`);
+  }
+}
+
+function getAtlassianGraphBasicAuthConfig() {
+  const email = String(
+    process.env.ATLASSIAN_GRAPHQL_EMAIL ||
+    process.env.ATLASSIAN_EMAIL ||
+    process.env.JIRA_EMAIL ||
+    ''
+  ).trim();
+  const apiToken = String(
+    process.env.ATLASSIAN_GRAPHQL_API_TOKEN ||
+    process.env.ATLASSIAN_API_TOKEN ||
+    process.env.JIRA_API_TOKEN ||
+    ''
+  ).trim();
+
+  return {
+    enabled: Boolean(email && apiToken),
+    email,
+    apiToken,
+  };
+}
+
+async function requestAtlassianGraphWithBasicAuth(query, variables = {}) {
+  const authConfig = getAtlassianGraphBasicAuthConfig();
+  if (!authConfig.enabled) {
+    throw new Error('configure ATLASSIAN_GRAPHQL_EMAIL/ATLASSIAN_GRAPHQL_API_TOKEN or ATLASSIAN_EMAIL/ATLASSIAN_API_TOKEN for native Goals GraphQL fallback.');
   }
 
-  return response?.data || response;
+  const { baseUrl } = await getCurrentSiteDetails();
+  if (!baseUrl) {
+    throw new Error('unable to resolve Atlassian site URL for GraphQL gateway.');
+  }
+
+  const credentials = Buffer.from(`${authConfig.email}:${authConfig.apiToken}`, 'utf8').toString('base64');
+  const response = await forgeFetch(`${baseUrl}/gateway/api/graphql`, {
+    method: 'POST',
+    headers: {
+      Authorization: `Basic ${credentials}`,
+      'Content-Type': 'application/json',
+    },
+    body: JSON.stringify({ query, variables }),
+  });
+  const text = await response.text();
+  const data = text ? JSON.parse(text) : {};
+
+  if (!response.ok) {
+    throw new Error(`POST ${baseUrl}/gateway/api/graphql failed: ${response.status} ${text}`);
+  }
+  if (Array.isArray(data.errors) && data.errors.length > 0) {
+    throw new Error(data.errors.map(error => error.message || JSON.stringify(error)).join('; '));
+  }
+
+  return data.data || data;
 }
 
 async function getCurrentSiteDetails() {
@@ -1452,6 +1617,12 @@ function getGitHubDemoConfig() {
     repo,
     token,
   };
+}
+
+function getGitHubRepositoryUrl() {
+  const owner = String(process.env.GITHUB_OWNER || '').trim();
+  const repo = String(process.env.GITHUB_REPO || '').trim();
+  return owner && repo ? `https://github.com/${owner}/${repo}` : '';
 }
 
 function getGitHubDemoConfigMessage() {
@@ -1519,16 +1690,34 @@ function buildGitHubDemoFileContent(config, project, issue) {
 }
 
 async function githubRequest(config, path, options = {}) {
-  const res = await forgeFetch(`https://api.github.com${path}`, {
-    ...options,
-    headers: {
-      Accept: 'application/vnd.github+json',
-      Authorization: `Bearer ${config.token}`,
-      'Content-Type': 'application/json',
-      'X-GitHub-Api-Version': '2022-11-28',
-      ...(options.headers || {}),
-    },
-  });
+  const controller = typeof AbortController !== 'undefined' ? new AbortController() : null;
+  const timeout = controller
+    ? setTimeout(() => controller.abort(), GITHUB_FETCH_TIMEOUT_MS)
+    : null;
+
+  let res;
+  try {
+    res = await forgeFetch(`https://api.github.com${path}`, {
+      ...options,
+      ...(controller ? { signal: controller.signal } : {}),
+      headers: {
+        Accept: 'application/vnd.github+json',
+        Authorization: `Bearer ${config.token}`,
+        'Content-Type': 'application/json',
+        'X-GitHub-Api-Version': '2022-11-28',
+        ...(options.headers || {}),
+      },
+    });
+  } catch (err) {
+    if (err?.name === 'AbortError') {
+      throw new Error(`${options.method || 'GET'} ${path} timed out after ${GITHUB_FETCH_TIMEOUT_MS / 1000}s`);
+    }
+    throw err;
+  } finally {
+    if (timeout) {
+      clearTimeout(timeout);
+    }
+  }
 
   const text = await res.text();
   const body = text ? (() => {
@@ -1855,9 +2044,38 @@ function getJsmItsmTemplateKeys() {
 }
 
 async function getServiceDeskId(projectKey) {
-  const data = await jiraGet('/rest/servicedeskapi/servicedesk');
-  const sd = (data.values || []).find(s => s.projectKey === projectKey);
-  return sd ? sd.id : null;
+  try {
+    const direct = await jiraGet(`/rest/servicedeskapi/servicedesk/project/${encodeURIComponent(projectKey)}`);
+    if (direct?.id) {
+      return direct.id;
+    }
+  } catch (err) {
+    const message = String(err?.message || '');
+    if (!message.includes('404')) {
+      console.warn(`Direct service desk lookup for ${projectKey} failed: ${message}`);
+    }
+  }
+
+  let start = 0;
+  const limit = 50;
+
+  for (let page = 0; page < 10; page += 1) {
+    const data = await jiraGet(`/rest/servicedeskapi/servicedesk?start=${start}&limit=${limit}`);
+    const values = Array.isArray(data.values) ? data.values : [];
+    const sd = values.find(s => s.projectKey === projectKey);
+
+    if (sd?.id) {
+      return sd.id;
+    }
+
+    if (data.isLastPage || values.length === 0) {
+      break;
+    }
+
+    start += limit;
+  }
+
+  return null;
 }
 
 async function getServiceDeskIdWithRetry(projectKey, {
@@ -1888,6 +2106,69 @@ async function getServiceDeskIdWithRetry(projectKey, {
 async function getServiceDeskRequestTypes(serviceDeskId) {
   const data = await jiraGet(`/rest/servicedeskapi/servicedesk/${serviceDeskId}/requesttype`);
   return Array.isArray(data.values) ? data.values : [];
+}
+
+function normaliseRequestType(requestType) {
+  return {
+    id: requestType.id,
+    name: requestType.name,
+    issueTypeId: requestType.issueTypeId || null,
+    issueTypeName: requestType.issueTypeName || requestType.issueType?.name || null,
+    description: requestType.description || '',
+  };
+}
+
+async function createServiceDeskRequestType(serviceDeskId, definition, issueTypeId) {
+  return await jiraPost(`/rest/servicedeskapi/servicedesk/${serviceDeskId}/requesttype`, {
+    name: definition.name,
+    description: definition.description,
+    helpText: definition.helpText,
+    issueTypeId: String(issueTypeId),
+  });
+}
+
+async function ensureRequiredItsmRequestTypes(project, serviceDeskId, diagnostics = []) {
+  const jiraProject = await jiraGet(`/rest/api/3/project/${encodeURIComponent(project.key)}`);
+  const issueTypes = Array.isArray(jiraProject.issueTypes) ? jiraProject.issueTypes : [];
+  const existingRequestTypes = project.requestTypes?.length
+    ? project.requestTypes
+    : (await getServiceDeskRequestTypes(serviceDeskId)).map(normaliseRequestType);
+  const ensuredRequestTypes = [...existingRequestTypes];
+
+  for (const definition of REQUIRED_ITSM_REQUEST_TYPES) {
+    const exactRequestType = ensuredRequestTypes.find(requestType =>
+      normaliseFieldName(requestType.name) === normaliseFieldName(definition.name)
+    );
+
+    if (exactRequestType) {
+      continue;
+    }
+
+    const issueType = issueTypes.find(type =>
+      definition.issueTypeNames.some(name => normaliseFieldName(type?.name) === normaliseFieldName(name))
+    );
+
+    if (!issueType?.id) {
+      diagnostics.push(`ITSM foundation ${project.key}: could not create request type "${definition.name}" because matching issue type was not found.`);
+      continue;
+    }
+
+    try {
+      const createdRequestType = await createServiceDeskRequestType(serviceDeskId, definition, issueType.id);
+      ensuredRequestTypes.push(normaliseRequestType({
+        ...createdRequestType,
+        name: createdRequestType.name || definition.name,
+        issueTypeId: createdRequestType.issueTypeId || issueType.id,
+        issueTypeName: createdRequestType.issueTypeName || issueType.name,
+        description: createdRequestType.description || definition.description,
+      }));
+      diagnostics.push(`ITSM foundation ${project.key}: created request type "${definition.name}" for issue type "${issueType.name}".`);
+    } catch (err) {
+      diagnostics.push(`ITSM foundation ${project.key}: request type "${definition.name}" was not created: ${err.message}`);
+    }
+  }
+
+  return ensuredRequestTypes;
 }
 
 async function getServiceDeskQueues(serviceDeskId) {
@@ -2007,10 +2288,14 @@ function buildFallbackFormPayloadAttempts(projectName, requestType) {
   ];
 }
 
-async function ensureDefaultSmartIntakeForm(projectKey, projectName, industry) {
-  const serviceDeskId = await getServiceDeskIdWithRetry(projectKey, {
-    attempts: 6,
-    delayMs: 1500,
+async function ensureDefaultSmartIntakeForm(projectKey, projectName, industry, options = {}) {
+  const diagnostics = options.diagnostics || [];
+  const lookupAttempts = options.lookupAttempts || 2;
+  const lookupDelayMs = options.lookupDelayMs || 1200;
+  const serviceDeskId = options.serviceDeskId || await getServiceDeskIdWithRetry(projectKey, {
+    attempts: lookupAttempts,
+    delayMs: lookupDelayMs,
+    diagnostics,
     label: 'Forms service desk lookup',
   });
   if (!serviceDeskId) {
@@ -2322,6 +2607,37 @@ const ITSM_DESCRIPTION_FOCUS = {
   'Post-incident Review': 'Capture timeline, impact, root cause, follow-up actions, owners, and prevention commitments.',
 };
 
+const REQUIRED_ITSM_REQUEST_TYPES = [
+  {
+    workType: 'Incident',
+    name: 'Incident',
+    description: 'Incident intake for service interruptions, outages, degradations, and urgent restoration work.',
+    helpText: 'Use this request type for disruption or outage records that need operational response.',
+    issueTypeNames: ['Incident'],
+  },
+  {
+    workType: 'Problem',
+    name: 'Problem',
+    description: 'Problem management intake for recurring symptoms, known errors, and root-cause analysis.',
+    helpText: 'Use this request type when one or more incidents need root-cause investigation.',
+    issueTypeNames: ['Problem'],
+  },
+  {
+    workType: 'Change',
+    name: 'Change',
+    description: 'Change enablement intake for planned operational changes, approvals, validation, and rollback planning.',
+    helpText: 'Use this request type for standard, normal, or emergency change records.',
+    issueTypeNames: ['Change'],
+  },
+  {
+    workType: 'Service Request',
+    name: 'Service Request',
+    description: 'Service request intake for access, fulfilment, reporting, and operational enablement requests.',
+    helpText: 'Use this request type for standard fulfilment and access requests.',
+    issueTypeNames: ['Service Request', 'Service request'],
+  },
+];
+
 function makeUniqueItsmSummary(baseTitle, workType, sourceIndex, sourceLength, usedTitles) {
   const fallbackBase = `${workType} record`;
   const cleanBase = String(baseTitle || fallbackBase).replace(/\s+-\s+Scenario\s+\d+$/i, '').replace(/\s+/g, ' ').trim() || fallbackBase;
@@ -2420,10 +2736,18 @@ async function createIncident(serviceDeskId, requestTypeId, title, priority, due
 function chooseRequestTypeForItsmWork(project, workType) {
   const requestTypes = project.requestTypes || [];
   const normalisedWorkType = normaliseFieldName(workType);
+  const exactNameMatch = requestTypes.find(requestType =>
+    normaliseFieldName(requestType?.name) === normalisedWorkType
+  );
+  const requestTypeMatchesIssueType = requestType => {
+    const issueTypeName = normaliseFieldName(requestType?.issueTypeName || requestType?.issueType?.name || '');
+    return issueTypeName && issueTypeName === normalisedWorkType;
+  };
   const findByPriority = keywords => {
     for (const keyword of keywords) {
       const match = requestTypes.find(requestType =>
-        String(requestType?.name || '').toLowerCase().includes(keyword)
+        String(requestType?.name || '').toLowerCase().includes(keyword) ||
+        String(requestType?.description || '').toLowerCase().includes(keyword)
       );
 
       if (match) {
@@ -2433,21 +2757,30 @@ function chooseRequestTypeForItsmWork(project, workType) {
 
     return null;
   };
+  const issueTypeMatch = requestTypes.find(requestTypeMatchesIssueType);
+
+  if (exactNameMatch) {
+    return exactNameMatch;
+  }
+
+  if (issueTypeMatch) {
+    return issueTypeMatch;
+  }
 
   if (normalisedWorkType === 'incident') {
-    return findByPriority(['report a system problem', 'incident', 'system problem', 'report broken hardware', 'broken hardware']);
+    return findByPriority(['report an incident', 'report a system problem', 'incident', 'system problem', 'report broken hardware', 'broken hardware']);
   }
 
   if (normalisedWorkType === 'problem') {
-    return findByPriority(['investigate a problem', 'problem']);
+    return findByPriority(['investigate a problem', 'problem', 'root cause', 'known error']);
   }
 
   if (normalisedWorkType === 'change') {
-    return findByPriority(['request a change', 'change']);
+    return findByPriority(['request a change', 'change', 'standard change', 'normal change', 'emergency change']);
   }
 
   if (normalisedWorkType === 'servicerequest') {
-    return findByPriority(['get it help', 'request new software', 'request new hardware', 'request admin access', 'request new account', 'request']);
+    return findByPriority(['service request', 'get it help', 'request new software', 'request new hardware', 'request admin access', 'request new account', 'request']);
   }
 
   if (normalisedWorkType === 'postincidentreview') {
@@ -2474,16 +2807,20 @@ async function createJsmRequestWorkItem(project, workItem, options) {
 
   if (!project.requestTypes?.length) {
     const requestTypes = await getServiceDeskRequestTypes(serviceDeskId);
-    project.requestTypes = requestTypes.map(requestType => ({
-      id: requestType.id,
-      name: requestType.name,
-      issueTypeId: requestType.issueTypeId || null,
-    }));
+    project.requestTypes = requestTypes.map(normaliseRequestType);
+  }
+
+  if (!project.requiredItsmRequestTypesEnsured) {
+    project.requestTypes = await ensureRequiredItsmRequestTypes(project, serviceDeskId, diagnostics);
+    project.requiredItsmRequestTypesEnsured = true;
   }
 
   const requestType = chooseRequestTypeForItsmWork(project, workItem.workType);
   if (!requestType?.id) {
-    throw new Error(`No matching JSM request type was available for ${workItem.workType}.`);
+    const availableRequestTypes = (project.requestTypes || [])
+      .map(type => `${type.name}${type.issueTypeName ? ` (${type.issueTypeName})` : ''}`)
+      .join(', ') || 'none';
+    throw new Error(`No matching JSM request type was available for ${workItem.workType}. Available request types: ${availableRequestTypes}.`);
   }
 
   diagnostics.push(`ITSM work ${project.key}: creating ${workItem.workType} through request type "${requestType.name}".`);
@@ -2509,6 +2846,50 @@ async function createJsmRequestWorkItem(project, workItem, options) {
   };
 }
 
+async function createJiraItsmIssueFallback(project, workItem, options = {}) {
+  const diagnostics = options.diagnostics || [];
+  const priority = options.priority || getPriorityName(workItem.priority);
+  const dueDate = options.dueDate || null;
+  const assigneeAccountId = options.assigneeAccountId || null;
+  const lifecycle = options.lifecycle || null;
+  const issue = await createIssue(
+    project.key,
+    workItem.title,
+    workItem.workType,
+    null,
+    priority,
+    dueDate,
+    null,
+    {
+      assigneeAccountId,
+      demoDateFields: options.demoDateFields || {},
+      diagnostics,
+      environmentName: options.environmentName,
+      lifecycle,
+      projectKind: 'business',
+      retentionPeriodDays: options.retentionPeriodDays,
+      description: [
+        workItem.description || `${workItem.workType} generated for the ${project.key} demo environment.`,
+        'Created through Jira issue fallback because Jira Service Management service desk provisioning was not available during the run.',
+      ].join('\n\n'),
+      labels: [
+        'itsm-demo',
+        `itsm-${normaliseFieldName(workItem.workType) || 'work'}`,
+        'request-type-fallback',
+      ],
+    }
+  );
+
+  diagnostics.push(`ITSM fallback ${project.key}: created ${workItem.workType} ${issue.key} as a Jira issue because service desk request creation was unavailable.`);
+
+  return {
+    key: issue.key,
+    requestTypeId: null,
+    requestTypeName: `${workItem.workType} (Jira issue fallback)`,
+    fallbackCreated: true,
+  };
+}
+
 function normaliseSoftwareTemplate(value) {
   return String(value || '').toLowerCase() === 'kanban' ? 'kanban' : 'scrum';
 }
@@ -2527,8 +2908,8 @@ function getSoftwareTemplateKeys(softwareTemplate, projectManagementStyle = 'tea
 
   if (template === 'kanban' && style === 'company-managed') {
     return [
-      'com.pyxis.greenhopper.jira:gh-kanban-template',
       'com.pyxis.greenhopper.jira:gh-simplified-kanban-classic',
+      'com.pyxis.greenhopper.jira:gh-kanban-template',
     ];
   }
 
@@ -2562,6 +2943,7 @@ async function createSoftwareProject(name, leadAccountId, keyPrefix, softwareTem
     projectTypeKey: 'software',
     maxAttempts: 12,
     templateKeys: getSoftwareTemplateKeys(softwareTemplate, projectManagementStyle),
+    allowTemplateOmission: false,
   });
 }
 
@@ -2703,7 +3085,9 @@ function getSoftwareComponentCatalog(project, industry) {
   return [
     deliveryComponent,
     `${industrySlug}-platform`,
-  ].slice(0, 2).map(name => name
+    'Compass Delivery Service',
+    'Compass Release Pipeline',
+  ].map(name => name
     .split('-')
     .map(part => part ? `${part.charAt(0).toUpperCase()}${part.slice(1)}` : part)
     .join(' '));
@@ -2730,24 +3114,50 @@ function getCompassComponentTemplates(config, project) {
   const environmentSlug = slugifyGitHubPart(config.environmentName, 'environment');
   const projectSlug = slugifyGitHubPart(project.key, 'project');
   const industryName = toTitleCase(config.industry || 'Business');
+  const repositoryUrl = getGitHubRepositoryUrl();
+  const buildLinks = (componentName) => [
+    ...(repositoryUrl ? [{
+      name: `${componentName} repository`,
+      type: 'REPOSITORY',
+      url: repositoryUrl,
+    }] : []),
+  ];
+
   return [
     {
       name: `${config.environmentName} ${project.key} Delivery Service`,
       typeId: 'SERVICE',
       key: `${environmentSlug}-${projectSlug}-delivery-service`,
       description: `${industryName} delivery service for ${project.name}.`,
+      links: buildLinks(`${project.key} delivery service`),
     },
     {
       name: `${config.environmentName} ${project.key} Release Pipeline`,
       typeId: 'APPLICATION',
       key: `${environmentSlug}-${projectSlug}-release-pipeline`,
       description: `${industryName} release pipeline for ${project.name}.`,
+      links: buildLinks(`${project.key} release pipeline`),
     },
   ];
 }
 
 async function createCompassComponent(cloudId, componentDetails) {
-  const data = await requestAtlassianGraph(`
+  const ownerId = String(process.env.COMPASS_OWNER_TEAM_ID || process.env.ATLASSIAN_TEAM_ID || '').trim();
+  const richInput = {
+    name: componentDetails.name,
+    typeId: componentDetails.typeId,
+    description: componentDetails.description,
+    labels: ['demo-data', 'jira-demo', slugifyGitHubPart(componentDetails.key, 'component')],
+    ...(componentDetails.links?.length ? { links: componentDetails.links } : {}),
+    ...(ownerId ? { ownerId } : {}),
+  };
+  const simpleInput = {
+    name: componentDetails.name,
+    typeId: componentDetails.typeId,
+  };
+
+  const createWithInput = async (input) => {
+    const data = await requestAtlassianGraph(`
     mutation createComponent($cloudId: ID!, $componentDetails: CreateCompassComponentInput!) {
       compass {
         createComponent(cloudId: $cloudId, input: $componentDetails) {
@@ -2761,18 +3171,58 @@ async function createCompassComponent(cloudId, componentDetails) {
       }
     }
   `, {
-    cloudId,
-    componentDetails: {
-      name: componentDetails.name,
-      typeId: componentDetails.typeId,
+      cloudId,
+      componentDetails: input,
+    });
+
+    const result = data?.compass?.createComponent;
+    if (!result?.success) {
+      throw new Error(`Compass createComponent did not return success for ${componentDetails.name}.`);
+    }
+    return result.componentDetails;
+  };
+
+  try {
+    const component = await createWithInput(richInput);
+    return {
+      ...component,
+      richPayloadApplied: true,
+      repositoryLinked: Boolean(componentDetails.links?.some(link => link.type === 'REPOSITORY')),
+      ownerConfigured: Boolean(ownerId),
+    };
+  } catch (richErr) {
+    const component = await createWithInput(simpleInput);
+    return {
+      ...component,
+      richPayloadApplied: false,
+      richPayloadError: richErr.message,
+      repositoryLinked: false,
+      ownerConfigured: false,
+    };
+  }
+}
+
+async function createCompassDependency(startComponent, endComponent) {
+  const data = await requestAtlassianGraph(`
+    mutation createRelationship($input: CreateCompassRelationshipInput!) {
+      compass {
+        createRelationship(input: $input) {
+          success
+        }
+      }
+    }
+  `, {
+    input: {
+      startNodeId: startComponent.id,
+      endNodeId: endComponent.id,
+      relationshipType: 'DEPENDS_ON',
     },
   });
 
-  const result = data?.compass?.createComponent;
+  const result = data?.compass?.createRelationship;
   if (!result?.success) {
-    throw new Error(`Compass createComponent did not return success for ${componentDetails.name}.`);
+    throw new Error(`Compass createRelationship did not return success for ${startComponent.name} -> ${endComponent.name}.`);
   }
-  return result.componentDetails;
 }
 
 function getGoalTypeAri(cloudId) {
@@ -2829,6 +3279,256 @@ async function createAtlassianGoal(cloudId, name, targetDate) {
   return goal;
 }
 
+function getAtlassianGoalStatusPlan(goalIndex) {
+  const plans = [
+    { status: 'on_track', label: 'ON TRACK', score: 70 },
+    { status: 'at_risk', label: 'AT RISK', score: 50 },
+    { status: 'off_track', label: 'OFF TRACK', score: 30 },
+  ];
+  return plans[Math.abs(Number(goalIndex) || 0) % plans.length];
+}
+
+function buildAtlassianGoalUpdateSummary(goalName, statusPlan) {
+  return JSON.stringify({
+    version: 1,
+    type: 'doc',
+    content: [
+      {
+        type: 'paragraph',
+        content: [
+          {
+            type: 'text',
+            text: `${goalName} is marked ${statusPlan.label.toLowerCase()} for demo progress tracking.`,
+          },
+        ],
+      },
+    ],
+  });
+}
+
+async function createAtlassianGoalStatusUpdate(goalId, goalName, targetDate, statusPlan) {
+  const safeTargetDate = /^\d{4}-\d{2}-\d{2}$/.test(String(targetDate || ''))
+    ? targetDate
+    : new Date().toISOString().slice(0, 10);
+  const summary = buildAtlassianGoalUpdateSummary(goalName, statusPlan);
+  const data = await requestAtlassianGraph(`
+    mutation CreateGoalStatusUpdate($goalId: ID!, $summary: String!, $status: String!, $score: Int!) {
+      goals_createUpdate(
+        input: {
+          goalId: $goalId
+          summary: $summary
+          status: $status
+          score: $score
+          targetDate: {
+            date: "${safeTargetDate}"
+            confidence: QUARTER
+          }
+        }
+      ) {
+        success
+        errors {
+          message
+        }
+        update {
+          id
+          newScore
+          updateType
+        }
+      }
+    }
+  `, {
+    goalId,
+    summary,
+    status: statusPlan.status,
+    score: statusPlan.score,
+  });
+
+  const result = data?.goals_createUpdate;
+  if (!result?.success) {
+    const messages = (result?.errors || []).map(error => error?.message).filter(Boolean).join('; ');
+    throw new Error(messages || 'Goals API did not accept the status update.');
+  }
+
+  return result.update || null;
+}
+
+let jiraGoalsFieldIdCache = null;
+
+async function getJiraGoalsFieldId(diagnostics = []) {
+  if (jiraGoalsFieldIdCache !== null) {
+    return jiraGoalsFieldIdCache;
+  }
+
+  try {
+    const fields = await jiraGet('/rest/api/3/field');
+    const goalsField = (Array.isArray(fields) ? fields : []).find(field => {
+      const name = String(field.name || '').toLowerCase();
+      const schemaText = JSON.stringify(field.schema || {}).toLowerCase();
+      return name === 'goals' || schemaText.includes('goals') || schemaText.includes('townsquare');
+    });
+    jiraGoalsFieldIdCache = goalsField?.id || '';
+
+    if (jiraGoalsFieldIdCache) {
+      diagnostics.push(`Native Goals field: resolved ${jiraGoalsFieldIdCache}.`);
+    } else {
+      diagnostics.push('Native Goals field: not found. Enable the Goals field for the project work type in Jira before native goal linking can appear in the Goals tab.');
+    }
+  } catch (err) {
+    jiraGoalsFieldIdCache = '';
+    diagnostics.push(`Native Goals field: lookup failed: ${err.message}`);
+  }
+
+  return jiraGoalsFieldIdCache;
+}
+
+async function isIssueFieldEditable(issueKey, fieldId) {
+  try {
+    const editMeta = await jiraGet(`/rest/api/3/issue/${encodeURIComponent(issueKey)}/editmeta`);
+    return Boolean(editMeta?.fields?.[fieldId]);
+  } catch {
+    return true;
+  }
+}
+
+async function updateIssueWithFirstWorkingPayload(issueKey, payloads, options = {}) {
+  let lastError = null;
+  const querySuffixes = options.querySuffixes || ['notifyUsers=false'];
+
+  for (const querySuffix of querySuffixes) {
+    for (const payload of payloads) {
+      try {
+        await jiraPut(`/rest/api/3/issue/${encodeURIComponent(issueKey)}?${querySuffix}`, payload);
+        return;
+      } catch (err) {
+        lastError = err;
+      }
+    }
+  }
+
+  throw lastError || new Error(`No payload variants were available for ${issueKey}.`);
+}
+
+async function linkIssueToAtlassianGoal(issueKey, goalId, diagnostics = []) {
+  const goalsFieldId = await getJiraGoalsFieldId(diagnostics);
+  if (!goalsFieldId) {
+    throw new Error('Native Goals field was not found on this Jira site.');
+  }
+
+  const editable = await isIssueFieldEditable(issueKey, goalsFieldId);
+  if (!editable) {
+    diagnostics.push(`Native Goals link ${issueKey}: ${goalsFieldId} is not on the edit screen; trying Jira admin screen-security override.`);
+  }
+
+  await updateIssueWithFirstWorkingPayload(issueKey, [
+    { fields: { [goalsFieldId]: [{ id: goalId }] } },
+    { update: { [goalsFieldId]: [{ set: [{ id: goalId }] }] } },
+    { fields: { [goalsFieldId]: [goalId] } },
+    { update: { [goalsFieldId]: [{ set: [goalId] }] } },
+  ], {
+    querySuffixes: [
+      'notifyUsers=false',
+      'notifyUsers=false&overrideScreenSecurity=true&overrideEditableFlag=true',
+    ],
+  });
+}
+
+async function linkIssueToCompassComponent(issueKey, component, diagnostics = []) {
+  const payloads = [];
+
+  if (component.id) {
+    payloads.push({ update: { components: [{ add: { id: String(component.id) } }] } });
+    payloads.push({ fields: { components: [{ id: String(component.id) }] } });
+  }
+  if (component.name) {
+    payloads.push({ update: { components: [{ add: { name: String(component.name) } }] } });
+    payloads.push({ fields: { components: [{ name: String(component.name) }] } });
+  }
+
+  try {
+    await updateIssueWithFirstWorkingPayload(issueKey, payloads);
+    diagnostics.push(`Compass link ${issueKey}: linked "${component.name}" to Components field.`);
+  } catch (err) {
+    diagnostics.push(`Compass link ${issueKey}: "${component.name}" not linked: ${err.message}`);
+    throw err;
+  }
+}
+
+function getProjectGoalTemplates(config, project) {
+  const industryName = toTitleCase(config.industry || 'Business');
+  const template = normaliseSoftwareTemplate(project?.softwareTemplate);
+  const methodLabel = template === 'kanban' ? 'flow' : 'sprint';
+
+  return [
+    {
+      title: `${project.key} improve ${industryName} release confidence`,
+      description: `Increase release confidence for ${project.name} by tightening ${methodLabel} quality signals, release readiness, and operational handoff.`,
+      priority: 'High',
+      targetOffsetDays: 90,
+    },
+    {
+      title: `${project.key} reduce customer-impacting defects`,
+      description: `Reduce escaped defects across ${project.name} with better triage, dependency visibility, and component ownership.`,
+      priority: 'Medium',
+      targetOffsetDays: 120,
+    },
+    {
+      title: `${project.key} improve delivery predictability`,
+      description: `Improve delivery predictability for ${project.name} through active sprint/flow tracking, aging work reviews, and roadmap alignment.`,
+      priority: 'Medium',
+      targetOffsetDays: 150,
+    },
+  ];
+}
+
+async function createProjectGoalWorkItem(config, project, goalTemplate, goalIndex, diagnostics = []) {
+  const targetDate = createShiftedDate(goalTemplate.targetOffsetDays + (goalIndex * 7)).toISOString().split('T')[0];
+  const lifecycle = createLifecycleForIssue({
+    index: goalIndex,
+    priority: goalTemplate.priority,
+    issueType: 'Task',
+    maxAgeDays: config.dateRangeDays,
+  });
+  const lifecycleForStatus = ensureResolvedLifecycleForStatus(lifecycle, goalIndex === 0 ? 'In Progress' : 'To Do');
+  const componentNames = (project.components || [])
+    .map(component => component.name)
+    .filter(Boolean)
+    .slice(0, 2);
+
+  const issue = await createIssue(
+    project.key,
+    goalTemplate.title,
+    'Task',
+    null,
+    goalTemplate.priority,
+    targetDate,
+    null,
+    {
+      demoDateFields: project.skipDemoDateFieldWrites ? {} : (project.demoDateFields || {}),
+      diagnostics,
+      environmentName: config.environmentName,
+      lifecycle: lifecycleForStatus,
+      projectKind: 'software-goal',
+      retentionPeriodDays: config.retentionPeriodDays,
+      description: goalTemplate.description,
+      skipEpicLink: true,
+      labels: ['demo-goal', 'project-goal'],
+      components: componentNames,
+    }
+  );
+
+  if (lifecycleForStatus.targetStatus && lifecycleForStatus.targetStatus !== 'To Do') {
+    await transitionIssue(issue.key, lifecycleForStatus.targetStatus);
+  }
+
+  return {
+    key: issue.key,
+    name: goalTemplate.title,
+    projectKey: project.key,
+    targetDate,
+    source: 'jira-work-item',
+  };
+}
+
 async function createEpic(projectKey, epicName, options = {}) {
   const dueDate = options.dueDate || null;
   const startDate = options.startDate || null;
@@ -2852,7 +3552,6 @@ async function createEpic(projectKey, epicName, options = {}) {
   if (startDate && startDateFieldId) fields[startDateFieldId] = startDate;
   if (assigneeAccountId) fields.assignee = { accountId: assigneeAccountId };
   if (priority) fields.priority = { name: priority };
-  Object.assign(fields, buildDemoDateFieldValues(demoDateFields, lifecycle));
 
   try {
     const epic = await jiraPost('/rest/api/3/issue', { fields });
@@ -3260,6 +3959,38 @@ async function getProjectDemoDateFieldIds(projectKey, diagnostics = []) {
   return result;
 }
 
+async function resolveDemoDateFieldsWithoutScreenSetup(projectKey, diagnostics = []) {
+  const result = {
+    createdDateFieldId: null,
+    resolvedDateFieldId: null,
+  };
+
+  try {
+    const globalFields = await getDemoDateFieldIds();
+    result.createdDateFieldId = globalFields.createdDateFieldId || null;
+    result.resolvedDateFieldId = globalFields.resolvedDateFieldId || null;
+    diagnostics.push(
+      `Date fields ${projectKey}: global lookup created=${result.createdDateFieldId || 'NOT_FOUND'}, resolved=${result.resolvedDateFieldId || 'NOT_FOUND'}`
+    );
+  } catch (err) {
+    diagnostics.push(`Date fields ${projectKey}: global lookup failed: ${err.message}`);
+  }
+
+  if (!result.createdDateFieldId || !result.resolvedDateFieldId) {
+    await ensureGlobalDemoDateFields(result, diagnostics);
+  }
+
+  diagnostics.push(
+    `Date fields ${projectKey}: screen configuration skipped; issue updates will use the normal edit path with admin override fallback.`
+  );
+  diagnostics.push(
+    `Date fields ${projectKey}: resolved created=${result.createdDateFieldId || 'NOT_FOUND'}, resolved=${result.resolvedDateFieldId || 'NOT_FOUND'}`
+  );
+
+  demoDateFieldsByProjectCache.set(projectKey, result);
+  return result;
+}
+
 async function getProjectIssueTypeScreenSchemeId(projectId) {
   for (let attempt = 0; attempt < 4; attempt++) {
     const data = await jiraGet(`/rest/api/3/issuetypescreenscheme/project?projectId=${encodeURIComponent(projectId)}`);
@@ -3450,6 +4181,71 @@ async function showFieldsInFieldConfigurations(projectId, fieldIds) {
   }
 
   return fieldConfigurationIds.length;
+}
+
+async function getProjectSpecificFieldConfigurationIds(projectId) {
+  const fieldConfigurationSchemeId = await getProjectFieldConfigurationSchemeId(projectId);
+
+  if (!fieldConfigurationSchemeId) {
+    return [];
+  }
+
+  const data = await jiraGet(`/rest/api/3/fieldconfigurationscheme/mapping?fieldConfigurationSchemeId=${encodeURIComponent(fieldConfigurationSchemeId)}&maxResults=100`);
+  const ids = new Set();
+
+  for (const mapping of data.values || []) {
+    if (mapping.fieldConfigurationId) {
+      ids.add(String(mapping.fieldConfigurationId));
+    }
+  }
+
+  return Array.from(ids);
+}
+
+async function hideFieldsInProjectFieldConfigurations(projectId, fieldIds) {
+  const fieldConfigurationIds = await getProjectSpecificFieldConfigurationIds(projectId);
+
+  for (const fieldConfigurationId of fieldConfigurationIds) {
+    await jiraPut(`/rest/api/3/fieldconfiguration/${encodeURIComponent(fieldConfigurationId)}/fields`, {
+      fieldConfigurationItems: fieldIds.map(fieldId => ({
+        id: fieldId,
+        isHidden: true,
+      })),
+    });
+  }
+
+  return fieldConfigurationIds.length;
+}
+
+async function hideNativeMajorIncidentFieldForProject(project, diagnostics = []) {
+  if (!project?.id || !project?.key) {
+    return { success: false, message: 'project id/key unavailable' };
+  }
+
+  const fields = await jiraGet('/rest/api/3/field');
+  const majorIncidentFieldIds = (Array.isArray(fields) ? fields : [])
+    .filter(field => normaliseFieldName(field?.name || '') === 'majorincident')
+    .map(field => field.id)
+    .filter(Boolean);
+
+  if (majorIncidentFieldIds.length === 0) {
+    diagnostics.push(`ITSM foundation ${project.key}: native Major incident field was not found.`);
+    return { success: true, fieldCount: 0, fieldConfigurationCount: 0 };
+  }
+
+  const fieldConfigurationCount = await hideFieldsInProjectFieldConfigurations(project.id, majorIncidentFieldIds);
+
+  if (fieldConfigurationCount === 0) {
+    diagnostics.push(`ITSM foundation ${project.key}: skipped hiding native Major incident field because Jira did not expose a project-specific field configuration.`);
+    return { success: true, fieldCount: majorIncidentFieldIds.length, fieldConfigurationCount: 0 };
+  }
+
+  diagnostics.push(`ITSM foundation ${project.key}: hid native Major incident field from ${fieldConfigurationCount} project field configuration(s).`);
+  return {
+    success: true,
+    fieldCount: majorIncidentFieldIds.length,
+    fieldConfigurationCount,
+  };
 }
 
 async function getPrimaryScreenTabId(screenId) {
@@ -3747,6 +4543,17 @@ function chooseDemoAssigneeAccountId(assignableUsers, itemIndex, projectIndex) {
   return assignableUsers[assigneeIndex] || null;
 }
 
+function chooseRequiredDemoAssigneeAccountId(assignableUsers, itemIndex, projectIndex) {
+  if (!Array.isArray(assignableUsers) || assignableUsers.length === 0) {
+    return null;
+  }
+
+  return chooseDemoAssigneeAccountId(assignableUsers, itemIndex, projectIndex)
+    || assignableUsers[buildRealisticAssigneeIndex(itemIndex, projectIndex, assignableUsers.length)]
+    || assignableUsers[0]
+    || null;
+}
+
 function isActiveHumanUser(user) {
   if (!user?.accountId) {
     return false;
@@ -3885,18 +4692,29 @@ async function saveLifecycleProperty(issue, options, lifecycle) {
 
 function buildDemoDateFieldValues(demoDateFields, lifecycle) {
   const values = {};
-  const createdDate = lifecycle?.createdAt ? toJiraDateOnly(lifecycle.createdAt) : null;
-  const resolvedDate = lifecycle ? getDemoResolvedDate(lifecycle) : null;
+  const dateValues = buildDemoDatePropertyValues(lifecycle);
 
-  if (demoDateFields?.createdDateFieldId && createdDate) {
-    values[demoDateFields.createdDateFieldId] = createdDate;
+  if (demoDateFields?.createdDateFieldId && dateValues.createdDate) {
+    values[demoDateFields.createdDateFieldId] = dateValues.createdDate;
   }
 
-  if (demoDateFields?.resolvedDateFieldId && resolvedDate) {
-    values[demoDateFields.resolvedDateFieldId] = resolvedDate;
+  if (demoDateFields?.resolvedDateFieldId && dateValues.resolvedDate) {
+    values[demoDateFields.resolvedDateFieldId] = dateValues.resolvedDate;
   }
 
   return values;
+}
+
+function buildDemoDatePropertyValues(lifecycle) {
+  const createdDate = lifecycle?.createdAt ? toJiraDateOnly(lifecycle.createdAt) : null;
+  const resolvedDate = lifecycle ? getDemoResolvedDate(lifecycle) : null;
+
+  return {
+    createdDate,
+    resolvedDate,
+    targetStatus: lifecycle?.targetStatus || null,
+    generatedAt: new Date().toISOString(),
+  };
 }
 
 function getDemoResolvedDate(lifecycle) {
@@ -3976,6 +4794,18 @@ function ensureResolvedLifecycleForStatus(lifecycle, status) {
 
 async function updateIssueDemoDateFields(issueKey, demoDateFields, lifecycle, diagnostics = []) {
   const fields = buildDemoDateFieldValues(demoDateFields, lifecycle);
+  const dateProperty = buildDemoDatePropertyValues(lifecycle);
+
+  if (dateProperty.createdDate || dateProperty.resolvedDate) {
+    try {
+      await jiraPut(
+        `/rest/api/3/issue/${encodeURIComponent(issueKey)}/properties/${encodeURIComponent(DEMO_DATE_ISSUE_PROPERTY_KEY)}`,
+        dateProperty
+      );
+    } catch (propertyErr) {
+      diagnostics.push(`Date metadata ${issueKey}: property save skipped: ${propertyErr.message}`);
+    }
+  }
 
   if (Object.keys(fields).length === 0) {
     return;
@@ -3999,8 +4829,7 @@ async function updateIssueDemoDateFields(issueKey, demoDateFields, lifecycle, di
       );
       diagnostics.push(`Date fields ${issueKey}: updated with screen override ${Object.keys(fields).join(', ')}`);
     } catch (overrideErr) {
-      const message = `Date fields ${issueKey}: update failed. Normal update: ${normalErr.message}. Override update: ${overrideErr.message}`;
-      diagnostics.push(message);
+      const message = `Date fields ${issueKey}: Jira blocked custom field writes, so dashboard charts will use generated date metadata fallback. Normal update: ${normalErr.message}. Override update: ${overrideErr.message}`;
       console.warn(message);
     }
   }
@@ -4105,22 +4934,23 @@ async function createIssue(projectKey, title, type, epicKey, priority, dueDate, 
   if (assigneeAccountId) fields.assignee = { accountId: assigneeAccountId };
 
   // These are customer-created date fields, not Jira's immutable system Created
-  // and Resolved fields. If the site exposes "Created date" and "Resolved Date"
-  // on the create screen, the generated dates appear directly in those columns.
-  Object.assign(fields, buildDemoDateFieldValues(demoDateFields, lifecycle));
+  // and Resolved fields. Jira rejects the entire issue create request when a
+  // custom field is missing from the create screen, so these are updated only
+  // after the issue exists.
+  const demoDateFieldValues = buildDemoDateFieldValues(demoDateFields, lifecycle);
 
-  console.log('DEMO_DATE_DIAGNOSTIC issue create date field payload', JSON.stringify({
+  console.log('DEMO_DATE_DIAGNOSTIC issue post-create date field values', JSON.stringify({
     projectKey,
     title,
     createdDateFieldId: demoDateFields.createdDateFieldId || null,
-    createdDateValue: demoDateFields.createdDateFieldId ? fields[demoDateFields.createdDateFieldId] || null : null,
+    createdDateValue: demoDateFields.createdDateFieldId ? demoDateFieldValues[demoDateFields.createdDateFieldId] || null : null,
     resolvedDateFieldId: demoDateFields.resolvedDateFieldId || null,
-    resolvedDateValue: demoDateFields.resolvedDateFieldId ? fields[demoDateFields.resolvedDateFieldId] || null : null,
+    resolvedDateValue: demoDateFields.resolvedDateFieldId ? demoDateFieldValues[demoDateFields.resolvedDateFieldId] || null : null,
   }));
 
   try {
     const issue = await jiraPost('/rest/api/3/issue', { fields });
-    console.log('DEMO_DATE_DIAGNOSTIC issue created with optional date fields intact', JSON.stringify({
+    console.log('DEMO_DATE_DIAGNOSTIC issue created; optional date fields will be updated after create', JSON.stringify({
       issueKey: issue.key,
       projectKey,
     }));
@@ -4212,31 +5042,69 @@ async function createIssue(projectKey, title, type, epicKey, priority, dueDate, 
 
 async function transitionIssue(issueKey, targetStatus) {
   try {
-    const data = await jiraGet(`/rest/api/3/issue/${issueKey}/transitions`);
-    const transitions = data.transitions || [];
     const targetAliases = {
       todo: ['todo', 'open', 'backlog'],
       inprogress: ['inprogress', 'progress', 'doing', 'active'],
       underreview: ['underreview', 'review', 'testing', 'qa', 'readyforreview'],
+      done: ['done', 'resolved', 'complete', 'completed', 'closed'],
       resolved: ['resolved', 'done', 'complete', 'completed', 'closed'],
       rejected: ['rejected', 'declined', 'cancelled', 'canceled', 'wontdo'],
     };
     const targetKey = normaliseStatusName(targetStatus);
     const aliases = targetAliases[targetKey] || [targetKey];
-    const t = transitions.find(transition => {
-      const candidate = normaliseStatusName(transition?.to?.name);
-      return aliases.some(alias => candidate.includes(alias));
-    });
+    const doneTarget = isDoneLikeStatus(targetStatus);
 
-    if (t) {
-      await api.asUser().requestJira(
+    const transitionWithAliases = async (candidateAliases, statusCategoryKey = null) => {
+      const data = await jiraGet(`/rest/api/3/issue/${issueKey}/transitions`);
+      const transitions = data.transitions || [];
+      const transition = transitions.find(item => {
+        const candidate = normaliseStatusName(item?.to?.name);
+        const category = item?.to?.statusCategory?.key;
+        return (
+          (statusCategoryKey && category === statusCategoryKey) ||
+          candidateAliases.some(alias => candidate === alias || candidate.includes(alias))
+        );
+      });
+
+      if (!transition) {
+        return false;
+      }
+
+      const res = await api.asUser().requestJira(
         route`/rest/api/3/issue/${issueKey}/transitions`,
         {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ transition: { id: String(t.id) } }),
+          body: JSON.stringify({ transition: { id: String(transition.id) } }),
         }
       );
+
+      if (!res.ok && res.status !== 204) {
+        const text = await res.text();
+        throw new Error(`transition ${transition.name || transition.id} failed: ${res.status} ${text}`);
+      }
+
+      await wait(500);
+      return true;
+    };
+
+    if (doneTarget) {
+      if (await transitionWithAliases(aliases, 'done')) {
+        return;
+      }
+
+      await transitionWithAliases(targetAliases.inprogress, 'indeterminate');
+
+      if (await transitionWithAliases(aliases, 'done')) {
+        return;
+      }
+
+      console.warn(`Transition ${issueKey} -> ${targetStatus}: no Done/Resolved/Complete transition was available.`);
+      return;
+    }
+
+    if (!(await transitionWithAliases(aliases))) {
+      console.warn(`Transition ${issueKey} -> ${targetStatus}: no matching transition was available.`);
     }
   } catch (err) {
     console.error(`Transition ${issueKey} -> ${targetStatus}: ${err.message}`);
@@ -4245,22 +5113,40 @@ async function transitionIssue(issueKey, targetStatus) {
 
 async function getBoardId(projectKey, boardType = 'scrum') {
   const safeBoardType = normaliseSoftwareTemplate(boardType) === 'kanban' ? 'kanban' : 'scrum';
-  const boardPath = `/rest/agile/1.0/board?projectKeyOrId=${encodeURIComponent(projectKey)}&type=${safeBoardType}`;
+  let fallbackBoardId = null;
+  const lookupPaths = [
+    `/rest/agile/1.0/board?projectKeyOrId=${encodeURIComponent(projectKey)}&type=${safeBoardType}`,
+    `/rest/agile/1.0/board?projectKeyOrId=${encodeURIComponent(projectKey)}`,
+  ];
 
   // Newly-created software projects do not always surface their Scrum board instantly.
   // A short retry loop makes the sprint step far more reliable without needing a manual rerun.
-  for (let attempt = 0; attempt < 4; attempt++) {
-    const data = await jiraGet(boardPath);
-    const boardId = data.values?.[0]?.id;
+  for (let attempt = 0; attempt < 8; attempt++) {
+    for (const boardPath of lookupPaths) {
+      const data = await jiraGet(boardPath);
+      const boards = Array.isArray(data.values) ? data.values : [];
+      const exactBoard = boards.find(board => String(board?.type || '').toLowerCase() === safeBoardType);
+      const board = exactBoard || boards[0];
+      const boardId = board?.id;
 
-    if (boardId) {
-      return boardId;
+      if (boardId) {
+        fallbackBoardId = exactBoard?.id || fallbackBoardId || boardId;
+        try {
+          await jiraGet(`/rest/agile/1.0/board/${encodeURIComponent(boardId)}/configuration`);
+          return boardId;
+        } catch (err) {
+          console.warn(`Board ${boardId} for ${projectKey} was returned by Jira but configuration lookup failed: ${err.message}`);
+          if (exactBoard?.id) {
+            return exactBoard.id;
+          }
+        }
+      }
     }
 
-    await wait(1500);
+    await wait(2000);
   }
 
-  return null;
+  return fallbackBoardId;
 }
 
 async function createSoftwareBoardForProject(project, boardType = 'scrum') {
@@ -4282,6 +5168,9 @@ async function createSoftwareBoardForProject(project, boardType = 'scrum') {
   });
 
   await favoriteSavedFilter(filter.id);
+  await wait(1500);
+  await jiraGet(`/rest/agile/1.0/board/${encodeURIComponent(board.id)}`);
+  await jiraGet(`/rest/agile/1.0/board/${encodeURIComponent(board.id)}/configuration`);
   return board.id || null;
 }
 
@@ -4297,18 +5186,11 @@ async function createSprint(boardId, name, startDate, endDate) {
 }
 
 async function updateSprint(sprintId, body) {
-  const res = await api.asUser().requestJira(buildTrustedJiraRoute(`/rest/agile/1.0/sprint/${sprintId}`), {
-    method: 'PUT',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify(body),
-  });
+  return jiraPut(`/rest/agile/1.0/sprint/${sprintId}`, body);
+}
 
-  if (!res.ok) {
-    const text = await res.text();
-    throw new Error(`PUT /rest/agile/1.0/sprint/${sprintId} failed: ${res.status} ${text}`);
-  }
-
-  return res.json();
+async function getSprint(sprintId) {
+  return jiraGet(`/rest/agile/1.0/sprint/${encodeURIComponent(sprintId)}`);
 }
 
 function getSprintSchedule(sprintIndex) {
@@ -4336,6 +5218,129 @@ function getSprintSchedule(sprintIndex) {
 async function moveIssuesToSprint(sprintId, issueKeys) {
   if (issueKeys.length === 0) return;
   await jiraPost(`/rest/agile/1.0/sprint/${sprintId}/issue`, { issues: issueKeys });
+}
+
+async function getSprintFieldId(diagnostics = []) {
+  if (sprintFieldIdCache !== null) {
+    return sprintFieldIdCache;
+  }
+
+  try {
+    const fields = await jiraGet('/rest/api/3/field');
+    const sprintField = Array.isArray(fields)
+      ? fields.find(field => (
+        String(field?.schema?.custom || '').includes('gh-sprint')
+        || String(field?.name || '').toLowerCase() === 'sprint'
+      ))
+      : null;
+
+    sprintFieldIdCache = sprintField?.id || '';
+    return sprintFieldIdCache;
+  } catch (err) {
+    sprintFieldIdCache = '';
+    diagnostics.push(`Sprint field lookup skipped: ${err.message}`);
+    return sprintFieldIdCache;
+  }
+}
+
+async function assignIssueToSprintField(issueKey, sprintId, diagnostics = []) {
+  const sprintFieldId = await getSprintFieldId(diagnostics);
+
+  if (!sprintFieldId) {
+    return false;
+  }
+
+  try {
+    await jiraPut(`/rest/api/3/issue/${encodeURIComponent(issueKey)}?notifyUsers=false`, {
+      fields: {
+        [sprintFieldId]: Number(sprintId),
+      },
+    });
+    return true;
+  } catch (singleValueErr) {
+    try {
+      await jiraPut(`/rest/api/3/issue/${encodeURIComponent(issueKey)}?notifyUsers=false`, {
+        fields: {
+          [sprintFieldId]: [Number(sprintId)],
+        },
+      });
+      return true;
+    } catch (arrayValueErr) {
+      diagnostics.push(`Sprint ${sprintId}: could not write Sprint field for ${issueKey}: ${arrayValueErr.message || singleValueErr.message}`);
+      return false;
+    }
+  }
+}
+
+async function assignIssuesToSprint(sprintId, issueKeys, diagnostics = []) {
+  const keys = Array.isArray(issueKeys) ? issueKeys.filter(Boolean) : [];
+
+  if (keys.length === 0) {
+    return { moved: false, fieldAssigned: 0 };
+  }
+
+  let moved = false;
+  try {
+    await moveIssuesToSprint(sprintId, keys);
+    moved = true;
+  } catch (err) {
+    diagnostics.push(`Sprint ${sprintId}: Agile sprint move failed, trying Sprint field fallback: ${err.message}`);
+  }
+
+  let fieldAssigned = 0;
+  for (const issueKey of keys) {
+    if (await assignIssueToSprintField(issueKey, sprintId, diagnostics)) {
+      fieldAssigned += 1;
+    }
+  }
+
+  return { moved, fieldAssigned };
+}
+
+async function getSprintIssueCount(sprintId) {
+  const data = await jiraGet(`/rest/agile/1.0/sprint/${encodeURIComponent(sprintId)}/issue?maxResults=50`);
+  const issues = Array.isArray(data.issues) ? data.issues : [];
+  return Number.isFinite(Number(data.total)) ? Number(data.total) : issues.length;
+}
+
+async function assignAndVerifyIssuesToSprint(sprintId, issueKeys, diagnostics = []) {
+  const keys = Array.isArray(issueKeys) ? issueKeys.filter(Boolean) : [];
+  const assignResult = await assignIssuesToSprint(sprintId, keys, diagnostics);
+
+  if (keys.length === 0) {
+    return { ...assignResult, verifiedCount: 0 };
+  }
+
+  let verifiedCount = 0;
+  try {
+    verifiedCount = await getSprintIssueCount(sprintId);
+  } catch (verifyErr) {
+    diagnostics.push(`Sprint ${sprintId}: issue verification failed after assignment: ${verifyErr.message}`);
+  }
+
+  if (verifiedCount === 0) {
+    try {
+      await wait(1200);
+      await moveIssuesToSprint(sprintId, keys);
+      verifiedCount = await getSprintIssueCount(sprintId);
+    } catch (retryErr) {
+      diagnostics.push(`Sprint ${sprintId}: retry assignment verification failed: ${retryErr.message}`);
+    }
+  }
+
+  return { ...assignResult, verifiedCount };
+}
+
+function getSprintIssueChunk(issueKeys, sprintIndex, sprintCount = MIN_SOFTWARE_SPRINTS_PER_PROJECT) {
+  const keys = Array.isArray(issueKeys) ? issueKeys.filter(Boolean) : [];
+  const safeSprintCount = Math.max(1, Number.parseInt(sprintCount, 10) || MIN_SOFTWARE_SPRINTS_PER_PROJECT);
+  const safeSprintIndex = Math.max(0, Number.parseInt(sprintIndex, 10) || 0);
+  const baseSize = Math.floor(keys.length / safeSprintCount);
+  const extraItems = keys.length % safeSprintCount;
+  const chunkSize = baseSize + (safeSprintIndex < extraItems ? 1 : 0);
+  const startIndex = (safeSprintIndex * baseSize) + Math.min(safeSprintIndex, extraItems);
+
+  return keys.slice(startIndex, startIndex + chunkSize);
 }
 
 async function getIssueLinkTypeName(preferredTypeName = 'Blocks') {
@@ -4427,6 +5432,9 @@ function getDashboardProjectContext(config, state, target) {
     value: 'default',
   };
   const dashboardIntent = inferDashboardIntent(dashboardSelection.prompt, config.industry, dashboardSelection.value);
+  const projectMethodLabel = isSoftware && !isEnterprise
+    ? `${getProjectManagementStyleLabel(project.softwareProjectStyle)} ${normaliseSoftwareTemplate(project.softwareTemplate) === 'kanban' ? 'Kanban' : 'Scrum'}`
+    : '';
   const dashboardTitle = dashboardSelection.value === 'default'
     ? fallbackTitle
     : `${fallbackTitle} - ${dashboardSelection.title}`;
@@ -4443,10 +5451,11 @@ function getDashboardProjectContext(config, state, target) {
     dashboardIndex: target.dashboardIndex,
     dashboardSelection,
     dashboardIntent,
-    dashboardProfile: dashboardIntent.title,
+    dashboardProfile: projectMethodLabel ? `${dashboardIntent.title} (${projectMethodLabel})` : dashboardIntent.title,
     project,
     projectKeys,
     customDateFields,
+    dateRangeDays: config.dateRangeDays || 180,
     projectTypeLabel: isSoftware ? 'Dev' : 'ITSM',
     dashboardName: `${dashboardOwnerName} - ${dashboardTitle}`,
     filterName: `${dashboardOwnerName} - ${filterTitle} Open Work (${state.metadata.runLabel || createRunLabel()})`,
@@ -4456,6 +5465,9 @@ function getDashboardProjectContext(config, state, target) {
           key: softwareProject.key,
           name: softwareProject.name,
           type: 'Software',
+          softwareTemplate: normaliseSoftwareTemplate(softwareProject.softwareTemplate),
+          softwareProjectStyle: normaliseProjectManagementStyle(softwareProject.softwareProjectStyle),
+          dashboardVariantSeed: getSoftwareProjectVariantSeed(softwareProject, target.projectIndex),
           projectManagementStyle: getProjectManagementStyleLabel(softwareProject.softwareProjectStyle),
           count: softwareProject.issueCount,
           boardId: softwareProject.boardId,
@@ -4479,6 +5491,21 @@ function getDashboardProjectContext(config, state, target) {
           dateFields: jsmProject.demoDateFields || {},
         })),
   };
+}
+
+function getJqlCustomFieldRef(fieldId) {
+  const match = String(fieldId || '').match(/^customfield_(\d+)$/);
+  return match ? `cf[${match[1]}]` : null;
+}
+
+function buildCustomDateRangeClause(fieldId, days) {
+  const fieldRef = getJqlCustomFieldRef(fieldId);
+  if (!fieldRef) {
+    return null;
+  }
+
+  const rangeDays = Math.max(1, Number.parseInt(days, 10) || 180);
+  return `${fieldRef} >= startOfDay("-${rangeDays}d")`;
 }
 
 function buildProjectFilterDefinition(context) {
@@ -4515,6 +5542,7 @@ async function createSavedFilter({ name, description, jql }) {
         name: candidateName,
         description,
         jql,
+        sharePermissions: [{ type: 'authenticated' }],
       });
     } catch (err) {
       lastError = err;
@@ -4526,6 +5554,10 @@ async function createSavedFilter({ name, description, jql }) {
   }
 
   throw lastError;
+}
+
+function isCustomDateFieldNotSearchableError(err) {
+  return /Field 'cf\[\d+\]' is not searchable/i.test(String(err?.message || ''));
 }
 
 async function getSavedFilter(filterId) {
@@ -4865,6 +5897,18 @@ async function configureFilterDrivenChartGadget(dashboardId, itemId, filter, ext
 }
 
 async function configureForgeDemoGadget(dashboardId, itemId, gadgetPlan, state, filter, environmentConfig, dashboardContext = null) {
+  const reportFilters = (state.results.reports || [])
+    .filter(report => !dashboardContext?.dashboardName || report.dashboardName === dashboardContext.dashboardName)
+    .map(report => ({
+      id: report.id,
+      name: report.name,
+      reportType: report.reportType,
+      viewUrl: report.viewUrl,
+      jql: report.jql,
+      customDateFilterApplied: report.customDateFilterApplied !== false,
+      customDateVisualSource: report.customDateVisualSource || 'gadget-custom-fields',
+    }));
+
   const config = {
     viewType: gadgetPlan.role.replace('forge-', ''),
     title: gadgetPlan.title,
@@ -4873,7 +5917,7 @@ async function configureForgeDemoGadget(dashboardId, itemId, gadgetPlan, state, 
     sectionLabel: gadgetPlan.sectionLabel || '',
     environmentName: dashboardContext?.dashboardName || state.results.dashboardName || environmentConfig.environmentName,
     dashboardSelection: dashboardContext?.dashboardSelection || null,
-    dashboardProfile: dashboardContext?.dashboardIntent?.title || null,
+    dashboardProfile: dashboardContext?.dashboardProfile || dashboardContext?.dashboardIntent?.title || null,
     dashboardLevel: dashboardContext?.dashboardIntent?.level || null,
     dashboardDomain: dashboardContext?.dashboardIntent?.domain || null,
     dashboardMetrics: dashboardContext?.dashboardIntent?.metrics || [],
@@ -4884,6 +5928,7 @@ async function configureForgeDemoGadget(dashboardId, itemId, gadgetPlan, state, 
     jql: filter.jql,
     allWorkJql: filter.allWorkJql || filter.jql,
     customDateFields: filter.customDateFields || dashboardContext?.customDateFields || {},
+    reportFilters,
     // The retention period is supplied from the global page form and stored on
     // every Forge dashboard gadget item. Keeping it in the gadget property means
     // each gadget can explain how long the generated demo environment should be
@@ -4908,6 +5953,9 @@ async function configureForgeDemoGadget(dashboardId, itemId, gadgetPlan, state, 
         key: project.key,
         name: project.name,
         type: 'Software',
+        softwareTemplate: normaliseSoftwareTemplate(project.softwareTemplate),
+        softwareProjectStyle: normaliseProjectManagementStyle(project.softwareProjectStyle),
+        dashboardVariantSeed: getSoftwareProjectVariantSeed(project),
         projectManagementStyle: getProjectManagementStyleLabel(project.softwareProjectStyle),
         count: project.issueCount,
         boardId: project.boardId,
@@ -4978,6 +6026,125 @@ async function ensureProjectSavedFilter(state, dashboardContext) {
   return savedFilter;
 }
 
+function buildDashboardReportFilterDefinitions(dashboardContext, dashboardFilter) {
+  const baseJql = String(dashboardFilter?.allWorkJql || dashboardFilter?.jql || '').replace(/\s+ORDER\s+BY\s+.+$/i, '').trim();
+  if (!baseJql) {
+    return [];
+  }
+
+  const reportPrefix = `${dashboardContext.dashboardName} - Report`;
+  const createdDateRangeClause = buildCustomDateRangeClause(
+    dashboardContext.customDateFields?.createdDateFieldId,
+    dashboardContext.dateRangeDays
+  );
+  const resolvedDateRangeClause = buildCustomDateRangeClause(
+    dashboardContext.customDateFields?.resolvedDateFieldId,
+    dashboardContext.dateRangeDays
+  );
+  const createdDateDescription = createdDateRangeClause
+    ? ' Uses the generated Created Date custom field for the selected ticket duration.'
+    : ' Uses Jira native Created because the generated Created Date custom field was not available.';
+  const resolvedDateDescription = resolvedDateRangeClause
+    ? ' Uses the generated Resolved Date custom field for the selected ticket duration.'
+    : ' Uses Jira native Updated because the generated Resolved Date custom field was not available.';
+  const common = {
+    dashboardIndex: dashboardContext.dashboardIndex,
+    dashboardName: dashboardContext.dashboardName,
+    projectKeys: dashboardContext.projectKeys,
+    customDateFields: dashboardContext.customDateFields || {},
+    dateRangeDays: dashboardContext.dateRangeDays || 180,
+  };
+  const createdWindowJql = createdDateRangeClause ? ` AND ${createdDateRangeClause}` : '';
+  const resolvedWindowJql = resolvedDateRangeClause ? ` AND ${resolvedDateRangeClause}` : '';
+  const urgentWorkJql = `${baseJql} AND priority in (Highest, High, Critical) ORDER BY priority DESC, duedate ASC`;
+  const agingOpenWorkJql = `${baseJql} AND statusCategory != Done ORDER BY priority DESC, duedate ASC`;
+  const completedTrendJql = `${baseJql} AND statusCategory = Done ORDER BY updated DESC`;
+
+  return [
+    {
+      ...common,
+      reportType: 'Urgent Work',
+      name: `${reportPrefix} - Urgent Work`,
+      description: `High-priority report filter for ${dashboardContext.dashboardName}.${createdDateDescription}`,
+      jql: `${baseJql}${createdWindowJql} AND priority in (Highest, High, Critical) ORDER BY priority DESC, duedate ASC`,
+      fallbackJql: urgentWorkJql,
+    },
+    {
+      ...common,
+      reportType: 'Aging Open Work',
+      name: `${reportPrefix} - Aging Open Work`,
+      description: `Open aging work report filter for ${dashboardContext.dashboardName}.${createdDateDescription}`,
+      jql: `${baseJql}${createdWindowJql} AND statusCategory != Done ORDER BY priority DESC, duedate ASC`,
+      fallbackJql: agingOpenWorkJql,
+    },
+    {
+      ...common,
+      reportType: 'Completed Trend',
+      name: `${reportPrefix} - Completed Trend`,
+      description: `Completed work trend report filter for ${dashboardContext.dashboardName}.${resolvedDateDescription}`,
+      jql: `${baseJql}${resolvedWindowJql} AND statusCategory = Done ORDER BY updated DESC`,
+      fallbackJql: completedTrendJql,
+    },
+  ];
+}
+
+async function ensureDashboardReportFilters(state, dashboardContext, dashboardFilter) {
+  const definitions = buildDashboardReportFilterDefinitions(dashboardContext, dashboardFilter);
+  const createdReports = [];
+  state.results.reports = state.results.reports || [];
+
+  for (const definition of definitions) {
+    try {
+      let customDateFilterApplied = true;
+      let activeDefinition = definition;
+      let reportFilter;
+
+      try {
+        reportFilter = await createSavedFilter(activeDefinition);
+      } catch (err) {
+        const canFallback = definition.fallbackJql && definition.fallbackJql !== definition.jql;
+        if (!canFallback || !isCustomDateFieldNotSearchableError(err)) {
+          throw err;
+        }
+
+        customDateFilterApplied = false;
+        activeDefinition = {
+          ...definition,
+          jql: definition.fallbackJql,
+          description: `${definition.description} Saved filter uses Jira-native JQL because this site does not expose the generated date fields as searchable JQL fields; the app report chart still uses generated Created Date and Resolved Date values directly.`,
+        };
+        reportFilter = await createSavedFilter(activeDefinition);
+        addChunkedDiagnostics(state, [
+          `Report filter "${definition.name}" used fallback Jira-native JQL because generated custom date fields are not searchable in saved filters; in-app Summary and Reports charts still use those custom field values directly.`,
+        ]);
+      }
+
+      const report = {
+        id: String(reportFilter.id),
+        name: reportFilter.name || definition.name,
+        jql: reportFilter.jql || activeDefinition.jql,
+        viewUrl: reportFilter.viewUrl || null,
+        reportType: definition.reportType,
+        dashboardName: definition.dashboardName,
+        projectKeys: definition.projectKeys,
+        customDateFilterApplied,
+        customDateVisualSource: 'gadget-custom-fields',
+      };
+      state.results.reports.push(report);
+      createdReports.push(report);
+      await favoriteSavedFilter(report.id);
+    } catch (err) {
+      addChunkedDiagnostics(state, [`Report filter "${definition.name}" skipped: ${err.message}`]);
+    }
+  }
+
+  if (createdReports.length > 0) {
+    addChunkedDiagnostics(state, [`Reports ${dashboardContext.dashboardName}: created ${createdReports.length} saved report filter(s).`]);
+  }
+
+  return createdReports;
+}
+
 async function createManagedDashboard(config, state, filter) {
   const dashboard = await createDashboard(`${config.environmentName} - Release Dashboard`);
   const availableGadgets = await getAvailableDashboardGadgets();
@@ -4994,11 +6161,6 @@ async function createManagedDashboard(config, state, filter) {
       role: 'filter-results',
       title: `${config.environmentName} Open Work`,
       keywords: ['filter results', 'filter'],
-    },
-    {
-      role: 'pie-chart-status',
-      title: 'Work by Status',
-      keywords: ['pie chart'],
     },
     {
       role: 'activity',
@@ -5078,6 +6240,12 @@ resolver.define('createDemoEnvironment', async ({ payload }) => {
   } = payload;
   const dateRangeDays = parseDateRangeDays(payload.dateRange);
   const retentionPeriodDays = ACTIVE_TICKET_RETENTION_DAYS;
+  const effectiveSprintsPerProject = normalisePositiveInteger(
+    sprintsPerProject,
+    MIN_SOFTWARE_SPRINTS_PER_PROJECT,
+    MIN_SOFTWARE_SPRINTS_PER_PROJECT,
+    MIN_SOFTWARE_SPRINTS_PER_PROJECT
+  );
 
   const results = {
     jsmProjects: [],
@@ -5149,9 +6317,14 @@ resolver.define('createDemoEnvironment', async ({ payload }) => {
         }
 
         try {
-          const formSetup = await ensureDefaultSmartIntakeForm(project.key, projectName, industry);
+          const formSetup = await ensureDefaultSmartIntakeForm(project.key, projectName, industry, {
+            serviceDeskId: project.serviceDeskId,
+            diagnostics: results.diagnostics,
+            lookupAttempts: 2,
+            lookupDelayMs: 1000,
+          });
           if (!formSetup.success) {
-            results.errors.push(`JSM Project ${project.key}: ${formSetup.message}`);
+            results.diagnostics.push(`Forms ${project.key}: skipped without failing the environment: ${formSetup.message}`);
           } else {
             results.diagnostics.push(`Forms ${project.key}: ${formSetup.reused ? 'reused' : 'created'} "${formSetup.name}" (request type ${formSetup.requestTypeId})`);
             if (formSetup.warning) {
@@ -5159,13 +6332,12 @@ resolver.define('createDemoEnvironment', async ({ payload }) => {
             }
           }
         } catch (err) {
-          results.errors.push(`JSM Project ${project.key}: default smart form setup failed: ${err.message}`);
+          results.diagnostics.push(`Forms ${project.key}: skipped without failing the environment: ${err.message}`);
         }
 
         // Create incidents as regular Bug issues (no JSM API needed)
         const projectIncidents = [];
         const count = Math.min(incidentsPerProject, MAX_INCIDENTS_PER_PROJECT);
-        const boardStatusCycle = ['To Do', 'In Progress', 'Done'];
 
         for (let j = 0; j < count; j++) {
           try {
@@ -5178,8 +6350,8 @@ resolver.define('createDemoEnvironment', async ({ payload }) => {
               maxAgeDays: dateRangeDays,
             });
             const dueDate = getDateString(getRandomInt(-60, 30));
-            const assigneeAccountId = chooseDemoAssigneeAccountId(assignableUsers, j, i);
-            const targetStatus = boardStatusCycle[j % boardStatusCycle.length];
+            const assigneeAccountId = chooseRequiredDemoAssigneeAccountId(assignableUsers, j, i);
+            const targetStatus = getDemoBugStatusFromDueDate(dueDate);
             const lifecycleForStatus = ensureResolvedLifecycleForStatus(lifecycle, targetStatus);
             // Create incident as a Bug type issue using standard Jira API
             const created = await createIssue(project.key, inc.title, 'Bug', null, priority, dueDate, null, {
@@ -5267,17 +6439,24 @@ resolver.define('createDemoEnvironment', async ({ payload }) => {
           }
         }
 
+        const projectVariantSeed = getSoftwareProjectVariantSeed({
+          key: project.key,
+          softwareTemplate: selectedSoftwareTemplate,
+          softwareProjectStyle: selectedSoftwareProjectStyle,
+        }, i);
+
         // Epics
         const epicKeys = [];
         for (let epicIndex = 0; epicIndex < content.epics.length; epicIndex++) {
-          const epicName = content.epics[epicIndex];
+          const variantIndex = epicIndex + projectVariantSeed;
+          const epicName = content.epics[variantIndex % (content.epics.length || 1)];
 
           try {
-            const dueDate = getDateString(30 + (epicIndex * 14));
-            const assigneeAccountId = chooseDemoAssigneeAccountId(assignableUsers, epicIndex, i);
-            const epicPriority = priorities[epicIndex % priorities.length];
+            const dueDate = getDateString(30 + ((variantIndex % Math.max(content.epics.length, 1)) * 14));
+            const assigneeAccountId = chooseDemoAssigneeAccountId(assignableUsers, variantIndex, i);
+            const epicPriority = priorities[variantIndex % priorities.length];
             const lifecycle = createLifecycleForIssue({
-              index: epicIndex,
+              index: variantIndex,
               priority: epicPriority,
               issueType: 'Epic',
               maxAgeDays: dateRangeDays,
@@ -5304,13 +6483,18 @@ resolver.define('createDemoEnvironment', async ({ payload }) => {
         const count = Math.min(issuesPerProject, MAX_ISSUES_PER_PROJECT);
         for (let j = 0; j < count; j++) {
           try {
-            const tmpl = getCycledTemplate(content.issues, j);
+            const variantIndex = j + projectVariantSeed;
+            const tmpl = getCycledTemplate(content.issues, variantIndex);
             const dueDate = getDateString(getRandomInt(-90, 90));
-            const assigneeAccountId = chooseDemoAssigneeAccountId(assignableUsers, j, i);
-            const priority = priorities[j % priorities.length];
-            const status = getDemoDevStatus(j);
+            const assigneeAccountId = isBugIssueType(tmpl.type)
+              ? chooseRequiredDemoAssigneeAccountId(assignableUsers, variantIndex, i)
+              : chooseDemoAssigneeAccountId(assignableUsers, variantIndex, i);
+            const priority = priorities[variantIndex % priorities.length];
+            const status = isBugIssueType(tmpl.type)
+              ? getDemoBugStatusFromDueDate(dueDate)
+              : getDemoDevStatus(variantIndex);
             const lifecycle = createLifecycleForIssue({
-              index: j,
+              index: variantIndex,
               priority,
               issueType: tmpl.type,
               maxAgeDays: dateRangeDays,
@@ -5320,10 +6504,10 @@ resolver.define('createDemoEnvironment', async ({ payload }) => {
               project.key,
               tmpl.title,
               tmpl.type,
-              epicKeys[j % epicKeys.length] || null,
+              epicKeys[variantIndex % epicKeys.length] || null,
               priority,
               dueDate,
-              versions[j % versions.length]?.id,
+              versions[variantIndex % versions.length]?.id,
               {
                 assigneeAccountId,
                 demoDateFields,
@@ -5347,22 +6531,37 @@ resolver.define('createDemoEnvironment', async ({ payload }) => {
         }
 
         // Sprints
-        const boardId = await getBoardId(project.key, selectedSoftwareTemplate);
-        if (selectedSoftwareTemplate === 'scrum' && boardId && issueKeys.length > 0) {
-          const chunkSize = Math.max(1, Math.ceil(issueKeys.length / sprintsPerProject));
-
-          for (let s = 0; s < sprintsPerProject; s++) {
+        let sprintBoardId = await getBoardId(project.key, 'scrum');
+        if (!sprintBoardId) {
+          results.errors.push(`Sprint setup ${project.key}: native Scrum board was not found, so sprint creation was skipped to avoid creating sprints on the wrong board.`);
+        }
+        if (sprintBoardId && issueKeys.length > 0) {
+          for (let s = 0; s < effectiveSprintsPerProject; s++) {
             try {
-              const daysBack = (sprintsPerProject - 1 - s) * 14;
-              const startDate = getDateString(-daysBack - 14);
-              const endDate = getDateString(-daysBack);
+              const schedule = getSprintSchedule(s);
+              const sprint = await createSprint(sprintBoardId, `${project.key} Sprint ${s + 1}`, schedule.startDate, schedule.endDate);
 
-              // FIX: No 'state' param — Jira API ignores/rejects it on creation
-              const sprint = await createSprint(boardId, `Sprint ${s + 1}`, startDate, endDate);
-
-              const chunk = issueKeys.slice(s * chunkSize, (s + 1) * chunkSize);
+              const chunk = getSprintIssueChunk(issueKeys, s, effectiveSprintsPerProject);
               if (chunk.length > 0) {
-                await moveIssuesToSprint(sprint.id, chunk);
+                const assignResult = await assignAndVerifyIssuesToSprint(sprint.id, chunk, results.diagnostics);
+                if (assignResult.verifiedCount === 0) {
+                  results.errors.push(`Sprint ${s + 1} for ${project.key}: Jira still reports 0 issues after assignment.`);
+                }
+              }
+
+              if (schedule.shouldActivate) {
+                await updateSprint(sprint.id, {
+                  name: sprint.name,
+                  startDate: formatDateForJira(schedule.startDate),
+                  endDate: formatDateForJira(schedule.endDate),
+                  state: 'active',
+                });
+                if (chunk.length > 0) {
+                  const assignResult = await assignAndVerifyIssuesToSprint(sprint.id, chunk, results.diagnostics);
+                  if (assignResult.verifiedCount === 0) {
+                    results.errors.push(`Sprint ${s + 1} for ${project.key}: active sprint has 0 verified issues after start.`);
+                  }
+                }
               }
               console.log(`Sprint ${s + 1} created with ${chunk.length} issues`);
             } catch (err) {
@@ -5485,14 +6684,14 @@ resolver.define('createDemoEnvironment', async ({ payload }) => {
   }
 });
 
-const INCIDENT_BATCH_SIZE = 2;
-const ISSUE_BATCH_SIZE = 2;
+const INCIDENT_BATCH_SIZE = 1;
+const ISSUE_BATCH_SIZE = 1;
 const VERSION_BATCH_SIZE = 2;
 const EPIC_BATCH_SIZE = 2;
 const SOFTWARE_VERSION_COUNT = 6;
 const MAX_INCIDENTS_PER_PROJECT = 60;
 const MAX_ISSUES_PER_PROJECT = 60;
-const MIN_SOFTWARE_SPRINTS_PER_PROJECT = 4;
+const MIN_SOFTWARE_SPRINTS_PER_PROJECT = 6;
 const ITSM_WORK_COUNT_KEYS = [
   'incidentRequestsPerProject',
   'problemRequestsPerProject',
@@ -5748,8 +6947,10 @@ function createChunkedExecutionState(accountId) {
       githubActivity: [],
       dashboards: [],
       savedFilters: [],
+      reports: [],
       compassComponents: [],
       atlassianGoals: [],
+      projectGoals: [],
       totalIncidents: 0,
       totalIssues: 0,
       dashboardId: null,
@@ -5818,7 +7019,6 @@ function buildChunkedExecutionPlan(config) {
     const softwareProjectConfig = getSoftwareProjectConfig(config, projectIndex);
     const issueCount = softwareProjectConfig.issuesPerProject;
     const softwareTemplate = normaliseSoftwareTemplate(softwareProjectConfig.softwareTemplate);
-    const usesScrumTemplate = softwareTemplate === 'scrum';
 
     steps.push({
       type: 'create-software-project-shell',
@@ -5855,16 +7055,6 @@ function buildChunkedExecutionPlan(config) {
       projectIndex,
       label: `Create components for software project ${projectIndex + 1}`,
     });
-    steps.push({
-      type: 'create-compass-components',
-      projectIndex,
-      label: `Create Compass components for software project ${projectIndex + 1}`,
-    });
-    steps.push({
-      type: 'create-atlassian-goals',
-      projectIndex,
-      label: `Create Atlassian Goals for software project ${projectIndex + 1}`,
-    });
 
     if (!csvIssueCreation) {
       const epicCount = getConfiguredContent(config).epics.length;
@@ -5878,6 +7068,12 @@ function buildChunkedExecutionPlan(config) {
         });
       }
     }
+
+    steps.push({
+      type: 'create-atlassian-goals',
+      projectIndex,
+      label: `Create and link Atlassian Goals for software project ${projectIndex + 1}`,
+    });
 
     steps.push({
       type: 'lookup-software-board',
@@ -5897,13 +7093,27 @@ function buildChunkedExecutionPlan(config) {
       }
     }
 
-    if (!csvIssueCreation && usesScrumTemplate) {
-      for (let sprintIndex = 0; sprintIndex < config.sprintsPerProject; sprintIndex++) {
+    steps.push({
+      type: 'create-compass-components',
+      projectIndex,
+      label: `Create and link Compass components for software project ${projectIndex + 1}`,
+    });
+
+    if (!csvIssueCreation) {
+      if (softwareTemplate === 'scrum') {
+        for (let sprintIndex = 0; sprintIndex < config.sprintsPerProject; sprintIndex++) {
+          steps.push({
+            type: 'create-software-sprint',
+            projectIndex,
+            sprintIndex,
+            label: `Create sprint ${sprintIndex + 1} for Scrum software project ${projectIndex + 1}`,
+          });
+        }
+      } else {
         steps.push({
-          type: 'create-software-sprint',
+          type: 'populate-kanban-board',
           projectIndex,
-          sprintIndex,
-          label: `Create sprint ${sprintIndex + 1} for software project ${projectIndex + 1}`,
+          label: `Populate Kanban board for software project ${projectIndex + 1}`,
         });
       }
     }
@@ -5915,10 +7125,47 @@ function buildChunkedExecutionPlan(config) {
       label: 'Generate CSV-ready historical dataset with real project keys',
     });
   } else {
-    steps.push({
-      type: 'create-dependencies',
-      label: 'Create links between the sample projects',
-    });
+    const itsmDependencyScopes = [
+      ['itsm-problem-incident', 'problem-to-incident'],
+      ['itsm-change-problem', 'change-to-problem'],
+      ['itsm-service-change', 'service-request-to-change'],
+      ['itsm-incident-change', 'incident-to-change'],
+    ];
+    for (let projectIndex = 0; projectIndex < config.jsmProjectCount; projectIndex++) {
+      for (const [dependencyScope, label] of itsmDependencyScopes) {
+        steps.push({
+          type: 'create-dependencies',
+          dependencyScope,
+          projectIndex,
+          label: `Create mandatory ITSM ${label} links for JSM project ${projectIndex + 1}`,
+        });
+      }
+    }
+
+    for (let projectIndex = 0; projectIndex < config.softwareProjectCount; projectIndex++) {
+      steps.push({
+        type: 'create-dependencies',
+        dependencyScope: 'software',
+        projectIndex,
+        label: `Create software work links for software project ${projectIndex + 1}`,
+      });
+    }
+
+    if (config.softwareProjectCount >= 2) {
+      steps.push({
+        type: 'create-dependencies',
+        dependencyScope: 'software-cross-project',
+        label: 'Create cross-project software dependency link',
+      });
+    }
+
+    if (config.jsmProjectCount > 0 && config.softwareProjectCount > 0) {
+      steps.push({
+        type: 'create-dependencies',
+        dependencyScope: 'devops',
+        label: 'Create DevOps dependency link between ITSM and software work',
+      });
+    }
 
     for (let projectIndex = 0; projectIndex < config.softwareProjectCount; projectIndex++) {
       steps.push({
@@ -6144,14 +7391,15 @@ async function executeBusinessDateFieldStep(state, step) {
   }
 
   try {
-    const screenSetup = await ensureDemoDateFieldsOnProjectScreens(project.id, project.key);
-    addChunkedDiagnostics(state, screenSetup.diagnostics);
+    const diagnostics = [];
+    const demoDateFields = await resolveDemoDateFieldsWithoutScreenSetup(project.key, diagnostics);
+    addChunkedDiagnostics(state, diagnostics);
 
-    project.demoDateFields = screenSetup.demoDateFields || null;
-    project.demoDateFieldsReady = Boolean(screenSetup.success);
+    project.demoDateFields = demoDateFields;
+    project.demoDateFieldsReady = Boolean(demoDateFields.createdDateFieldId || demoDateFields.resolvedDateFieldId);
 
-    if (!screenSetup.success) {
-      addChunkedError(state, `JSM Project ${project.key}: ${screenSetup.message}`);
+    if (!project.demoDateFieldsReady) {
+      addChunkedError(state, `JSM Project ${project.key}: could not resolve demo date fields.`);
     }
   } catch (err) {
     addChunkedError(state, `JSM Project ${project.key}: date field setup failed: ${err.message}`);
@@ -6166,9 +7414,14 @@ async function executeBusinessFormStep(config, state, step) {
   }
 
   try {
-    const formSetup = await ensureDefaultSmartIntakeForm(project.key, project.name, config.industry);
+    const formSetup = await ensureDefaultSmartIntakeForm(project.key, project.name, config.industry, {
+      serviceDeskId: project.serviceDeskId,
+      diagnostics: state.results.diagnostics,
+      lookupAttempts: 2,
+      lookupDelayMs: 1000,
+    });
     if (!formSetup.success) {
-      addChunkedError(state, `JSM Project ${project.key}: ${formSetup.message}`);
+      addChunkedDiagnostics(state, [`Forms ${project.key}: skipped without failing the environment: ${formSetup.message}`]);
       return;
     }
 
@@ -6184,7 +7437,7 @@ async function executeBusinessFormStep(config, state, step) {
       addChunkedDiagnostics(state, [`Forms ${project.key}: ${formSetup.warning}`]);
     }
   } catch (err) {
-    addChunkedError(state, `JSM Project ${project.key}: default smart form setup failed: ${err.message}`);
+    addChunkedDiagnostics(state, [`Forms ${project.key}: skipped without failing the environment: ${err.message}`]);
   }
 }
 
@@ -6208,12 +7461,12 @@ async function executeItsmFoundationStep(config, state, step) {
 
     try {
       const requestTypes = await getServiceDeskRequestTypes(serviceDeskId);
-      project.requestTypes = requestTypes.map(requestType => ({
-        id: requestType.id,
-        name: requestType.name,
-        issueTypeId: requestType.issueTypeId || null,
-      }));
-      const requestTypeNames = project.requestTypes.map(requestType => requestType.name).join(', ') || 'none';
+      project.requestTypes = requestTypes.map(normaliseRequestType);
+      project.requestTypes = await ensureRequiredItsmRequestTypes(project, serviceDeskId, state.results.diagnostics);
+      project.requiredItsmRequestTypesEnsured = true;
+      const requestTypeNames = project.requestTypes
+        .map(requestType => `${requestType.name}${requestType.issueTypeName ? ` (${requestType.issueTypeName})` : ''}`)
+        .join(', ') || 'none';
       addChunkedDiagnostics(state, [`ITSM foundation ${project.key}: request types available=${requestTypeNames}.`]);
     } catch (err) {
       addChunkedDiagnostics(state, [`ITSM foundation ${project.key}: request type lookup failed: ${err.message}`]);
@@ -6230,6 +7483,12 @@ async function executeItsmFoundationStep(config, state, step) {
     } catch (err) {
       addChunkedDiagnostics(state, [`ITSM foundation ${project.key}: queue lookup failed: ${err.message}`]);
     }
+  }
+
+  try {
+    await hideNativeMajorIncidentFieldForProject(project, state.results.diagnostics);
+  } catch (err) {
+    addChunkedDiagnostics(state, [`ITSM foundation ${project.key}: native Major incident field cleanup skipped: ${err.message}`]);
   }
 
   const knowledgeBase = await ensureKnowledgeBaseSpace(project.key, project.name, config.industry, state.results.diagnostics);
@@ -6286,12 +7545,32 @@ async function executeBusinessIncidentBatchStep(config, state, step) {
       let created;
       let requestTypeName = null;
 
+      let jsmCreated;
       try {
-        const jsmCreated = await createJsmRequestWorkItem(project, workItem, {
+        jsmCreated = await createJsmRequestWorkItem(project, workItem, {
           diagnostics: state.results.diagnostics,
         });
-        created = { key: jsmCreated.key };
-        requestTypeName = jsmCreated.requestTypeName;
+      } catch (requestErr) {
+        const canFallback = /service desk id was not available|no matching jsm request type|request type/i.test(String(requestErr?.message || ''));
+        if (!canFallback) {
+          throw requestErr;
+        }
+
+        state.results.diagnostics.push(`ITSM work ${project.key}: JSM request creation unavailable for ${workItem.workType} ${workIndex + 1}; using Jira issue fallback. Reason: ${requestErr.message}`);
+        jsmCreated = await createJiraItsmIssueFallback(project, workItem, {
+          diagnostics: state.results.diagnostics,
+          priority,
+          dueDate,
+          assigneeAccountId,
+          lifecycle: lifecycleForStatus,
+          demoDateFields,
+          environmentName: config.environmentName,
+          retentionPeriodDays: config.retentionPeriodDays,
+        });
+      }
+      created = { key: jsmCreated.key };
+      requestTypeName = jsmCreated.requestTypeName;
+      if (!jsmCreated.fallbackCreated) {
         await saveLifecycleProperty(created, {
           environmentName: config.environmentName,
           projectKind: 'business',
@@ -6299,25 +7578,13 @@ async function executeBusinessIncidentBatchStep(config, state, step) {
         }, lifecycleForStatus);
         await updateIssueDemoDateFields(created.key, demoDateFields, lifecycleForStatus, state.results.diagnostics);
         await updateIssueBoardVisibleFields(created.key, { assigneeAccountId, dueDate }, state.results.diagnostics);
-        try {
-          await jiraPut(`/rest/api/3/issue/${encodeURIComponent(created.key)}?notifyUsers=false`, {
-            fields: { priority: { name: priority } },
-          });
-        } catch (priorityErr) {
-          state.results.diagnostics.push(`Board fields ${created.key}: priority update skipped: ${priorityErr.message}`);
-        }
-      } catch (requestErr) {
-        state.results.diagnostics.push(`ITSM work ${project.key}: request API create failed for ${workItem.workType}; falling back to Jira issue create. ${requestErr.message}`);
-        created = await createIssue(project.key, workItem.title, workItem.issueType, null, priority, dueDate, null, {
-          assigneeAccountId,
-          demoDateFields,
-          diagnostics: state.results.diagnostics,
-          environmentName: config.environmentName,
-          lifecycle: lifecycleForStatus,
-          projectKind: 'business',
-          retentionPeriodDays: config.retentionPeriodDays,
-          description: workItem.description,
+      }
+      try {
+        await jiraPut(`/rest/api/3/issue/${encodeURIComponent(created.key)}?notifyUsers=false`, {
+          fields: { priority: { name: priority } },
         });
+      } catch (requestErr) {
+        state.results.diagnostics.push(`Board fields ${created.key}: priority update skipped: ${requestErr.message}`);
       }
       // Keep board demos visually useful by distributing generated incidents
       // across the default board columns that exist in team-managed projects.
@@ -6408,26 +7675,49 @@ async function executeSoftwareDateFieldStep(state, step) {
 
   project.timelineStartDateFieldId = await getTimelineStartDateFieldId(state.results.diagnostics);
 
-  if (project.skipDemoDateFieldWrites) {
-    project.demoDateFields = {};
-    project.demoDateFieldsReady = false;
-    addChunkedDiagnostics(state, [
-      `Date fields ${project.key}: skipped custom Created Date / Resolved Date writes because team-managed Software projects do not expose classic screens reliably. Dashboard date visuals now use custom demo date fields only, so date-based trend visuals may be empty for this project unless Jira allows those fields on the project.`,
-    ]);
-    return;
-  }
-
   try {
-    const screenSetup = await ensureDemoDateFieldsOnProjectScreens(project.id, project.key);
-    addChunkedDiagnostics(state, screenSetup.diagnostics);
+    const diagnostics = [];
+    const setupResult = project.softwareProjectStyle === 'team-managed'
+      ? {
+        ...(await resolveDemoDateFieldsWithoutScreenSetup(project.key, diagnostics)),
+        success: true,
+        screenCount: 0,
+      }
+      : await ensureDemoDateFieldsOnProjectScreens(project.id, project.key);
+    const demoDateFields = setupResult.demoDateFields || setupResult;
+    if (Array.isArray(setupResult.diagnostics)) {
+      diagnostics.push(...setupResult.diagnostics);
+    }
+    addChunkedDiagnostics(state, diagnostics);
 
-    project.demoDateFields = screenSetup.demoDateFields || null;
-    project.demoDateFieldsReady = Boolean(screenSetup.success);
+    project.demoDateFields = demoDateFields;
+    project.demoDateFieldsReady = Boolean(demoDateFields.createdDateFieldId || demoDateFields.resolvedDateFieldId);
+    project.skipDemoDateFieldWrites = !project.demoDateFieldsReady;
 
-    if (!screenSetup.success) {
-      addChunkedError(state, `Software Project ${project.key}: ${screenSetup.message}`);
+    if (!project.demoDateFieldsReady) {
+      addChunkedError(state, `Software Project ${project.key}: could not resolve demo date fields.`);
+    }
+
+    if (project.softwareProjectStyle === 'team-managed') {
+      addChunkedDiagnostics(state, [
+        `Date fields ${project.key}: team-managed project screen setup is not available through classic Jira screen APIs; charts will use generated date metadata if Jira blocks custom field writes.`,
+      ]);
+    } else if (setupResult.success) {
+      addChunkedDiagnostics(state, [
+        `Date fields ${project.key}: configured ${setupResult.fieldCount || 0} date field(s) on ${setupResult.screenCount || 0} company-managed screen(s).`,
+      ]);
+    } else {
+      addChunkedDiagnostics(state, [
+        `Date fields ${project.key}: screen setup did not complete (${setupResult.message || 'unknown reason'}); charts will use generated date metadata if Jira blocks custom field writes.`,
+      ]);
     }
   } catch (err) {
+    project.demoDateFields = null;
+    project.demoDateFieldsReady = false;
+    project.skipDemoDateFieldWrites = true;
+    addChunkedDiagnostics(state, [
+      `Date fields ${project.key}: date field resolution failed: ${err.message}`,
+    ]);
     addChunkedError(state, `Software Project ${project.key}: date field setup failed: ${err.message}`);
   }
 }
@@ -6547,6 +7837,7 @@ async function executeCompassComponentsStep(config, state, step) {
   try {
     const cloudId = await resolveAtlassianCloudId();
     const templates = getCompassComponentTemplates(config, project);
+    const createdCompassComponents = [];
 
     for (const template of templates) {
       try {
@@ -6556,13 +7847,46 @@ async function executeCompassComponentsStep(config, state, step) {
           name: component.name || template.name,
           typeId: component.typeId || template.typeId,
           projectKey: project.key,
+          repositoryLinked: Boolean(component.repositoryLinked),
+          ownerConfigured: Boolean(component.ownerConfigured),
+          richPayloadApplied: Boolean(component.richPayloadApplied),
         };
         project.compassComponents = project.compassComponents || [];
         project.compassComponents.push(record);
         state.results.compassComponents.push(record);
-        addChunkedDiagnostics(state, [`Compass ${project.key}: created ${record.name} (${record.typeId}).`]);
+        createdCompassComponents.push(record);
+        addChunkedDiagnostics(state, [`Compass ${project.key}: created ${record.name} (${record.typeId})${record.repositoryLinked ? ' with repository link' : ''}${record.ownerConfigured ? ' and owner team' : ''}.`]);
+        if (component.richPayloadApplied === false) {
+          addChunkedDiagnostics(state, [`Compass ${project.key}: "${record.name}" used simple create fallback after rich metadata was rejected: ${component.richPayloadError}`]);
+        }
       } catch (componentErr) {
         addChunkedDiagnostics(state, [`Compass ${project.key}: component "${template.name}" skipped: ${componentErr.message}`]);
+      }
+    }
+
+    if (createdCompassComponents.length >= 2) {
+      try {
+        await createCompassDependency(createdCompassComponents[1], createdCompassComponents[0]);
+        createdCompassComponents[1].dependencyLinked = true;
+        addChunkedDiagnostics(state, [`Compass ${project.key}: dependency linked ${createdCompassComponents[1].name} depends on ${createdCompassComponents[0].name}.`]);
+      } catch (dependencyErr) {
+        addChunkedDiagnostics(state, [`Compass ${project.key}: dependency link skipped: ${dependencyErr.message}`]);
+      }
+    }
+
+    const linkTargets = (project.issueKeys || []).filter(Boolean);
+    if (createdCompassComponents.length > 0 && linkTargets.length === 0) {
+      addChunkedDiagnostics(state, [`Compass ${project.key}: created native components but did not link them because no generated issue keys were available yet.`]);
+    }
+
+    for (let index = 0; index < createdCompassComponents.length && linkTargets.length > 0; index += 1) {
+      const component = createdCompassComponents[index];
+      const issueKey = linkTargets[index % linkTargets.length];
+      try {
+        await linkIssueToCompassComponent(issueKey, component, state.results.diagnostics);
+        component.linkedIssueKey = issueKey;
+      } catch {
+        // linkIssueToCompassComponent already records the exact Jira error.
       }
     }
   } catch (err) {
@@ -6577,9 +7901,31 @@ async function executeAtlassianGoalsStep(config, state, step) {
     return;
   }
 
+  project.projectGoals = project.projectGoals || [];
+  state.results.projectGoals = state.results.projectGoals || [];
+
+  const goalTemplates = getProjectGoalTemplates(config, project);
+  for (let goalIndex = 0; goalIndex < goalTemplates.length; goalIndex += 1) {
+    const goalTemplate = goalTemplates[goalIndex];
+    const existingGoal = project.projectGoals.find(goal => goal.name === goalTemplate.title);
+    if (existingGoal) {
+      continue;
+    }
+
+    try {
+      const goalRecord = await createProjectGoalWorkItem(config, project, goalTemplate, goalIndex, state.results.diagnostics);
+      project.projectGoals.push(goalRecord);
+      project.issueKeys = Array.from(new Set([...(project.issueKeys || []), goalRecord.key]));
+      state.results.projectGoals.push(goalRecord);
+      addChunkedDiagnostics(state, [`Project goal ${project.key}: created ${goalRecord.key} "${goalRecord.name}" (target ${goalRecord.targetDate}).`]);
+    } catch (err) {
+      addChunkedDiagnostics(state, [`Project goal ${project.key}: "${goalTemplate.title}" skipped: ${err.message}`]);
+    }
+  }
+
   if (!GOALS_DEMO_ENABLED) {
     if (!state.metadata.goalsConfigWarningShown) {
-      addChunkedDiagnostics(state, ['Atlassian Goals skipped: GOALS_DEMO_ENABLED=false.']);
+      addChunkedDiagnostics(state, ['Atlassian Goals GraphQL skipped: GOALS_DEMO_ENABLED=false. Jira project goal work items were still created where possible.']);
       state.metadata.goalsConfigWarningShown = true;
     }
     return;
@@ -6590,27 +7936,58 @@ async function executeAtlassianGoalsStep(config, state, step) {
     const goalTypeAri = getGoalTypeAri(cloudId);
     if (!goalTypeAri) {
       if (!state.metadata.goalsConfigWarningShown) {
-        addChunkedDiagnostics(state, ['Atlassian Goals skipped: configure ATLASSIAN_GOAL_TYPE_ARI, or ATLASSIAN_GOAL_ACTIVATION_ID and ATLASSIAN_GOAL_TYPE_ID.']);
+        addChunkedDiagnostics(state, ['Atlassian Goals GraphQL skipped: configure ATLASSIAN_GOAL_TYPE_ARI, or ATLASSIAN_GOAL_ACTIVATION_ID and ATLASSIAN_GOAL_TYPE_ID. Jira project goal work items were still created where possible.']);
         state.metadata.goalsConfigWarningShown = true;
       }
       return;
     }
 
-    const targetDate = createShiftedDate(90 + (step.projectIndex * 30)).toISOString().split('T')[0];
-    const goalName = `${config.environmentName} ${project.key} delivery goal`;
-    const goal = await createAtlassianGoal(cloudId, goalName, targetDate);
-    const record = {
-      id: goal.id,
-      name: goal.name || goalName,
-      projectKey: project.key,
-      targetDate,
-    };
     project.atlassianGoals = project.atlassianGoals || [];
-    project.atlassianGoals.push(record);
-    state.results.atlassianGoals.push(record);
-    addChunkedDiagnostics(state, [`Goal ${project.key}: created "${record.name}" (${targetDate}).`]);
+    for (let goalIndex = 0; goalIndex < project.projectGoals.length; goalIndex += 1) {
+      const projectGoal = project.projectGoals[goalIndex];
+      const nativeLinkIssueKey = (project.epicKeys || [])[goalIndex % (project.epicKeys || []).length] || projectGoal.key;
+      const nativeLinkIssueType = nativeLinkIssueKey === projectGoal.key ? 'goal work item' : 'epic';
+      const statusPlan = getAtlassianGoalStatusPlan(goalIndex);
+      try {
+        const goal = await createAtlassianGoal(cloudId, projectGoal.name, projectGoal.targetDate);
+        const record = {
+          id: goal.id,
+          name: goal.name || projectGoal.name,
+          projectKey: project.key,
+          targetDate: projectGoal.targetDate,
+          status: statusPlan.status,
+          statusLabel: statusPlan.label,
+          score: statusPlan.score,
+          linkedIssueKey: nativeLinkIssueKey,
+          linkedIssueType: nativeLinkIssueType,
+        };
+
+        try {
+          await createAtlassianGoalStatusUpdate(record.id, record.name, record.targetDate, statusPlan);
+          record.statusUpdated = true;
+        } catch (statusErr) {
+          record.statusUpdated = false;
+          addChunkedDiagnostics(state, [`Atlassian Goal ${project.key}: created "${record.name}" but status stayed pending because the update failed: ${statusErr.message}`]);
+        }
+
+        project.atlassianGoals.push(record);
+        state.results.atlassianGoals.push(record);
+        addChunkedDiagnostics(state, [`Atlassian Goal ${project.key}: created "${record.name}" (${record.targetDate}, ${record.statusUpdated ? record.statusLabel : 'PENDING'}).`]);
+
+        try {
+          await linkIssueToAtlassianGoal(nativeLinkIssueKey, record.id, state.results.diagnostics);
+          record.nativeLinked = true;
+          addChunkedDiagnostics(state, [`Atlassian Goal ${project.key}: linked "${record.name}" to ${nativeLinkIssueType} ${nativeLinkIssueKey} through the native Goals field.`]);
+        } catch (linkErr) {
+          record.nativeLinked = false;
+          addChunkedDiagnostics(state, [`Atlassian Goal ${project.key}: created "${record.name}" but native link to ${nativeLinkIssueType} ${nativeLinkIssueKey} failed: ${linkErr.message}`]);
+        }
+      } catch (goalErr) {
+        addChunkedDiagnostics(state, [`Atlassian Goal ${project.key}: "${projectGoal.name}" skipped: ${goalErr.message}`]);
+      }
+    }
   } catch (err) {
-    addChunkedDiagnostics(state, [`Goal ${project.key}: skipped: ${err.message}`]);
+    addChunkedDiagnostics(state, [`Atlassian Goals ${project.key}: skipped: ${err.message}`]);
   }
 }
 
@@ -6627,27 +8004,29 @@ async function executeSoftwareEpicBatchStep(config, state, step) {
     : (project.demoDateFields || await getProjectDemoDateFieldIds(project.key, state.results.diagnostics));
   const assignableUsers = await getAssignableUsers(project.key, state.metadata.accountId);
   project.demoDateFields = demoDateFields;
+  const projectVariantSeed = getSoftwareProjectVariantSeed(project, step.projectIndex);
 
   for (let offset = 0; offset < step.count; offset++) {
     const epicIndex = step.start + offset;
-    const epicName = epics[epicIndex];
+    const variantIndex = epicIndex + projectVariantSeed;
+    const epicName = epics[variantIndex % (epics.length || 1)];
 
     if (!epicName) {
       continue;
     }
 
     try {
-      const assigneeAccountId = chooseDemoAssigneeAccountId(assignableUsers, epicIndex, step.projectIndex);
+      const assigneeAccountId = chooseDemoAssigneeAccountId(assignableUsers, variantIndex, step.projectIndex);
       const epicPriorities = ['Highest', 'High', 'Medium', 'Low'];
-      const epicPriority = epicPriorities[epicIndex % epicPriorities.length];
+      const epicPriority = epicPriorities[variantIndex % epicPriorities.length];
       const lifecycle = createLifecycleForIssue({
-        index: epicIndex,
+        index: variantIndex,
         priority: epicPriority,
         issueType: 'Epic',
         maxAgeDays: config.dateRangeDays,
       });
       const lifecycleForStatus = ensureResolvedLifecycleForStatus(lifecycle, lifecycle.targetStatus || 'Done');
-      const dueDate = buildDueDateFromLifecycle(lifecycleForStatus, epicPriority, epicIndex);
+      const dueDate = buildDueDateFromLifecycle(lifecycleForStatus, epicPriority, variantIndex);
       const startDate = lifecycleForStatus?.createdAt ? toJiraDateOnly(lifecycleForStatus.createdAt) : null;
       const epic = await createEpic(project.key, epicName, {
         assigneeAccountId,
@@ -6686,11 +8065,10 @@ async function executeSoftwareBoardLookupStep(config, state, step) {
     const softwareTemplate = normaliseSoftwareTemplate(project.softwareTemplate || config.softwareTemplate);
     project.boardId = await getBoardId(project.key, softwareTemplate);
 
-    if (!project.boardId) {
-      project.boardId = await createSoftwareBoardForProject(project, softwareTemplate);
-      if (project.boardId) {
-        addChunkedDiagnostics(state, [`Board ${project.key}: created ${softwareTemplate} board ${project.boardId} because Jira did not expose one automatically.`]);
-      }
+    if (project.boardId) {
+      addChunkedDiagnostics(state, [`Board ${project.key}: using native ${softwareTemplate} board ${project.boardId}.`]);
+    } else {
+      addChunkedError(state, `Board ${project.key}: Jira did not expose a native ${softwareTemplate} board after waiting; skipped app-created board fallback so work is not attached to the wrong board.`);
     }
   } catch (err) {
     addChunkedError(state, `Board lookup for ${project.key}: ${err.message}`);
@@ -6712,33 +8090,44 @@ async function executeSoftwareIssueBatchStep(config, state, step) {
   project.demoDateFields = demoDateFields;
   const assignableUsers = await getAssignableUsers(project.key, state.metadata.accountId);
   const softwareTemplate = normaliseSoftwareTemplate(project.softwareTemplate || config.softwareTemplate);
+  const projectVariantSeed = getSoftwareProjectVariantSeed(project, step.projectIndex);
 
   for (let offset = 0; offset < step.count; offset++) {
     const issueIndex = step.start + offset;
-    const template = getCycledTemplate(content.issues, issueIndex);
+    const variantIndex = issueIndex + projectVariantSeed;
+    const template = getCycledTemplate(content.issues, variantIndex);
 
     if (!template) {
       continue;
     }
 
     try {
-      const priority = priorities[issueIndex % priorities.length];
+      const priority = priorities[variantIndex % priorities.length];
       const lifecycle = createLifecycleForIssue({
-        index: issueIndex,
+        index: variantIndex,
         priority,
         issueType: template.type,
         maxAgeDays: config.dateRangeDays,
       });
-      const assigneeAccountId = chooseDemoAssigneeAccountId(assignableUsers, issueIndex, step.projectIndex);
-      const status = getDemoDevStatus(issueIndex);
+      const defaultStatus = getDemoDevStatus(variantIndex);
+      const provisionalLifecycle = ensureResolvedLifecycleForStatus(lifecycle, defaultStatus);
+      const provisionalDueDate = buildDueDateFromLifecycle(provisionalLifecycle, priority, variantIndex);
+      const status = isBugIssueType(template.type)
+        ? getDemoBugStatusFromDueDate(provisionalDueDate)
+        : defaultStatus;
       const lifecycleForStatus = ensureResolvedLifecycleForStatus(lifecycle, status);
-      const dueDate = buildDueDateFromLifecycle(lifecycleForStatus, priority, issueIndex);
+      const dueDate = isBugIssueType(template.type)
+        ? provisionalDueDate
+        : buildDueDateFromLifecycle(lifecycleForStatus, priority, variantIndex);
+      const assigneeAccountId = isBugIssueType(template.type)
+        ? chooseRequiredDemoAssigneeAccountId(assignableUsers, variantIndex, step.projectIndex)
+        : chooseDemoAssigneeAccountId(assignableUsers, variantIndex, step.projectIndex);
       const startDate = lifecycleForStatus?.createdAt ? toJiraDateOnly(lifecycleForStatus.createdAt) : null;
-      const releaseVersions = chooseReleaseVersionIds(project, issueIndex, template.type);
-      const methodologyDescription = getSoftwareMethodologyDescription(project, issueIndex);
+      const releaseVersions = chooseReleaseVersionIds(project, variantIndex, template.type);
+      const methodologyDescription = getSoftwareMethodologyDescription(project, variantIndex);
       const epicKey = softwareTemplate === 'kanban'
         ? null
-        : project.epicKeys[issueIndex % (project.epicKeys.length || 1)] || null;
+        : project.epicKeys[variantIndex % (project.epicKeys.length || 1)] || null;
       const issue = await createIssue(
         project.key,
         template.title,
@@ -6760,8 +8149,8 @@ async function executeSoftwareIssueBatchStep(config, state, step) {
           startDateFieldId: project.timelineStartDateFieldId,
           description: [template.description || '', methodologyDescription].filter(Boolean).join('\n\n'),
           skipEpicLink: softwareTemplate === 'kanban',
-          labels: getSoftwareMethodologyLabels(project, issueIndex, template.type),
-          components: chooseSoftwareComponentNames(project, issueIndex, template.type),
+          labels: getSoftwareMethodologyLabels(project, variantIndex, template.type),
+          components: chooseSoftwareComponentNames(project, variantIndex, template.type),
         }
       );
 
@@ -6775,7 +8164,8 @@ async function executeSoftwareIssueBatchStep(config, state, step) {
         epicKey,
         fixVersionId: releaseVersions.fixVersionId,
         affectsVersionId: releaseVersions.affectsVersionId,
-        methodologyPhase: getWaterfallPhase(issueIndex),
+        methodologyPhase: getWaterfallPhase(variantIndex),
+        variantSeed: projectVariantSeed,
       });
       project.issueCount++;
       state.results.totalIssues++;
@@ -6807,44 +8197,44 @@ async function executeSoftwareSprintStep(config, state, step) {
     return;
   }
 
-  if (normaliseSoftwareTemplate(project.softwareTemplate || config.softwareTemplate) !== 'scrum') {
-    addChunkedDiagnostics(state, [`Sprint ${project.key}: skipped because Jira Kanban boards do not support sprints.`]);
+  const softwareTemplate = normaliseSoftwareTemplate(project.softwareTemplate || config.softwareTemplate);
+  if (softwareTemplate !== 'scrum') {
+    addChunkedDiagnostics(state, [`${project.key}: skipped Scrum sprint setup because this is a Kanban project; Kanban cards are populated directly on the Kanban board.`]);
     return;
   }
 
-  if (!project.boardId) {
-    try {
-      project.boardId = await getBoardId(project.key, 'scrum');
-
-      if (!project.boardId) {
-        project.boardId = await createSoftwareBoardForProject(project, 'scrum');
-        addChunkedDiagnostics(state, [`Sprint ${project.key}: created Scrum board ${project.boardId} during sprint setup.`]);
-      }
-    } catch (err) {
-      addChunkedError(state, `Sprint ${step.sprintIndex + 1} for ${project.key}: board lookup/create failed: ${err.message}`);
-      return;
-    }
-  }
-
-  if (!project.boardId) {
-    addChunkedError(state, `Sprint ${step.sprintIndex + 1} for ${project.key}: Scrum board not found, so sprint creation was skipped.`);
-    return;
-  }
-
-  if (project.issueKeys.length === 0) {
-    addChunkedError(state, `Sprint ${step.sprintIndex + 1} for ${project.key}: no issues were created, so the sprint was skipped.`);
-    return;
-  }
+  let sprintBoardId = null;
 
   try {
-    const chunkSize = Math.max(1, Math.ceil(project.issueKeys.length / config.sprintsPerProject));
+    sprintBoardId = await getBoardId(project.key, 'scrum');
+  } catch (err) {
+    addChunkedError(state, `Sprint ${step.sprintIndex + 1} for ${project.key}: native Scrum board lookup failed: ${err.message}`);
+    return;
+  }
+
+  if (!sprintBoardId) {
+    addChunkedError(state, `Sprint ${step.sprintIndex + 1} for ${project.key}: native Scrum board was not found, so sprint creation was skipped to avoid creating sprints on the wrong board.`);
+    return;
+  }
+
+  project.sprintBoardId = sprintBoardId;
+  project.boardId = sprintBoardId;
+
+  try {
     const schedule = getSprintSchedule(step.sprintIndex);
-    const sprint = await createSprint(project.boardId, `${project.key} Sprint ${step.sprintIndex + 1}`, schedule.startDate, schedule.endDate);
-    const issueChunk = project.issueKeys.slice(step.sprintIndex * chunkSize, (step.sprintIndex + 1) * chunkSize);
+    const sprint = await createSprint(sprintBoardId, `${project.key} Sprint ${step.sprintIndex + 1}`, schedule.startDate, schedule.endDate);
+    const issueChunk = getSprintIssueChunk(project.issueKeys, step.sprintIndex, config.sprintsPerProject);
+
+    if (step.sprintIndex === 0 && issueChunk.length === 0) {
+      addChunkedError(state, `Sprint ${sprint.id} for ${project.key}: Sprint 1 was created but no software issue keys were available to move into it.`);
+    }
 
     if (issueChunk.length > 0) {
-      await moveIssuesToSprint(sprint.id, issueChunk);
-      addChunkedDiagnostics(state, [`Sprint ${sprint.id}: moved ${issueChunk.length} issue(s) into ${sprint.name}.`]);
+      const assignResult = await assignAndVerifyIssuesToSprint(sprint.id, issueChunk, state.results.diagnostics);
+      addChunkedDiagnostics(state, [`Sprint ${sprint.id}: assigned ${issueChunk.length} issue(s) into ${sprint.name} (${assignResult.moved ? 'Agile move ok' : 'Agile move fallback used'}, Sprint field writes ${assignResult.fieldAssigned}/${issueChunk.length}, verified ${assignResult.verifiedCount}).`]);
+      if (assignResult.verifiedCount === 0) {
+        addChunkedError(state, `Sprint ${sprint.id} for ${project.key}: Jira still reports 0 issues in ${sprint.name} after assignment.`);
+      }
     }
 
     if (schedule.targetState === 'closed') {
@@ -6874,9 +8264,24 @@ async function executeSoftwareSprintStep(config, state, step) {
           endDate: formatDateForJira(schedule.endDate),
           state: 'active',
         });
+        if (issueChunk.length > 0) {
+          const assignResult = await assignAndVerifyIssuesToSprint(sprint.id, issueChunk, state.results.diagnostics);
+          addChunkedDiagnostics(state, [`Sprint ${sprint.id}: confirmed ${issueChunk.length} issue(s) in active sprint ${sprint.name} (${assignResult.moved ? 'Agile move ok' : 'Agile move fallback used'}, Sprint field writes ${assignResult.fieldAssigned}/${issueChunk.length}, verified ${assignResult.verifiedCount}).`]);
+          if (assignResult.verifiedCount === 0) {
+            addChunkedError(state, `Sprint ${sprint.id} for ${project.key}: active sprint ${sprint.name} has 0 verified issues after start.`);
+          }
+        }
+        try {
+          const activeSprint = await getSprint(sprint.id);
+          if (String(activeSprint?.state || '').toLowerCase() !== 'active') {
+            addChunkedError(state, `Sprint ${sprint.id} for ${project.key}: Jira created the sprint but state is "${activeSprint?.state || 'unknown'}", not active.`);
+          }
+        } catch (verifyStateErr) {
+          addChunkedDiagnostics(state, [`Sprint ${sprint.id}: active-state verification failed: ${verifyStateErr.message}`]);
+        }
         addChunkedDiagnostics(state, [`Sprint ${sprint.id}: started active sprint ${sprint.name}.`]);
       } catch (sprintStateErr) {
-        addChunkedDiagnostics(state, [`Sprint ${sprint.id}: active-state update skipped: ${sprintStateErr.message}`]);
+        addChunkedError(state, `Sprint ${sprint.id} for ${project.key}: active-state update failed, so the sprint may remain in backlog/future state: ${sprintStateErr.message}`);
       }
     }
 
@@ -6893,11 +8298,64 @@ async function executeSoftwareSprintStep(config, state, step) {
   }
 }
 
-async function executeDependencyStep(state) {
+async function executeKanbanBoardPopulationStep(config, state, step) {
+  const project = state.results.softwareProjects[step.projectIndex];
+  if (!project?.key) {
+    addChunkedError(state, `Software Project ${step.projectIndex + 1}: skipped Kanban board population because the project was not created.`);
+    return;
+  }
+
+  const softwareTemplate = normaliseSoftwareTemplate(project.softwareTemplate || config.softwareTemplate);
+  if (softwareTemplate !== 'kanban') {
+    return;
+  }
+
+  try {
+    project.boardId = await getBoardId(project.key, 'kanban');
+
+    if (!project.boardId) {
+      addChunkedError(state, `Kanban ${project.key}: native Kanban board was not found, so app-created board fallback was skipped to avoid wiring work to the wrong board.`);
+      return;
+    }
+
+    const issueRecords = Array.isArray(project.issueRecords) ? project.issueRecords : [];
+    for (const record of issueRecords) {
+      if (record?.key && record.status && record.status !== 'To Do') {
+        await transitionIssue(record.key, record.status);
+      }
+    }
+
+    if (project.boardId) {
+      const boardIssues = await jiraGet(`/rest/agile/1.0/board/${encodeURIComponent(project.boardId)}/issue?jql=${encodeURIComponent(`project = ${project.key} ORDER BY Rank ASC`)}&maxResults=1`);
+      const visibleTotal = Number(boardIssues.total || 0);
+      if (visibleTotal === 0 && issueRecords.length > 0) {
+        addChunkedError(state, `Kanban ${project.key}: ${issueRecords.length} issue(s) were created, but board ${project.boardId} returned 0 visible issues.`);
+      } else {
+        addChunkedDiagnostics(state, [`Kanban ${project.key}: board ${project.boardId} can see ${visibleTotal} generated issue(s).`]);
+      }
+    }
+  } catch (err) {
+    addChunkedError(state, `Kanban board population for ${project.key}: ${err.message}`);
+  }
+}
+
+async function executeDependencyStep(state, step = {}) {
   const linked = [];
   const failedLinks = [];
+  const maxLinks = 12;
+  const deadlineMs = Date.now() + 18000;
+  let skippedAfterLimit = false;
+  let attemptedLinks = 0;
+  const scope = step.dependencyScope || 'all';
+  const shouldRunScope = candidate => scope === 'all' || scope === candidate;
 
   const linkAndTrack = async (fromKey, toKey, typeName, label) => {
+    if (attemptedLinks >= maxLinks || Date.now() >= deadlineMs) {
+      skippedAfterLimit = true;
+      return;
+    }
+
+    attemptedLinks += 1;
     const result = await createIssueLink(fromKey, toKey, typeName);
     if (result.ok) {
       linked.push(label || `${fromKey} ${typeName} ${toKey}`);
@@ -6907,28 +8365,45 @@ async function executeDependencyStep(state) {
   };
 
   try {
-    for (const project of state.results.softwareProjects || []) {
-      const records = project?.issueRecords || [];
+    if (shouldRunScope('software')) {
+      const softwareProjects = scope === 'software' && Number.isInteger(step.projectIndex)
+        ? [state.results.softwareProjects[step.projectIndex]].filter(Boolean)
+        : state.results.softwareProjects || [];
 
-      for (let index = 1; index < Math.min(records.length, 8); index += 1) {
-        const current = records[index];
-        const previous = records[index - 1];
+      for (const project of softwareProjects) {
+        const records = project?.issueRecords || [];
+        const isKanbanProject = normaliseSoftwareTemplate(project?.softwareTemplate) === 'kanban';
 
-        if (!current?.key || !previous?.key) {
-          continue;
-        }
+        for (let index = 1; index < Math.min(records.length, 4); index += 1) {
+          const current = records[index];
+          const previous = records[index - 1];
 
-        if (String(current.issueType || '').toLowerCase() === 'bug') {
-          await linkAndTrack(current.key, previous.key, 'Blocks', `Software dependency: defect ${current.key} blocks ${previous.key}.`);
-        } else if (current.epicKey) {
-          await linkAndTrack(current.key, current.epicKey, 'Relates', `Software traceability: ${current.key} relates to epic ${current.epicKey}.`);
-        } else if (index % 3 === 0) {
-          await linkAndTrack(current.key, previous.key, 'Relates', `Software dependency: ${current.key} relates to ${previous.key}.`);
+          if (!current?.key || !previous?.key) {
+            continue;
+          }
+
+          if (String(current.issueType || '').toLowerCase() === 'bug') {
+            await linkAndTrack(current.key, previous.key, 'Blocks', `Software dependency: defect ${current.key} blocks ${previous.key}.`);
+          } else if (current.epicKey) {
+            await linkAndTrack(current.key, current.epicKey, 'Relates', `Software traceability: ${current.key} relates to epic ${current.epicKey}.`);
+          } else if (isKanbanProject) {
+            const relationType = index % 2 === 0 ? 'Relates' : 'Blocks';
+            await linkAndTrack(
+              relationType === 'Blocks' ? previous.key : current.key,
+              relationType === 'Blocks' ? current.key : previous.key,
+              relationType,
+              relationType === 'Blocks'
+                ? `Kanban flow dependency: ${previous.key} blocks ${current.key}.`
+                : `Kanban flow relationship: ${current.key} relates to ${previous.key}.`
+            );
+          } else if (index % 3 === 0) {
+            await linkAndTrack(current.key, previous.key, 'Relates', `Software dependency: ${current.key} relates to ${previous.key}.`);
+          }
         }
       }
     }
 
-    if (state.results.softwareProjects.length >= 2) {
+    if (shouldRunScope('software-cross-project') && state.results.softwareProjects.length >= 2) {
       const firstSoftwareIssue = state.results.softwareProjects[0]?.firstIssueKey;
       const secondSoftwareIssue = state.results.softwareProjects[1]?.firstIssueKey;
 
@@ -6937,27 +8412,73 @@ async function executeDependencyStep(state) {
       }
     }
 
-    for (const jsmProject of state.results.jsmProjects || []) {
+    if (
+      shouldRunScope('itsm') ||
+      shouldRunScope('itsm-problem-incident') ||
+      shouldRunScope('itsm-change-problem') ||
+      shouldRunScope('itsm-service-change') ||
+      shouldRunScope('itsm-incident-change')
+    ) {
+      const jsmProjects = scope.startsWith('itsm') && Number.isInteger(step.projectIndex)
+        ? [state.results.jsmProjects[step.projectIndex]].filter(Boolean)
+        : state.results.jsmProjects || [];
+
+      for (const jsmProject of jsmProjects) {
       const workItems = jsmProject?.itsmWorkItems || jsmProject?.incidents || [];
-      const firstIncident = workItems.find(item => item.workType === 'Incident')?.key;
-      const firstProblem = workItems.find(item => item.workType === 'Problem')?.key;
-      const firstChange = workItems.find(item => item.workType === 'Change')?.key;
-      const firstServiceRequest = workItems.find(item => item.workType === 'Service Request')?.key;
+      const incidents = workItems.filter(item => item.workType === 'Incident' && item.key);
+      const problems = workItems.filter(item => item.workType === 'Problem' && item.key);
+      const changes = workItems.filter(item => item.workType === 'Change' && item.key);
+      const serviceRequests = workItems.filter(item => item.workType === 'Service Request' && item.key);
+      const linkedPairs = new Set();
+      const linkRoundRobin = async (fromItems, toItems, typeName, labelBuilder) => {
+        if (!fromItems.length || !toItems.length) {
+          return;
+        }
 
-      if (firstIncident && firstProblem) {
-        await linkAndTrack(firstProblem, firstIncident, 'Relates', `ITSM relationship: problem ${firstProblem} relates to incident ${firstIncident}.`);
+        for (let index = 0; index < fromItems.length; index += 1) {
+          const fromItem = fromItems[index];
+          const toItem = toItems[index % toItems.length];
+          const pairKey = `${fromItem.key}:${toItem.key}:${typeName}`;
+
+          if (!fromItem.key || !toItem.key || linkedPairs.has(pairKey)) {
+            continue;
+          }
+
+          linkedPairs.add(pairKey);
+          await linkAndTrack(fromItem.key, toItem.key, typeName, labelBuilder(fromItem.key, toItem.key));
+        }
+      };
+
+      if (scope === 'all' || scope === 'itsm' || scope === 'itsm-problem-incident') {
+        await linkRoundRobin(problems, incidents, 'Relates', (problemKey, incidentKey) =>
+          `ITSM relationship: problem ${problemKey} relates to incident ${incidentKey}.`
+        );
       }
-
-      if (firstProblem && firstChange) {
-        await linkAndTrack(firstChange, firstProblem, 'Relates', `ITSM relationship: change ${firstChange} relates to problem ${firstProblem}.`);
+      if (scope === 'all' || scope === 'itsm' || scope === 'itsm-change-problem') {
+        await linkRoundRobin(changes, problems.length ? problems : incidents, problems.length ? 'Blocks' : 'Relates', (changeKey, relatedKey) =>
+          problems.length
+            ? `ITSM dependency: change ${changeKey} is linked to root-cause problem ${relatedKey}.`
+            : `ITSM relationship: change ${changeKey} relates to incident ${relatedKey}.`
+        );
       }
-
-      if (firstServiceRequest && firstChange) {
-        await linkAndTrack(firstServiceRequest, firstChange, 'Relates', `ITSM relationship: service request ${firstServiceRequest} relates to change ${firstChange}.`);
+      if (scope === 'all' || scope === 'itsm' || scope === 'itsm-service-change') {
+        await linkRoundRobin(serviceRequests, changes.length ? changes : incidents, 'Relates', (requestKey, relatedKey) =>
+          changes.length
+            ? `ITSM relationship: service request ${requestKey} relates to change ${relatedKey}.`
+            : `ITSM relationship: service request ${requestKey} relates to incident ${relatedKey}.`
+        );
+      }
+      if (scope === 'all' || scope === 'itsm' || scope === 'itsm-incident-change') {
+        await linkRoundRobin(incidents, changes.length ? changes : serviceRequests, 'Relates', (incidentKey, relatedKey) =>
+          changes.length
+            ? `ITSM relationship: incident ${incidentKey} relates to change ${relatedKey}.`
+            : `ITSM relationship: incident ${incidentKey} relates to service request ${relatedKey}.`
+        );
+      }
       }
     }
 
-    if (state.results.jsmProjects.length > 0 && state.results.softwareProjects.length > 0) {
+    if (shouldRunScope('devops') && state.results.jsmProjects.length > 0 && state.results.softwareProjects.length > 0) {
       const firstIncident = state.results.jsmProjects[0]?.itsmWorkItems?.find(item => item.workType === 'Incident')?.key
         || state.results.jsmProjects[0]?.incidents?.[0]?.key;
       const firstSoftwareIssue = state.results.softwareProjects[0]?.firstIssueKey;
@@ -6969,6 +8490,9 @@ async function executeDependencyStep(state) {
 
     if (linked.length > 0) {
       addChunkedDiagnostics(state, linked.slice(0, 12));
+    }
+    if (skippedAfterLimit) {
+      addChunkedDiagnostics(state, [`Dependency linking stopped after ${attemptedLinks} attempted link(s), ${linked.length} successful, to stay inside the Forge 25-second resolver limit.`]);
     }
     if (failedLinks.length > 0) {
       addChunkedDiagnostics(state, [
@@ -7071,7 +8595,20 @@ function buildManagedDashboardPlan(config, availableGadgets, state, dashboardCon
     || (dashboardContext?.projectTypeLabel === 'Dev'
       ? config.softwareDashboardIntent
       : config.opsDashboardIntent);
-  const orderedPlans = orderDashboardGadgetPlans(MANAGED_DASHBOARD_GADGET_PLANS, dashboardIntent);
+  let orderedPlans = orderDashboardGadgetPlans(MANAGED_DASHBOARD_GADGET_PLANS, dashboardIntent);
+
+  if (dashboardContext?.projectTypeLabel === 'Dev') {
+    const variantSeed = dashboardContext.projects?.[0]?.dashboardVariantSeed || getSoftwareProjectVariantSeed(dashboardContext.project, dashboardContext.dashboardIndex);
+    const pinnedRoles = new Set(['forge-environment', 'forge-summary']);
+    const pinnedPlans = orderedPlans.filter(plan => pinnedRoles.has(plan.role));
+    const flexiblePlans = orderedPlans.filter(plan => !pinnedRoles.has(plan.role));
+    const rotation = flexiblePlans.length === 0 ? 0 : variantSeed % flexiblePlans.length;
+    orderedPlans = [
+      ...pinnedPlans,
+      ...flexiblePlans.slice(rotation),
+      ...flexiblePlans.slice(0, rotation),
+    ];
+  }
 
   for (const plan of orderedPlans) {
     if (plan.disabled) {
@@ -7161,6 +8698,8 @@ async function executeDashboardShellStep(config, state, step) {
       };
       return;
     }
+
+    await ensureDashboardReportFilters(state, dashboardContext, filter);
 
     state.metadata.dashboardPlans = state.metadata.dashboardPlans || [];
     state.metadata.dashboardPlans[dashboardContext.dashboardIndex] = {
@@ -7294,7 +8833,43 @@ async function searchDemoDashboardIssues(jql, customDateFields = {}) {
     // around the run time instead of the selected ticket data duration.
     fields: ['summary', 'status', 'priority', 'assignee', 'issuetype', 'duedate', 'project', 'fixVersions', ...customFieldIds],
   });
-  return Array.isArray(data.issues) ? data.issues : [];
+  const issues = Array.isArray(data.issues) ? data.issues : [];
+  return enrichIssuesWithDemoDateProperties(issues, customDateFields);
+}
+
+async function enrichIssuesWithDemoDateProperties(issues, customDateFields = {}) {
+  const needsPropertyFallback = issue => {
+    const createdField = customDateFields.createdDateFieldId;
+    const resolvedField = customDateFields.resolvedDateFieldId;
+    return (
+      !createdField ||
+      !issue.fields?.[createdField] ||
+      (issue.fields?.status?.statusCategory?.key === 'done' && (!resolvedField || !issue.fields?.[resolvedField]))
+    );
+  };
+
+  await Promise.all((issues || []).filter(needsPropertyFallback).map(async issue => {
+    try {
+      const property = await jiraGet(
+        `/rest/api/3/issue/${encodeURIComponent(issue.key)}/properties/${encodeURIComponent(DEMO_DATE_ISSUE_PROPERTY_KEY)}`
+      );
+      issue.properties = {
+        ...(issue.properties || {}),
+        [DEMO_DATE_ISSUE_PROPERTY_KEY]: property?.value || null,
+      };
+    } catch {
+      issue.properties = {
+        ...(issue.properties || {}),
+        [DEMO_DATE_ISSUE_PROPERTY_KEY]: null,
+      };
+    }
+  }));
+
+  return issues;
+}
+
+function getDemoDateIssueProperty(issue) {
+  return issue.properties?.[DEMO_DATE_ISSUE_PROPERTY_KEY] || null;
 }
 
 function getDemoCreatedDate(issue, config = {}) {
@@ -7308,12 +8883,16 @@ function getDashboardResolvedDate(issue, config = {}) {
 
 function getCustomDemoCreatedDate(issue, config = {}) {
   const customFieldId = config.customDateFields?.createdDateFieldId;
-  return customFieldId ? issue.fields?.[customFieldId] || null : null;
+  return (customFieldId ? issue.fields?.[customFieldId] || null : null)
+    || getDemoDateIssueProperty(issue)?.createdDate
+    || null;
 }
 
 function getCustomDemoResolvedDate(issue, config = {}) {
   const customFieldId = config.customDateFields?.resolvedDateFieldId;
-  return customFieldId ? issue.fields?.[customFieldId] || null : null;
+  return (customFieldId ? issue.fields?.[customFieldId] || null : null)
+    || getDemoDateIssueProperty(issue)?.resolvedDate
+    || null;
 }
 
 function countIssuesByField(issues, fieldName, fallback) {
@@ -7794,6 +9373,53 @@ function buildDashboardDataNotes(config) {
   })));
 }
 
+function buildDemoInsightsResponse(config, issues, projects = []) {
+  const sprintHealth = buildSprintHealth(issues, projects);
+  const baseJql = config.allWorkJql || config.jql || '';
+
+  return {
+    success: true,
+    config,
+    issues: issues.map(issue => ({
+      key: issue.key,
+      summary: issue.fields?.summary || '',
+      status: issue.fields?.status?.name || 'Unknown',
+      priority: issue.fields?.priority?.name || 'None',
+      assignee: issue.fields?.assignee?.displayName || 'Unassigned',
+      issueType: issue.fields?.issuetype?.name || 'Issue',
+      projectKey: issue.fields?.project?.key || '',
+      dueDate: issue.fields?.duedate || null,
+      createdAt: getDemoCreatedDate(issue, config),
+      resolvedAt: getDashboardResolvedDate(issue, config),
+    })),
+    statusCounts: countIssuesByField(issues, 'status', 'Unknown'),
+    priorityCounts: countIssuesByField(issues, 'priority', 'None'),
+    issueTypeCounts: countIssuesByField(issues, 'issuetype', 'Issue'),
+    kpiCards: buildDashboardKpiCards(config, issues),
+    dataNotes: buildDashboardDataNotes(config),
+    overdueByProject: countOverdueIssuesByProject(issues),
+    averageTimeInStatus: buildAverageTimeInStatus(issues, config),
+    ticketAging: buildTicketAging(issues, config),
+    escalationMetrics: buildEscalationMetrics(issues),
+    reports: buildDashboardReports(config),
+    drilldowns: {
+      allWork: { url: `/issues/?jql=${encodeURIComponent(baseJql)}` },
+      open: { url: `/issues/?jql=${encodeURIComponent(config.jql || baseJql)}` },
+      slaBreached: {
+        url: `/issues/?jql=${encodeURIComponent(`${baseJql.replace(/\s+ORDER\s+BY\s+.+$/i, '').trim()} AND statusCategory != Done ORDER BY duedate ASC`)}`,
+      },
+    },
+    createdResolvedTrend: buildCreatedResolvedTrend(issues, config.dateRangeDays || 30, config),
+    sprintHealth,
+    burndown: [
+      { name: 'To Do', count: sprintHealth.todo },
+      { name: 'In Progress', count: sprintHealth.inProgress },
+      { name: 'Done', count: sprintHealth.done },
+    ],
+    roadmap: buildRoadmap(projects),
+  };
+}
+
 resolver.define('getDemoDashboardGadgetData', async ({ payload }) => {
   const dashboardId = payload?.dashboardId;
   const gadgetId = payload?.gadgetId;
@@ -7809,46 +9435,69 @@ resolver.define('getDemoDashboardGadgetData', async ({ payload }) => {
     const config = await getDashboardItemProperty(dashboardId, gadgetId, 'config');
     const issues = config.allWorkJql ? await searchDemoDashboardIssues(config.allWorkJql, config.customDateFields || {}) : [];
     const projects = config.projects || [];
-    const sprintHealth = buildSprintHealth(issues, projects);
+    return buildDemoInsightsResponse(config, issues, projects);
+  } catch (err) {
+    return {
+      success: false,
+      message: err.message,
+    };
+  }
+});
+
+resolver.define('getProjectInsightsData', async ({ payload }) => {
+  const projectKey = String(payload?.projectKey || '').trim();
+
+  if (!projectKey) {
+    return {
+      success: false,
+      message: 'Project context was not available for this sidebar page.',
+    };
+  }
+
+  try {
+    const diagnostics = [];
+    const customDateFields = await resolveDemoDateFieldsWithoutScreenSetup(projectKey, diagnostics);
+    const project = await jiraGet(`/rest/api/3/project/${encodeURIComponent(projectKey)}`);
+    const projectType = project?.projectTypeKey === 'service_desk' ? 'ITSM' : 'Software';
+    const baseJql = `project = ${projectKey}`;
+    const allWorkJql = `${baseJql} ORDER BY updated DESC`;
+    const config = {
+      viewType: 'project-insights',
+      title: 'Summary & Reports',
+      subtitle: 'Project sidebar insights using generated custom Created Date and Resolved Date fields.',
+      visualType: 'summary-grid',
+      sectionLabel: projectType === 'ITSM' ? 'Service Project Summary' : 'Software Project Summary',
+      environmentName: project?.name || projectKey,
+      dashboardProfile: `${project?.name || projectKey} Summary`,
+      dashboardLevel: 'project',
+      dashboardDomain: projectType,
+      dashboardMetrics: ['Work by status', 'Created vs resolved', 'Open work', 'Priority'],
+      dashboardQuestions: ['Is work moving and completing over time?'],
+      dashboardKpis: ['Resolution rate %', 'Average cycle time', 'High Priority', 'Throughput'],
+      filterId: '',
+      filterName: `${projectKey} work`,
+      jql: `${baseJql} AND statusCategory != Done ORDER BY priority DESC, duedate ASC`,
+      allWorkJql,
+      customDateFields,
+      reportFilters: [],
+      retentionPeriodDays: 180,
+      dateRange: '6 months',
+      dateRangeDays: 180,
+      generatedAt: new Date().toISOString().split('T')[0],
+      projects: [{
+        key: projectKey,
+        name: project?.name || projectKey,
+        type: projectType,
+        count: 0,
+        sprints: [],
+        dateFields: customDateFields,
+      }],
+    };
+    const issues = await searchDemoDashboardIssues(allWorkJql, customDateFields);
 
     return {
-      success: true,
-      config,
-      issues: issues.map(issue => ({
-        key: issue.key,
-        summary: issue.fields?.summary || '',
-        status: issue.fields?.status?.name || 'Unknown',
-        priority: issue.fields?.priority?.name || 'None',
-        assignee: issue.fields?.assignee?.displayName || 'Unassigned',
-        issueType: issue.fields?.issuetype?.name || 'Issue',
-        projectKey: issue.fields?.project?.key || '',
-        dueDate: issue.fields?.duedate || null,
-      })),
-      statusCounts: countIssuesByField(issues, 'status', 'Unknown'),
-      priorityCounts: countIssuesByField(issues, 'priority', 'None'),
-      issueTypeCounts: countIssuesByField(issues, 'issuetype', 'Issue'),
-      kpiCards: buildDashboardKpiCards(config, issues),
-      dataNotes: buildDashboardDataNotes(config),
-      overdueByProject: countOverdueIssuesByProject(issues),
-      averageTimeInStatus: buildAverageTimeInStatus(issues, config),
-      ticketAging: buildTicketAging(issues, config),
-      escalationMetrics: buildEscalationMetrics(issues),
-      reports: buildDashboardReports(config),
-      drilldowns: {
-        allWork: { url: `/issues/?jql=${encodeURIComponent(config.allWorkJql || config.jql || '')}` },
-        open: { url: `/issues/?jql=${encodeURIComponent(config.jql || config.allWorkJql || '')}` },
-        slaBreached: {
-          url: `/issues/?jql=${encodeURIComponent(`${(config.allWorkJql || config.jql || '').replace(/\s+ORDER\s+BY\s+.+$/i, '').trim()} AND statusCategory != Done ORDER BY duedate ASC`)}`,
-        },
-      },
-      createdResolvedTrend: buildCreatedResolvedTrend(issues, config.dateRangeDays || 30, config),
-      sprintHealth,
-      burndown: [
-        { name: 'To Do', count: sprintHealth.todo },
-        { name: 'In Progress', count: sprintHealth.inProgress },
-        { name: 'Done', count: sprintHealth.done },
-      ],
-      roadmap: buildRoadmap(projects),
+      ...buildDemoInsightsResponse(config, issues, config.projects),
+      diagnostics,
     };
   } catch (err) {
     return {
@@ -7953,7 +9602,9 @@ function buildChunkedSummary(config, state) {
   const softwareStyleSummary = softwareStyles.length === 0
     ? getProjectManagementStyleLabel(config.softwareProjectStyle)
     : softwareStyles.join(', ');
-  const scrumProjectCount = (config.softwareProjects || []).filter(project => normaliseSoftwareTemplate(project.softwareTemplate) === 'scrum').length;
+  const softwareProjectCountWithSprints = (config.softwareProjects || [])
+    .filter(project => normaliseSoftwareTemplate(project.softwareTemplate) === 'scrum')
+    .length;
   const softwareVersions = results.softwareProjects.flatMap(project => project.versions || []);
   const softwareSprints = results.softwareProjects.flatMap(project => project.sprints || []);
   const softwareComponents = results.softwareProjects.flatMap(project => project.components || []);
@@ -7969,10 +9620,17 @@ function buildChunkedSummary(config, state) {
   }, {});
   const dashboards = results.dashboards?.filter(Boolean) || [];
   const savedFilters = results.savedFilters?.filter(Boolean) || [];
+  const reports = results.reports?.filter(Boolean) || [];
   const confluenceSpaces = results.confluenceSpaces?.filter(space => space?.success) || [];
   const githubActivity = results.githubActivity?.filter(Boolean) || [];
   const compassComponents = results.compassComponents?.filter(Boolean) || [];
+  const linkedCompassComponents = compassComponents.filter(component => component.linkedIssueKey);
+  const repositoryLinkedCompassComponents = compassComponents.filter(component => component.repositoryLinked);
+  const dependencyLinkedCompassComponents = compassComponents.filter(component => component.dependencyLinked);
+  const ownedCompassComponents = compassComponents.filter(component => component.ownerConfigured);
   const atlassianGoals = results.atlassianGoals?.filter(Boolean) || [];
+  const linkedAtlassianGoals = atlassianGoals.filter(goal => goal.nativeLinked);
+  const projectGoals = results.projectGoals?.filter(Boolean) || [];
   const projectKeys = [
     ...createdJsmProjects.map(project => project.key),
     ...results.softwareProjects.map(project => project.key),
@@ -7981,9 +9639,12 @@ function buildChunkedSummary(config, state) {
   const workerDataset = state.metadata.workerDataset;
   const workerDatePatch = state.metadata.workerDatePatch;
   const workerAiBlueprint = workerDataset?.metadata?.aiBlueprint;
+  const hasWarningsOrErrors = results.errors.length > 0;
   const lines = [
     hasProjects
-      ? `"${config.environmentName}" demo environment created successfully.`
+      ? hasWarningsOrErrors
+        ? `"${config.environmentName}" demo environment was created with warnings that need review.`
+        : `"${config.environmentName}" demo environment created successfully.`
       : `"${config.environmentName}" demo environment creation was attempted, but no resources were created.`,
     '',
     'Summary:',
@@ -7994,7 +9655,7 @@ function buildChunkedSummary(config, state) {
     `- Software Projects: ${results.softwareProjects.length} (${results.totalIssues} issues total)`,
     `- Software Templates: ${softwareTemplateSummary}`,
     `- Dev Project Management: ${softwareStyleSummary}`,
-    `- Sprints per Scrum Software Project: ${scrumProjectCount > 0 ? config.sprintsPerProject : 0}`,
+    `- Sprints per Scrum Software Project: ${softwareProjectCountWithSprints > 0 ? config.sprintsPerProject : 0}`,
     `- Software Release Coverage: ${softwareVersions.length} version(s) modelled (${releaseStageCounts.past || 0} past, ${releaseStageCounts.current || 0} current, ${releaseStageCounts.upcoming || 0} upcoming); fix versions and affected versions are populated where Jira allows them.`,
     `- Software Components: ${softwareComponents.length} project component(s) created and assigned to generated software issues.`,
     `- Sprint Coverage: ${softwareSprints.length} sprint(s) modelled (${sprintStateCounts.closed || 0} completed, ${sprintStateCounts.active || 0} active, ${sprintStateCounts.future || 0} upcoming).`,
@@ -8016,13 +9677,25 @@ function buildChunkedSummary(config, state) {
     `- Dashboards: ${dashboards.length > 0 ? `${dashboards.length} created` : 'Not created'}`,
     `- Dashboard Template: ${results.dashboardTemplateId || 'Generated gadget layout'}`,
     `- Saved Filters: ${savedFilters.length > 0 ? `${savedFilters.length} auto-created` : 'Auto-created filter not available'}`,
+    `- Report Filters: ${reports.length > 0 ? `${reports.length} auto-created` : 'Not created'}`,
     `- Knowledge Bases: ${confluenceSpaces.length > 0 ? `${confluenceSpaces.length} Confluence space(s) created` : 'Not created'}`,
     `- GitHub Development Activity: ${githubActivity.length > 0 ? `${githubActivity.length} linked branch/commit/PR/deployment item(s) created` : 'Not created or not configured'}`,
-    `- Compass Components: ${compassComponents.length > 0 ? `${compassComponents.length} created` : 'Not created or not configured'}`,
-    `- Atlassian Goals: ${atlassianGoals.length > 0 ? `${atlassianGoals.length} created` : 'Not created or not configured'}`,
+    `- Jira Project Components: ${softwareComponents.length > 0 ? `${softwareComponents.length} created and assigned to generated software issues` : 'Not created'}`,
+    `- Compass Components: ${compassComponents.length > 0 ? `${compassComponents.length} created, ${linkedCompassComponents.length} linked to work items, ${repositoryLinkedCompassComponents.length} repository link(s), ${dependencyLinkedCompassComponents.length} dependency link(s), ${ownedCompassComponents.length} owner assignment(s)` : 'Not created or not configured'}`,
+    `- Goal Work Items: ${projectGoals.length > 0 ? `${projectGoals.length} Jira work item(s) created with goal labels` : 'Not created'}`,
+    `- Native Atlassian Goals: ${atlassianGoals.length > 0 ? `${atlassianGoals.length} created, ${linkedAtlassianGoals.length} linked through Jira Goals field, ${atlassianGoals.filter(goal => goal.statusUpdated).length} status update(s) applied` : 'Not created or not configured'}`,
     `- Dashboard Filter Wiring: ${dashboards.length > 0 && dashboards.every(dashboard => dashboard.filterApplied) ? 'Applied automatically' : 'Needs verification'}`,
     '',
   ];
+
+  if (compassComponents.length === 0) {
+    lines.splice(lines.length - 1, 0, '- Compass Setup Note: Compass component creation requires Compass to be enabled on the Atlassian site and Forge GraphQL access for the current user.');
+  }
+
+  if (atlassianGoals.length === 0) {
+    lines.splice(lines.length - 1, 0, '- Goals Setup Note: the Jira Goals tab shows only native Atlassian Goals linked to work. The fallback goal work items created by this app will not appear there.');
+    lines.splice(lines.length - 1, 0, '- Native Goals Setup Note: Atlassian Goals requires GOALS_DEMO_ENABLED=true plus ATLASSIAN_GOAL_TYPE_ARI, or ATLASSIAN_GOAL_ACTIVATION_ID plus ATLASSIAN_GOAL_TYPE_ID. If Forge GraphQL is blocked, also set ATLASSIAN_GRAPHQL_EMAIL and ATLASSIAN_GRAPHQL_API_TOKEN.');
+  }
 
   if (createdJsmProjects.length > 0) {
     lines.push('JSM ITSM Projects Created:');
@@ -8064,16 +9737,28 @@ function buildChunkedSummary(config, state) {
       }, {});
       const releaseSummary = `${versions.length} versions: ${projectReleaseCounts.past || 0} past, ${projectReleaseCounts.current || 0} current, ${projectReleaseCounts.upcoming || 0} upcoming`;
       const componentSummary = `${(project.components || []).length} components`;
-      const sprintSummary = normaliseSoftwareTemplate(project.softwareTemplate) === 'scrum'
-        ? `; sprints ${projectSprintCounts.closed || 0} done, ${projectSprintCounts.active || 0} active, ${projectSprintCounts.future || 0} upcoming`
-        : '; Kanban flow/WIP labels applied';
-      return `- ${project.key}: ${project.name} (${isCsvIssueCreationMode() ? 'CSV import pending' : `${project.issueCount} issues`}, ${getProjectManagementStyleLabel(project.softwareProjectStyle)}, board ${project.boardId || 'pending'}; ${releaseSummary}; ${componentSummary}${sprintSummary})`;
+      const sprintSummary = `; sprints ${projectSprintCounts.closed || 0} done, ${projectSprintCounts.active || 0} active, ${projectSprintCounts.future || 0} upcoming`;
+      const kanbanSummary = normaliseSoftwareTemplate(project.softwareTemplate) === 'kanban' ? '; Kanban flow/WIP labels applied' : '';
+      const goalSummary = `; ${(project.projectGoals || []).length} goal work items; ${(project.atlassianGoals || []).length} native goals; ${(project.atlassianGoals || []).filter(goal => goal.nativeLinked).length} native goal links`;
+      const compassLinkSummary = `; ${(project.compassComponents || []).filter(component => component.linkedIssueKey).length} Compass links`;
+      return `- ${project.key}: ${project.name} (${isCsvIssueCreationMode() ? 'CSV import pending' : `${project.issueCount} issues`}, ${getProjectManagementStyleLabel(project.softwareProjectStyle)}, board ${project.boardId || 'pending'}; ${releaseSummary}; ${componentSummary}${sprintSummary}${kanbanSummary}${goalSummary}${compassLinkSummary})`;
     }));
     const softwareProjectsWithForms = results.softwareProjects.filter(project => project.smartForm?.name);
     if (softwareProjectsWithForms.length > 0) {
       lines.push('');
       lines.push('Software Forms Created:');
       lines.push(...softwareProjectsWithForms.map(project => `- ${project.key}: ${project.smartForm.name} (${project.smartForm.reused ? 'reused' : 'created'})`));
+    }
+    lines.push('');
+  }
+
+  if (softwareComponents.length > 0) {
+    lines.push('Jira Project Components Created:');
+    for (const project of results.softwareProjects) {
+      const componentNames = (project.components || []).map(component => component.name).filter(Boolean);
+      if (componentNames.length > 0) {
+        lines.push(`- ${project.key}: ${componentNames.join(', ')}`);
+      }
     }
     lines.push('');
   }
@@ -8087,6 +9772,12 @@ function buildChunkedSummary(config, state) {
   if (savedFilters.length > 0) {
     lines.push('Saved Filters Ready:');
     lines.push(...savedFilters.map(filter => `- ${filter.name} (${filter.id})${filter.viewUrl ? ` - ${filter.viewUrl}` : ''}`));
+    lines.push('');
+  }
+
+  if (reports.length > 0) {
+    lines.push('Report Filters Ready:');
+    lines.push(...reports.map(report => `- ${report.name} (${report.id})${report.viewUrl ? ` - ${report.viewUrl}` : ''}`));
     lines.push('');
   }
 
@@ -8114,9 +9805,20 @@ function buildChunkedSummary(config, state) {
     lines.push('');
   }
 
+  if (projectGoals.length > 0) {
+    lines.push('Goal Work Items Created (not native Jira Goals tab entries):');
+    lines.push(...projectGoals.slice(0, 30).map(goal => `- ${goal.projectKey}: ${goal.key} ${goal.name} (target ${goal.targetDate})`));
+    if (projectGoals.length > 30) {
+      lines.push(`- ...and ${projectGoals.length - 30} more Jira project goal(s).`);
+    }
+    lines.push('');
+  }
+
   if (compassComponents.length > 0) {
     lines.push('Compass Components Created:');
-    lines.push(...compassComponents.slice(0, 20).map(component => `- ${component.projectKey}: ${component.name} (${component.typeId})`));
+    lines.push(...compassComponents.slice(0, 20).map(component => (
+      `- ${component.projectKey}: ${component.name} (${component.typeId})${component.linkedIssueKey ? ` linked to ${component.linkedIssueKey}` : ' not linked to work items'}${component.repositoryLinked ? '; repository linked' : ''}${component.dependencyLinked ? '; dependency linked' : ''}${component.ownerConfigured ? '; owner assigned' : ''}`
+    )));
     if (compassComponents.length > 20) {
       lines.push(`- ...and ${compassComponents.length - 20} more Compass component(s).`);
     }
@@ -8125,7 +9827,9 @@ function buildChunkedSummary(config, state) {
 
   if (atlassianGoals.length > 0) {
     lines.push('Atlassian Goals Created:');
-    lines.push(...atlassianGoals.slice(0, 20).map(goal => `- ${goal.projectKey}: ${goal.name} (target ${goal.targetDate})`));
+    lines.push(...atlassianGoals.slice(0, 20).map(goal => (
+      `- ${goal.projectKey}: ${goal.name} (target ${goal.targetDate}; status ${goal.statusUpdated ? goal.statusLabel : 'PENDING'})${goal.nativeLinked ? ` linked to ${goal.linkedIssueType || 'work item'} ${goal.linkedIssueKey}` : ' not linked to Jira Goals field'}`
+    )));
     if (atlassianGoals.length > 20) {
       lines.push(`- ...and ${atlassianGoals.length - 20} more goal(s).`);
     }
@@ -8174,8 +9878,8 @@ function buildChunkedSummary(config, state) {
     lines.push('');
   }
 
-  if (results.diagnostics.length > 0) {
-    const diagnosticLines = results.diagnostics.slice(-80);
+  if (String(process.env.SHOW_SETUP_DIAGNOSTICS || 'true').toLowerCase() !== 'false' && results.diagnostics.length > 0) {
+    const diagnosticLines = results.diagnostics.slice(-60);
     lines.push(`Setup Diagnostics (${diagnosticLines.length}${results.diagnostics.length > diagnosticLines.length ? ` of ${results.diagnostics.length}` : ''}):`);
     lines.push(...diagnosticLines.map(item => `- ${item}`));
     lines.push('');
@@ -8305,8 +10009,11 @@ resolver.define('executeDemoEnvironmentStep', async ({ payload }) => {
     case 'create-software-sprint':
       await executeSoftwareSprintStep(config, state, step);
       break;
+    case 'populate-kanban-board':
+      await executeKanbanBoardPopulationStep(config, state, step);
+      break;
     case 'create-dependencies':
-      await executeDependencyStep(state);
+      await executeDependencyStep(state, step);
       break;
     case 'create-github-development-activity':
       await executeGitHubDevelopmentActivityStep(config, state, step);
