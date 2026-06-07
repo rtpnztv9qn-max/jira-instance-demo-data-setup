@@ -6,6 +6,13 @@
 # Node artifact files
 node_modules/
 dist/
+static/hello-world/build-check/
+static/hello-world/build-codex-verify*/
+static/hello-world/build-fast-inventory-fix/
+static/hello-world/build-space-labels-fix/
+static/hello-world/build-space-taxonomy-fix/
+static/hello-world/build-action-feedback-fix/
+static/hello-world/build-message-polish-fix/
 
 # Compiled Java class files
 *.class

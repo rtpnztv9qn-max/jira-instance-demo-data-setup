@@ -653,7 +653,7 @@ async function generateAiDemoContent(config) {
     serviceRequests: config.itsmWorkCounts?.serviceRequestsPerProject || 1,
     changes: config.itsmWorkCounts?.changeRequestsPerProject || 1,
     problems: config.itsmWorkCounts?.problemRequestsPerProject || 1,
-    softwareIssues: Math.max(...(config.softwareProjects || []).map(project => project.issuesPerProject || 0), config.issuesPerProject || 10),
+    softwareIssues: Math.max(...(config.softwareProjects || []).map(project => project.issuesPerProject || 0), config.issuesPerProject || DEFAULT_SOFTWARE_ISSUES_PER_PROJECT),
   };
   const boundedCounts = {
     incidents: Math.min(MAX_INCIDENTS_PER_PROJECT, Math.max(0, requestedCounts.incidents)),
@@ -762,7 +762,7 @@ async function generateAiDemoContent(config) {
     },
   };
   const customDomainInstruction = config.isCustomIndustry
-    ? 'This is a custom "Others" domain entered by the user. Treat it as the source of truth. Do not substitute Banking, Healthcare, Retail, Insurance, Telecom, E-commerce, SaaS, or Manufacturing unless the user literally typed that domain.'
+    ? 'This is a custom "Others" domain entered by the user. Treat it as the source of truth. Do not substitute Banking, Healthcare, Insurance, Telecom, Retail, Manufacturing, SaaS, Public Sector, Education, or Energy & Utilities unless the user literally typed that domain.'
     : 'Use the selected predefined business domain as the source of truth.';
   const prompt = [
     `Business domain: ${config.industry}.`,
@@ -1356,6 +1356,12 @@ async function jiraPut(path, body) {
     method: 'PUT',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify(body),
+  });
+}
+
+async function jiraDelete(path) {
+  return jiraRequest(path, {
+    method: 'DELETE',
   });
 }
 
@@ -2027,6 +2033,237 @@ async function getProjectByKeyIfExists(projectKey) {
   }
 }
 
+async function getIssueCountForProject(projectKey) {
+  if (!projectKey) {
+    return null;
+  }
+
+  try {
+    const response = await jiraPost('/rest/api/3/search/approximate-count', {
+      jql: `project = ${quoteJqlValue(projectKey)}`,
+    });
+    const count = Number(response.count);
+    return Number.isFinite(count) ? count : null;
+  } catch {
+    return null;
+  }
+}
+
+function getProjectInsightIssueCount(project) {
+  const candidates = [
+    project?.insight?.totalIssueCount,
+    project?.insight?.lastIssueUpdateTime ? null : project?.issueCount,
+  ];
+  const value = candidates.find(candidate => Number.isFinite(Number(candidate)));
+  return Number.isFinite(Number(value)) ? Number(value) : null;
+}
+
+async function getProjectDemoDomainMetadata(projectKey) {
+  if (!projectKey) {
+    return null;
+  }
+
+  try {
+    return await jiraGet(`/rest/api/3/project/${encodeURIComponent(projectKey)}/properties/${DEMO_DOMAIN_PROJECT_PROPERTY_KEY}`);
+  } catch (err) {
+    return null;
+  }
+}
+
+async function saveProjectDemoDomainMetadata(project, metadata, diagnostics = []) {
+  if (!project?.key) {
+    return;
+  }
+
+  try {
+    await jiraPut(`/rest/api/3/project/${encodeURIComponent(project.key)}/properties/${DEMO_DOMAIN_PROJECT_PROPERTY_KEY}`, metadata);
+  } catch (err) {
+    diagnostics.push(`Domain metadata ${project.key}: skipped project property write: ${err.message}`);
+  }
+}
+
+function projectNameMatchesDomain(projectName, domain) {
+  const normalizedName = String(projectName || '').toLowerCase();
+  const normalizedDomain = String(domain || '').trim().toLowerCase();
+  return Boolean(normalizedDomain && normalizedName.includes(normalizedDomain));
+}
+
+function quoteJqlValue(value) {
+  return `"${String(value || '').replace(/\\/g, '\\\\').replace(/"/g, '\\"')}"`;
+}
+
+function classifyDomainProject(project, metadata = null) {
+  const value = metadata?.value || metadata || {};
+  if (value.kind === 'business' || value.kind === 'software') {
+    return {
+      ...value,
+      categoryLabel: value.kind === 'business' ? 'JSM' : 'Software',
+      detailLabel: value.kind === 'business'
+        ? normaliseJsmServiceType(value.jsmServiceType)
+        : `${normaliseSoftwareTemplate(value.softwareTemplate)} ${getProjectManagementStyleLabel(value.softwareProjectStyle || '')}`.trim(),
+    };
+  }
+
+  const name = String(project?.name || '');
+  const serviceType = JSM_SERVICE_TYPES.find(type => new RegExp(`\\b${type}\\b`, 'i').test(name));
+  const isKanban = /\bkanban\b/i.test(name);
+  const isScrum = /\bscrum\b/i.test(name);
+  const lowerName = name.toLowerCase();
+
+  if (project?.projectTypeKey === 'service_desk') {
+    return {
+      kind: 'business',
+      jsmServiceType: serviceType || 'ITSM',
+      categoryLabel: 'JSM',
+      detailLabel: serviceType || 'ITSM',
+    };
+  }
+
+  if (project?.projectTypeKey === 'software') {
+    const softwareTemplate = isKanban ? 'kanban' : isScrum ? 'scrum' : '';
+    return {
+      kind: 'software',
+      softwareTemplate,
+      softwareProjectStyle: value.softwareProjectStyle || '',
+      categoryLabel: 'Software',
+      detailLabel: `${softwareTemplate || 'software'} ${value.softwareProjectStyle || ''}`.trim(),
+    };
+  }
+
+  if (project?.projectTypeKey === 'business') {
+    const businessSpaceType = lowerName.includes('budget')
+      ? 'budget-planning'
+      : lowerName.includes('procurement') || lowerName.includes('purchase')
+        ? 'procurement-management'
+        : lowerName.includes('recruit')
+          ? 'recruitment-tracking'
+          : 'task-tracking';
+    return {
+      kind: 'business-project',
+      categoryLabel: 'Business',
+      businessSpaceType,
+      detailLabel: getBusinessSpaceTypeLabel(businessSpaceType),
+    };
+  }
+
+  if (project?.projectTypeKey === 'product_discovery' || project?.projectTypeKey === 'product-discovery') {
+    return {
+      kind: 'product-discovery',
+      categoryLabel: 'JPD',
+      productDiscoveryType: 'product-discovery',
+      detailLabel: 'Product discovery',
+    };
+  }
+
+  return {
+    kind: project?.projectTypeKey || 'project',
+    categoryLabel: project?.projectTypeKey || 'Project',
+    detailLabel: project?.projectTypeKey || 'Project',
+  };
+}
+
+async function searchDomainProjects(domain, options = {}) {
+  const requestedSpaceType = String(options.spaceType || '').trim();
+  const values = [];
+  const maxResults = 50;
+
+  const response = await jiraGet(`/rest/api/3/project/search?query=${encodeURIComponent(domain)}&startAt=0&maxResults=${maxResults}&expand=insight`);
+  const pageValues = Array.isArray(response?.values) ? response.values : [];
+  values.push(...pageValues);
+
+  const projects = [];
+
+  for (const project of values) {
+    if (!projectNameMatchesDomain(project.name, domain)) {
+      continue;
+    }
+
+    const initialClassification = classifyDomainProject(project, null);
+    if (!projectMatchesRequestedSpaceType(initialClassification, requestedSpaceType)) {
+      continue;
+    }
+
+    const metadata = await getProjectDemoDomainMetadata(project.key);
+    const classification = classifyDomainProject(project, metadata);
+    if (!projectMatchesRequestedSpaceType(classification, requestedSpaceType)) {
+      continue;
+    }
+
+    const issueCount = getProjectInsightIssueCount(project) ?? await getIssueCountForProject(project.key);
+    projects.push({
+      id: project.id,
+      key: project.key,
+      name: project.name,
+      projectTypeKey: project.projectTypeKey,
+      issueCount,
+      ...classification,
+      metadata: metadata?.value || metadata || null,
+    });
+  }
+
+  return projects;
+}
+
+function projectMatchesRequestedSpaceType(project, spaceType) {
+  const requested = String(spaceType || '').trim();
+  if (!requested) {
+    return true;
+  }
+
+  if (requested.startsWith('jsm:')) {
+    return project.kind === 'business'
+      && normaliseJsmServiceType(project.jsmServiceType) === normaliseJsmServiceType(requested.replace(/^jsm:/, ''));
+  }
+
+  if (requested.startsWith('software:')) {
+    return project.kind === 'software'
+      && normaliseSoftwareTemplate(project.softwareTemplate || requested.replace(/^software:/, '')) === normaliseSoftwareTemplate(requested.replace(/^software:/, ''));
+  }
+
+  if (requested.startsWith('business:')) {
+    return project.kind === 'business-project'
+      && normaliseBusinessSpaceType(project.businessSpaceType) === normaliseBusinessSpaceType(requested.replace(/^business:/, ''));
+  }
+
+  if (requested === 'jpd:product-discovery') {
+    return project.kind === 'product-discovery';
+  }
+
+  return true;
+}
+
+async function findReusableDomainProject(config, criteria = {}) {
+  if (config.reuseExistingDomainData === false) {
+    return null;
+  }
+
+  const projects = await searchDomainProjects(config.industry);
+  const excludeKeys = new Set((criteria.excludeKeys || []).filter(Boolean));
+  const matches = projects.filter(project => {
+    if (excludeKeys.has(project.key)) {
+      return false;
+    }
+
+    if (criteria.kind && project.kind !== criteria.kind) {
+      return false;
+    }
+
+    if (criteria.kind === 'business') {
+      return normaliseJsmServiceType(project.jsmServiceType) === normaliseJsmServiceType(criteria.jsmServiceType);
+    }
+
+    if (criteria.kind === 'software') {
+      const templateMatches = !criteria.softwareTemplate || !project.softwareTemplate || normaliseSoftwareTemplate(project.softwareTemplate) === normaliseSoftwareTemplate(criteria.softwareTemplate);
+      const styleMatches = !criteria.softwareProjectStyle || !project.softwareProjectStyle || normaliseProjectManagementStyle(project.softwareProjectStyle) === normaliseProjectManagementStyle(criteria.softwareProjectStyle);
+      return templateMatches && styleMatches;
+    }
+
+    return true;
+  });
+  const selectedVolumeKeys = new Set(config.volumeProjectKeys || []);
+  return matches.find(project => selectedVolumeKeys.has(project.key)) || matches[0] || null;
+}
+
 function getJsmItsmTemplateKeys() {
   // This first key is the Jira Cloud "IT service management" template shown in
   // Jira's project template picker. The remaining entries are ITSM/service-desk
@@ -2503,7 +2740,14 @@ async function ensureKnowledgeBaseSpace(projectKey, projectName, industry, diagn
           ].join(''),
         },
       });
-      pages.push({ id: created.id || null, title: page.title });
+      const webUrl = created._links?.webui
+        ? `${created._links?.base || ''}${created._links.webui}`
+        : null;
+      pages.push({
+        id: created.id || null,
+        title: page.title,
+        webUrl,
+      });
     } catch (err) {
       diagnostics.push(`Knowledge base ${projectKey}: page "${page.title}" creation failed: ${err.message}`);
     }
@@ -2709,10 +2953,68 @@ function getItsmWorkItem(content, index, itsmWorkCounts) {
 }
 
 async function ensureDefaultSoftwareWorkForm(projectKey, projectName, industry) {
+  const syntheticRequestType = {
+    id: null,
+    issueTypeId: null,
+  };
+  const formName = `${projectName} Work Intake`;
+
+  try {
+    const existingForms = await jiraFormsGet(`project/${encodeURIComponent(projectKey)}/form`);
+    const existingForm = (Array.isArray(existingForms) ? existingForms : []).find(form =>
+      normaliseFieldName(form?.name) === normaliseFieldName(formName) ||
+      normaliseFieldName(form?.name) === normaliseFieldName(`${projectName} Smart Intake`)
+    );
+
+    if (existingForm) {
+      return {
+        success: true,
+        reused: true,
+        id: existingForm.id || null,
+        name: existingForm.name || formName,
+        mode: 'software-existing',
+      };
+    }
+  } catch {
+    // Listing software forms is best-effort. Some tenants expose the Forms
+    // screen but do not expose its project-form API for non-JSM projects.
+  }
+
+  const attempts = buildFallbackFormPayloadAttempts(projectName, syntheticRequestType).map(attempt => ({
+    ...attempt,
+    payload: {
+      ...attempt.payload,
+      design: {
+        ...attempt.payload.design,
+        settings: {
+          ...attempt.payload.design?.settings,
+          name: formName,
+        },
+      },
+    },
+  }));
+  const errors = [];
+
+  for (const attempt of attempts) {
+    try {
+      const created = await jiraFormsPost(`project/${encodeURIComponent(projectKey)}/form`, attempt.payload);
+      return {
+        success: true,
+        reused: false,
+        id: created?.id || null,
+        name: created?.name || formName,
+        mode: `software-${attempt.label}`,
+        warning: 'Created through the Forms project API without JSM request-type publishing.',
+      };
+    } catch (err) {
+      errors.push(`${attempt.label}: ${err.message}`);
+    }
+  }
+
   return {
     success: false,
     unsupported: true,
-    message: `Software Project ${projectKey}: Jira Software project forms are not currently created by the supported Atlassian Forms REST API. The supported project-form API is for JSM projects, so the generated JSM Ops project receives forms automatically while the Software project's Forms tab must be created manually in Jira.`,
+    message: `Software Project ${projectKey}: Jira exposed the Forms tab, but the supported Forms project API did not accept a Software project form payload. Attempts failed: ${errors.join(' | ')}`,
   };
 }
 
@@ -3069,6 +3371,15 @@ async function createVersion(projectId, name, releaseDate, released) {
   });
 }
 
+async function getProjectVersions(projectKey) {
+  try {
+    const versions = await jiraGet(`/rest/api/3/project/${encodeURIComponent(projectKey)}/versions`);
+    return Array.isArray(versions) ? versions : [];
+  } catch {
+    return [];
+  }
+}
+
 async function createProjectComponent(projectKey, name, description) {
   return await jiraPost('/rest/api/3/component', {
     project: projectKey,
@@ -3110,16 +3421,50 @@ function chooseSoftwareComponentNames(project, issueIndex, issueType) {
   return names.filter(Boolean).slice(0, 2);
 }
 
-function getCompassComponentTemplates(config, project) {
+function buildAtlassianSiteUrl(baseUrl, path) {
+  const cleanBase = String(baseUrl || '').replace(/\/+$/, '');
+  const cleanPath = String(path || '').startsWith('/') ? path : `/${path || ''}`;
+  return cleanBase ? `${cleanBase}${cleanPath}` : null;
+}
+
+function getCompassComponentTemplates(config, project, siteDetails = {}, dashboardRecord = null) {
   const environmentSlug = slugifyGitHubPart(config.environmentName, 'environment');
   const projectSlug = slugifyGitHubPart(project.key, 'project');
   const industryName = toTitleCase(config.industry || 'Business');
   const repositoryUrl = getGitHubRepositoryUrl();
+  const projectUrl = buildAtlassianSiteUrl(siteDetails.baseUrl, `/jira/software/c/projects/${project.key}/summary`);
+  const boardUrl = project.boardId
+    ? buildAtlassianSiteUrl(siteDetails.baseUrl, `/jira/software/c/projects/${project.key}/boards/${project.boardId}`)
+    : buildAtlassianSiteUrl(siteDetails.baseUrl, `/jira/software/c/projects/${project.key}/board`);
+  const releasesUrl = buildAtlassianSiteUrl(siteDetails.baseUrl, `/jira/software/c/projects/${project.key}/versions`);
+  const dashboardUrl = dashboardRecord?.viewUrl
+    ? buildAtlassianSiteUrl(siteDetails.baseUrl, dashboardRecord.viewUrl)
+    : null;
   const buildLinks = (componentName) => [
     ...(repositoryUrl ? [{
       name: `${componentName} repository`,
       type: 'REPOSITORY',
       url: repositoryUrl,
+    }] : []),
+    ...(projectUrl ? [{
+      name: `${componentName} Jira project`,
+      type: 'OTHER_LINK',
+      url: projectUrl,
+    }] : []),
+    ...(boardUrl ? [{
+      name: `${componentName} delivery board`,
+      type: 'OTHER_LINK',
+      url: boardUrl,
+    }] : []),
+    ...(releasesUrl ? [{
+      name: `${componentName} release roadmap`,
+      type: 'OTHER_LINK',
+      url: releasesUrl,
+    }] : []),
+    ...(dashboardUrl ? [{
+      name: `${componentName} dashboard`,
+      type: 'OTHER_LINK',
+      url: dashboardUrl,
     }] : []),
   ];
 
@@ -3128,14 +3473,14 @@ function getCompassComponentTemplates(config, project) {
       name: `${config.environmentName} ${project.key} Delivery Service`,
       typeId: 'SERVICE',
       key: `${environmentSlug}-${projectSlug}-delivery-service`,
-      description: `${industryName} delivery service for ${project.name}.`,
+      description: `${industryName} delivery service for ${project.name}. Tracks Jira work, release health, service ownership, GitHub delivery activity, and dashboard links for the demo environment.`,
       links: buildLinks(`${project.key} delivery service`),
     },
     {
       name: `${config.environmentName} ${project.key} Release Pipeline`,
       typeId: 'APPLICATION',
       key: `${environmentSlug}-${projectSlug}-release-pipeline`,
-      description: `${industryName} release pipeline for ${project.name}.`,
+      description: `${industryName} release pipeline for ${project.name}. Represents build, validation, deployment, release readiness, and downstream dependency tracking.`,
       links: buildLinks(`${project.key} release pipeline`),
     },
   ];
@@ -3143,13 +3488,27 @@ function getCompassComponentTemplates(config, project) {
 
 async function createCompassComponent(cloudId, componentDetails) {
   const ownerId = String(process.env.COMPASS_OWNER_TEAM_ID || process.env.ATLASSIAN_TEAM_ID || '').trim();
+  const labels = ['demo-data', 'jira-demo', slugifyGitHubPart(componentDetails.key, 'component')];
   const richInput = {
     name: componentDetails.name,
     typeId: componentDetails.typeId,
     description: componentDetails.description,
-    labels: ['demo-data', 'jira-demo', slugifyGitHubPart(componentDetails.key, 'component')],
+    labels,
     ...(componentDetails.links?.length ? { links: componentDetails.links } : {}),
     ...(ownerId ? { ownerId } : {}),
+  };
+  const richWithoutOwnerInput = {
+    name: componentDetails.name,
+    typeId: componentDetails.typeId,
+    description: componentDetails.description,
+    labels,
+    ...(componentDetails.links?.length ? { links: componentDetails.links } : {}),
+  };
+  const metadataInput = {
+    name: componentDetails.name,
+    typeId: componentDetails.typeId,
+    description: componentDetails.description,
+    labels,
   };
   const simpleInput = {
     name: componentDetails.name,
@@ -3182,24 +3541,33 @@ async function createCompassComponent(cloudId, componentDetails) {
     return result.componentDetails;
   };
 
-  try {
-    const component = await createWithInput(richInput);
-    return {
-      ...component,
-      richPayloadApplied: true,
-      repositoryLinked: Boolean(componentDetails.links?.some(link => link.type === 'REPOSITORY')),
-      ownerConfigured: Boolean(ownerId),
-    };
-  } catch (richErr) {
-    const component = await createWithInput(simpleInput);
-    return {
-      ...component,
-      richPayloadApplied: false,
-      richPayloadError: richErr.message,
-      repositoryLinked: false,
-      ownerConfigured: false,
-    };
+  const attempts = [
+    { mode: 'rich', input: richInput, ownerConfigured: Boolean(ownerId), repositoryLinked: Boolean(componentDetails.links?.some(link => link.type === 'REPOSITORY')), relatedLinkCount: componentDetails.links?.length || 0 },
+    { mode: 'rich-no-owner', input: richWithoutOwnerInput, ownerConfigured: false, repositoryLinked: Boolean(componentDetails.links?.some(link => link.type === 'REPOSITORY')), relatedLinkCount: componentDetails.links?.length || 0 },
+    { mode: 'metadata', input: metadataInput, ownerConfigured: false, repositoryLinked: false, relatedLinkCount: 0 },
+    { mode: 'simple', input: simpleInput, ownerConfigured: false, repositoryLinked: false, relatedLinkCount: 0 },
+  ];
+  const errors = [];
+
+  for (const attempt of attempts) {
+    try {
+      const component = await createWithInput(attempt.input);
+      return {
+        ...component,
+        richPayloadApplied: attempt.mode === 'rich' || attempt.mode === 'rich-no-owner',
+        metadataApplied: attempt.mode !== 'simple',
+        createMode: attempt.mode,
+        repositoryLinked: attempt.repositoryLinked,
+        relatedLinkCount: attempt.relatedLinkCount,
+        ownerConfigured: attempt.ownerConfigured,
+        richPayloadError: errors.join(' | '),
+      };
+    } catch (err) {
+      errors.push(`${attempt.mode}: ${err.message}`);
+    }
   }
+
+  throw new Error(errors.join(' | '));
 }
 
 async function createCompassDependency(startComponent, endComponent) {
@@ -3281,9 +3649,9 @@ async function createAtlassianGoal(cloudId, name, targetDate) {
 
 function getAtlassianGoalStatusPlan(goalIndex) {
   const plans = [
-    { status: 'on_track', label: 'ON TRACK', score: 70 },
-    { status: 'at_risk', label: 'AT RISK', score: 50 },
-    { status: 'off_track', label: 'OFF TRACK', score: 30 },
+    { status: 'on_track', label: 'ON TRACK', score: 70, progressPercent: 72 },
+    { status: 'at_risk', label: 'AT RISK', score: 50, progressPercent: 48 },
+    { status: 'off_track', label: 'OFF TRACK', score: 30, progressPercent: 24 },
   ];
   return plans[Math.abs(Number(goalIndex) || 0) % plans.length];
 }
@@ -3298,7 +3666,7 @@ function buildAtlassianGoalUpdateSummary(goalName, statusPlan) {
         content: [
           {
             type: 'text',
-            text: `${goalName} is marked ${statusPlan.label.toLowerCase()} for demo progress tracking.`,
+            text: `${goalName} is marked ${statusPlan.label.toLowerCase()} with ${statusPlan.progressPercent}% demo progress for portfolio tracking.`,
           },
         ],
       },
@@ -3311,7 +3679,7 @@ async function createAtlassianGoalStatusUpdate(goalId, goalName, targetDate, sta
     ? targetDate
     : new Date().toISOString().slice(0, 10);
   const summary = buildAtlassianGoalUpdateSummary(goalName, statusPlan);
-  const data = await requestAtlassianGraph(`
+  const createWithCurrentSchema = async () => await requestAtlassianGraph(`
     mutation CreateGoalStatusUpdate($goalId: ID!, $summary: String!, $status: String!, $score: Int!) {
       goals_createUpdate(
         input: {
@@ -3342,6 +3710,7 @@ async function createAtlassianGoalStatusUpdate(goalId, goalName, targetDate, sta
     status: statusPlan.status,
     score: statusPlan.score,
   });
+  const data = await createWithCurrentSchema();
 
   const result = data?.goals_createUpdate;
   if (!result?.success) {
@@ -4896,6 +5265,96 @@ async function updateIssueBoardVisibleFields(issueKey, { assigneeAccountId, dueD
   }
 }
 
+let storyPointFieldIdCache = null;
+
+async function getStoryPointFieldId(diagnostics = []) {
+  if (storyPointFieldIdCache !== null) {
+    return storyPointFieldIdCache;
+  }
+
+  try {
+    const fields = await jiraGet('/rest/api/3/field');
+    const candidates = Array.isArray(fields) ? fields : [];
+    const match = candidates.find(field => {
+      const name = String(field?.name || '').toLowerCase();
+      const schema = JSON.stringify(field?.schema || {}).toLowerCase();
+      return name === 'story points' ||
+        name === 'story point estimate' ||
+        name.includes('story points') ||
+        name.includes('story point estimate') ||
+        (name.includes('estimate') && schema.includes('com.atlassian.jira.plugin.system.customfieldtypes:float'));
+    });
+    storyPointFieldIdCache = match?.id || '';
+    if (storyPointFieldIdCache) {
+      diagnostics.push(`Estimation fields: resolved story point field ${storyPointFieldIdCache}.`);
+    } else {
+      diagnostics.push('Estimation fields: Story Points / Story point estimate field was not found; falling back to Original Estimate only.');
+    }
+  } catch (err) {
+    storyPointFieldIdCache = '';
+    diagnostics.push(`Estimation fields: story point lookup failed: ${err.message}`);
+  }
+
+  return storyPointFieldIdCache;
+}
+
+function getDemoStoryPointEstimate(issueType, issueIndex) {
+  if (String(issueType || '').toLowerCase() === 'epic') {
+    return 13 + ((issueIndex % 3) * 8);
+  }
+
+  if (isBugIssueType(issueType)) {
+    return [2, 3, 5][issueIndex % 3];
+  }
+
+  return [1, 2, 3, 5, 8][issueIndex % 5];
+}
+
+async function updateIssueEstimationFields(issueKey, issueType, issueIndex, diagnostics = []) {
+  const storyPoints = getDemoStoryPointEstimate(issueType, issueIndex);
+  const storyPointFieldId = await getStoryPointFieldId(diagnostics);
+
+  if (storyPointFieldId) {
+    const fields = { [storyPointFieldId]: storyPoints };
+    try {
+      await jiraPut(`/rest/api/3/issue/${encodeURIComponent(issueKey)}?notifyUsers=false`, { fields });
+      diagnostics.push(`Estimation fields ${issueKey}: story points set to ${storyPoints}.`);
+    } catch (normalErr) {
+      try {
+        await jiraPut(
+          `/rest/api/3/issue/${encodeURIComponent(issueKey)}?notifyUsers=false&overrideScreenSecurity=true&overrideEditableFlag=true`,
+          { fields }
+        );
+        diagnostics.push(`Estimation fields ${issueKey}: story points set with screen override to ${storyPoints}.`);
+      } catch (overrideErr) {
+        diagnostics.push(`Estimation fields ${issueKey}: story point update skipped. Normal update: ${normalErr.message}. Override update: ${overrideErr.message}`);
+      }
+    }
+  }
+
+  const timeTrackingFields = {
+    timetracking: {
+      originalEstimate: `${Math.max(1, storyPoints * 4)}h`,
+      remainingEstimate: `${Math.max(1, storyPoints * 2)}h`,
+    },
+  };
+
+  try {
+    await jiraPut(`/rest/api/3/issue/${encodeURIComponent(issueKey)}?notifyUsers=false`, { fields: timeTrackingFields });
+    diagnostics.push(`Estimation fields ${issueKey}: original estimate set to ${storyPoints * 4}h.`);
+  } catch (normalErr) {
+    try {
+      await jiraPut(
+        `/rest/api/3/issue/${encodeURIComponent(issueKey)}?notifyUsers=false&overrideScreenSecurity=true&overrideEditableFlag=true`,
+        { fields: timeTrackingFields }
+      );
+      diagnostics.push(`Estimation fields ${issueKey}: original estimate set with screen override to ${storyPoints * 4}h.`);
+    } catch (overrideErr) {
+      diagnostics.push(`Estimation fields ${issueKey}: time tracking update skipped. Normal update: ${normalErr.message}. Override update: ${overrideErr.message}`);
+    }
+  }
+}
+
 async function createIssue(projectKey, title, type, epicKey, priority, dueDate, versionId, options = {}) {
   const lifecycle = options.lifecycle || null;
   const demoDateFields = options.demoDateFields || {};
@@ -4962,6 +5421,9 @@ async function createIssue(projectKey, title, type, epicKey, priority, dueDate, 
       startDate: options.startDate,
       startDateFieldId: options.startDateFieldId,
     }, options.diagnostics);
+    if (options.projectKind === 'software') {
+      await updateIssueEstimationFields(issue.key, type, options.issueIndex || 0, options.diagnostics);
+    }
     return issue;
   } catch (err) {
     const errorMessage = String(err?.message || '');
@@ -5003,6 +5465,9 @@ async function createIssue(projectKey, title, type, epicKey, priority, dueDate, 
         startDate: options.startDate,
         startDateFieldId: options.startDateFieldId,
       }, options.diagnostics);
+      if (options.projectKind === 'software') {
+        await updateIssueEstimationFields(issue.key, fallbackIssueType.name || type, options.issueIndex || 0, options.diagnostics);
+      }
       return issue;
     }
 
@@ -5034,6 +5499,9 @@ async function createIssue(projectKey, title, type, epicKey, priority, dueDate, 
         startDate: options.startDate,
         startDateFieldId: options.startDateFieldId,
       }, options.diagnostics);
+      if (options.projectKind === 'software') {
+        await updateIssueEstimationFields(issue.key, type, options.issueIndex || 0, options.diagnostics);
+      }
       return issue;
     }
     throw err;
@@ -5382,6 +5850,150 @@ async function createIssueLink(inwardKey, outwardKey, typeName = 'Blocks') {
     console.error(`Link ${inwardKey} -> ${outwardKey} (${typeName}): ${err.message}`);
     return { ok: false, message: err.message };
   }
+}
+
+async function addIssueComment(issueKey, paragraphs, diagnostics = []) {
+  if (!issueKey || !Array.isArray(paragraphs) || paragraphs.length === 0) {
+    return false;
+  }
+
+  try {
+    await jiraPost(`/rest/api/3/issue/${encodeURIComponent(issueKey)}/comment`, {
+      body: buildADF(paragraphs.filter(Boolean).slice(0, 6)),
+    });
+    return true;
+  } catch (err) {
+    diagnostics.push(`Relationship evidence ${issueKey}: comment skipped: ${err.message}`);
+    return false;
+  }
+}
+
+async function addIssueRemoteLink(issueKey, link, diagnostics = []) {
+  const url = String(link?.url || '').trim();
+  if (!issueKey || !/^https?:\/\//i.test(url)) {
+    return false;
+  }
+
+  try {
+    await jiraPost(`/rest/api/3/issue/${encodeURIComponent(issueKey)}/remotelink`, {
+      relationship: link.relationship || 'references',
+      object: {
+        url,
+        title: link.title || 'Demo reference',
+        summary: link.summary || 'Generated demo reference for this work item.',
+        icon: {
+          url16x16: 'https://www.atlassian.com/favicon.ico',
+          title: 'Reference',
+        },
+      },
+    });
+    return true;
+  } catch (err) {
+    diagnostics.push(`Relationship evidence ${issueKey}: remote link skipped: ${err.message}`);
+    return false;
+  }
+}
+
+function findKnowledgeBasePageForWorkType(project, workType) {
+  const pages = project?.knowledgeBase?.pages || [];
+  const normalizedWorkType = String(workType || '').toLowerCase();
+  const keywords = normalizedWorkType.includes('problem')
+    ? ['problem']
+    : normalizedWorkType.includes('change')
+      ? ['change']
+      : normalizedWorkType.includes('service')
+        ? ['service request', 'fulfilment']
+        : ['incident'];
+
+  return pages.find(page => keywords.some(keyword => String(page.title || '').toLowerCase().includes(keyword)))
+    || pages[0]
+    || null;
+}
+
+function buildReferenceUrlForIssue(state, project, record, category) {
+  const issueType = String(record?.issueType || record?.workType || '').toLowerCase();
+  if (category === 'itsm') {
+    const page = findKnowledgeBasePageForWorkType(project, record?.workType || record?.issueType);
+    if (page?.webUrl && /^https?:\/\//i.test(page.webUrl)) {
+      return {
+        url: page.webUrl,
+        title: page.title,
+        relationship: 'documented by',
+        summary: 'Generated Confluence knowledge article for this ITSM work type.',
+      };
+    }
+    return {
+      url: 'https://www.atlassian.com/software/jira/service-management/templates/itsm',
+      title: 'ITSM operating model reference',
+      relationship: 'references',
+      summary: 'External reference used for generated ITSM demo context.',
+    };
+  }
+
+  const releaseVersion = (project?.versions || []).find(version => (
+    String(version.id) === String(record?.fixVersionId || record?.affectsVersionId || '')
+  ));
+
+  if (releaseVersion?.releaseDate) {
+    return {
+      url: 'https://www.atlassian.com/software/jira/features/versions',
+      title: `${releaseVersion.name} release readiness`,
+      relationship: issueType.includes('bug') ? 'fixes in' : 'tracked by',
+      summary: `Generated ${releaseVersion.releaseStage || 'release'} release context for ${project?.key || 'software project'}.`,
+    };
+  }
+
+  return {
+    url: 'https://www.atlassian.com/software/jira/guides/use-cases/software-development',
+    title: 'Software delivery reference',
+    relationship: 'references',
+    summary: 'External reference used for generated software delivery demo context.',
+  };
+}
+
+function buildRelationshipComment({ fromKey, toKey, typeName, category, fromRecord, toRecord, project }) {
+  const relation = String(typeName || 'Relates').toLowerCase().includes('block')
+    ? 'blocks or is blocked by'
+    : 'relates to';
+  const fromTitle = fromRecord?.title || fromRecord?.summary || fromKey;
+  const toTitle = toRecord?.title || toRecord?.summary || toKey;
+
+  if (category === 'itsm') {
+    return [
+      `Demo relationship added: ${fromKey} ${relation} ${toKey}.`,
+      `Operational context: ${fromTitle} is connected with ${toTitle} so incident, problem, change, and request flow can be reviewed from either work item.`,
+      `Timeline and dependency views should show this relationship as linked work; use the generated Created Date, Resolved Date, and Due date fields for historical reporting.`,
+    ];
+  }
+
+  return [
+    `Demo delivery dependency added: ${fromKey} ${relation} ${toKey}.`,
+    `Software context: ${fromTitle} is connected with ${toTitle} for release planning, sprint review, defect triage, and dependency tracking.`,
+    `Project context: ${project?.key || 'software'} uses fix versions, affected versions, sprint or Kanban flow state, and generated custom dates for the demo reports.`,
+  ];
+}
+
+async function addRelationshipEvidence(state, evidence) {
+  const diagnostics = state?.results?.diagnostics || [];
+  const fromKey = evidence?.fromKey;
+  const toKey = evidence?.toKey;
+  if (!fromKey || !toKey) {
+    return 0;
+  }
+
+  let writes = 0;
+  const commentAdded = await addIssueComment(fromKey, buildRelationshipComment(evidence), diagnostics);
+  if (commentAdded) {
+    writes += 1;
+  }
+
+  const remoteLink = buildReferenceUrlForIssue(state, evidence.project, evidence.fromRecord, evidence.category);
+  const remoteLinkAdded = await addIssueRemoteLink(fromKey, remoteLink, diagnostics);
+  if (remoteLinkAdded) {
+    writes += 1;
+  }
+
+  return writes;
 }
 
 function buildEnvironmentFilterDefinition(config, state) {
@@ -6707,17 +7319,65 @@ const ACTIVE_ITSM_WORK_COUNT_KEYS = [
 ];
 
 const ITSM_WORK_COUNT_DEFAULTS = {
-  incidentRequestsPerProject: 1,
-  problemRequestsPerProject: 1,
-  changeRequestsPerProject: 1,
-  serviceRequestsPerProject: 1,
+  incidentRequestsPerProject: 60,
+  problemRequestsPerProject: 60,
+  changeRequestsPerProject: 60,
+  serviceRequestsPerProject: 60,
   postIncidentReviewsPerProject: 0,
 };
+
+const DEFAULT_SOFTWARE_ISSUES_PER_PROJECT = 60;
+const DEMO_DOMAIN_PROJECT_PROPERTY_KEY = 'cprimeDemoDomainSetup';
+const JSM_SERVICE_TYPES = ['ITSM', 'HRSM', 'CSM'];
+const BUSINESS_SPACE_TYPES = ['task-tracking', 'budget-planning', 'procurement-management', 'recruitment-tracking'];
+
+function normaliseBusinessSpaceType(value) {
+  const raw = String(value || 'task-tracking').trim().toLowerCase();
+  return BUSINESS_SPACE_TYPES.includes(raw) ? raw : 'task-tracking';
+}
+
+function getBusinessSpaceTypeLabel(value) {
+  const normalized = normaliseBusinessSpaceType(value);
+  const labels = {
+    'task-tracking': 'Task tracking',
+    'budget-planning': 'Budget planning',
+    'procurement-management': 'Procurement management',
+    'recruitment-tracking': 'Recruitment tracking',
+  };
+  return labels[normalized] || 'Task tracking';
+}
 
 function normalisePositiveInteger(value, fallback, min, max) {
   const parsed = Number.parseInt(value, 10);
   if (Number.isNaN(parsed)) return fallback;
   return Math.max(min, Math.min(max, parsed));
+}
+
+function normaliseJsmServiceType(value) {
+  const raw = String(value || 'ITSM').trim();
+  const match = JSM_SERVICE_TYPES.find(type => type.toLowerCase() === raw.toLowerCase());
+  return match || 'ITSM';
+}
+
+function normaliseJsmServiceTypes(payload = {}) {
+  const values = Array.isArray(payload.jsmServiceTypes)
+    ? payload.jsmServiceTypes
+    : Array.from({ length: normalisePositiveInteger(payload.jsmProjectCount, 0, 0, 10) }, () => 'ITSM');
+  return values
+    .map(normaliseJsmServiceType)
+    .slice(0, 10);
+}
+
+function createDomainProjectName(domain, projectKind, index, details = {}) {
+  const cleanDomain = String(domain || 'Demo').trim() || 'Demo';
+  if (projectKind === 'business') {
+    const serviceType = normaliseJsmServiceType(details.serviceType);
+    return `${cleanDomain} - ${serviceType} Ops ${index + 1}`;
+  }
+
+  const template = normaliseSoftwareTemplate(details.softwareTemplate);
+  const templateLabel = template === 'kanban' ? 'Kanban' : 'Scrum';
+  return `${cleanDomain} - ${templateLabel} Dev ${index + 1}`;
 }
 
 function normaliseItsmWorkCounts(payload = {}) {
@@ -6759,14 +7419,14 @@ function normaliseSoftwareProjectConfigs(payload = {}) {
       .map(project => ({
         softwareTemplate: normaliseSoftwareTemplate(project?.softwareTemplate),
         softwareProjectStyle: normaliseProjectManagementStyle(project?.softwareProjectStyle),
-        issuesPerProject: normalisePositiveInteger(project?.issuesPerProject, 10, 1, MAX_ISSUES_PER_PROJECT),
+        issuesPerProject: normalisePositiveInteger(project?.issuesPerProject, DEFAULT_SOFTWARE_ISSUES_PER_PROJECT, 1, MAX_ISSUES_PER_PROJECT),
       }));
   }
 
   const count = normalisePositiveInteger(payload.softwareProjectCount, 0, 0, 10);
   const softwareTemplate = normaliseSoftwareTemplate(payload.softwareTemplate);
   const softwareProjectStyle = normaliseProjectManagementStyle(payload.softwareProjectStyle);
-  const issuesPerProject = normalisePositiveInteger(payload.issuesPerProject, 10, 1, MAX_ISSUES_PER_PROJECT);
+  const issuesPerProject = normalisePositiveInteger(payload.issuesPerProject, DEFAULT_SOFTWARE_ISSUES_PER_PROJECT, 1, MAX_ISSUES_PER_PROJECT);
 
   return Array.from({ length: count }, () => ({
     softwareTemplate,
@@ -6819,12 +7479,24 @@ function getSoftwareProjectConfig(config, projectIndex) {
   return config.softwareProjects?.[projectIndex] || {
     softwareTemplate: normaliseSoftwareTemplate(config.softwareTemplate),
     softwareProjectStyle: normaliseProjectManagementStyle(config.softwareProjectStyle),
-    issuesPerProject: normalisePositiveInteger(config.issuesPerProject, 10, 1, MAX_ISSUES_PER_PROJECT),
+    issuesPerProject: normalisePositiveInteger(config.issuesPerProject, DEFAULT_SOFTWARE_ISSUES_PER_PROJECT, 1, MAX_ISSUES_PER_PROJECT),
   };
 }
 
 function getTotalItsmWorkCount(itsmWorkCounts = {}) {
   return ACTIVE_ITSM_WORK_COUNT_KEYS.reduce((total, key) => total + (Number(itsmWorkCounts[key]) || 0), 0);
+}
+
+function shouldAddVolumeToExistingProject(config, projectKey) {
+  if (!projectKey) {
+    return false;
+  }
+
+  if (Array.isArray(config.volumeProjectKeys) && config.volumeProjectKeys.length > 0) {
+    return config.volumeProjectKeys.includes(projectKey);
+  }
+
+  return Boolean(config.addVolumeToExistingDomainData);
 }
 
 function formatItsmWorkMix(itsmWorkCounts = {}) {
@@ -6838,13 +7510,13 @@ function formatItsmWorkMix(itsmWorkCounts = {}) {
 }
 
 function normalisePayload(payload) {
-  const environmentName = String(payload.environmentName || '').trim();
   const rawIndustry = String(payload.industry || 'Banking').trim();
   const rawCustomIndustry = String(payload.customIndustry || '').trim();
   const isCustomIndustry = Boolean(payload.isCustomIndustry || rawIndustry.toLowerCase() === 'other' || rawIndustry.toLowerCase() === 'others');
   const industry = isCustomIndustry
     ? (rawCustomIndustry || rawIndustry || 'Custom Business')
     : rawIndustry;
+  const environmentName = String(payload.environmentName || industry).trim() || industry;
   const opsDashboardPrompt = String(payload.opsDashboardPrompt || payload.dashboardPrompt || '').trim();
   const softwareDashboardPrompt = String(payload.softwareDashboardPrompt || '').trim();
   const opsDashboardTypes = Array.isArray(payload.opsDashboardTypes)
@@ -6858,6 +7530,10 @@ function normalisePayload(payload) {
   const softwareProjects = normaliseSoftwareProjectConfigs(payload);
   const itsmWorkCounts = normaliseItsmWorkCounts(payload);
   const incidentsPerProject = getTotalItsmWorkCount(itsmWorkCounts);
+  const jsmServiceTypes = normaliseJsmServiceTypes(payload);
+  const volumeProjectKeys = Array.isArray(payload.volumeProjectKeys)
+    ? payload.volumeProjectKeys.map(value => String(value || '').trim()).filter(Boolean)
+    : [];
   const opsDashboardSelections = normaliseDashboardSelections(
     payload.opsDashboardSelections,
     opsDashboardTypes,
@@ -6888,10 +7564,13 @@ function normalisePayload(payload) {
     dashboardIntent: inferDashboardIntent(opsDashboardPrompt, industry),
     opsDashboardIntent: inferDashboardIntent(opsDashboardPrompt, industry),
     softwareDashboardIntent: inferDashboardIntent(softwareDashboardPrompt, industry),
+    addVolumeToExistingDomainData: Boolean(payload.addVolumeToExistingDomainData || volumeProjectKeys.length > 0),
+    volumeProjectKeys,
     runSeed: payload.runSeed || null,
     dateRange: String(payload.dateRange || '6 months'),
     dateRangeDays: parseDateRangeDays(payload.dateRange),
-    jsmProjectCount: normalisePositiveInteger(payload.jsmProjectCount, 1, 0, 10),
+    jsmServiceTypes,
+    jsmProjectCount: jsmServiceTypes.length,
     incidentsPerProject,
     itsmWorkCounts,
     softwareProjects,
@@ -6899,7 +7578,7 @@ function normalisePayload(payload) {
     softwareProjectCount: softwareProjects.length,
     softwareTemplate: softwareProjects[0]?.softwareTemplate || softwareTemplate,
     softwareProjectStyle: softwareProjects[0]?.softwareProjectStyle || softwareProjectStyle,
-    issuesPerProject: softwareProjects[0]?.issuesPerProject || normalisePositiveInteger(payload.issuesPerProject, 10, 1, MAX_ISSUES_PER_PROJECT),
+    issuesPerProject: softwareProjects[0]?.issuesPerProject || normalisePositiveInteger(payload.issuesPerProject, DEFAULT_SOFTWARE_ISSUES_PER_PROJECT, 1, MAX_ISSUES_PER_PROJECT),
     sprintsPerProject: normalisePositiveInteger(
       payload.sprintsPerProject,
       MIN_SOFTWARE_SPRINTS_PER_PROJECT,
@@ -6948,6 +7627,8 @@ function createChunkedExecutionState(accountId) {
       dashboards: [],
       savedFilters: [],
       reports: [],
+      jiraPlans: [],
+      jiraRoadmaps: [],
       compassComponents: [],
       atlassianGoals: [],
       projectGoals: [],
@@ -6976,12 +7657,14 @@ function buildChunkedExecutionPlan(config) {
   const csvIssueCreation = isCsvIssueCreationMode();
 
   for (let projectIndex = 0; projectIndex < config.jsmProjectCount; projectIndex++) {
+    const jsmServiceType = normaliseJsmServiceType(config.jsmServiceTypes?.[projectIndex]);
     steps.push({
       type: 'create-business-project',
       projectIndex,
-      projectName: `${config.environmentName} - ${config.industry} Ops ${projectIndex + 1} (${runSeed})`,
+      jsmServiceType,
+      projectName: createDomainProjectName(config.industry, 'business', projectIndex, { serviceType: jsmServiceType }),
       projectKeyPrefix: deriveRunProjectKeyPrefix({ ...config, runSeed }, config.industry, projectIndex),
-      label: `Create JSM ITSM project ${projectIndex + 1} of ${config.jsmProjectCount}`,
+      label: `Find or create JSM ${jsmServiceType} project ${projectIndex + 1} of ${config.jsmProjectCount}`,
     });
 
     steps.push({
@@ -7023,9 +7706,9 @@ function buildChunkedExecutionPlan(config) {
     steps.push({
       type: 'create-software-project-shell',
       projectIndex,
-      projectName: `${config.environmentName} - ${config.industry} Dev ${projectIndex + 1} (${runSeed})`,
+      projectName: createDomainProjectName(config.industry, 'software', projectIndex, softwareProjectConfig),
       projectKeyPrefix: deriveRunProjectKeyPrefix({ ...config, runSeed }, config.industry, projectIndex + config.jsmProjectCount),
-      label: `Create software project ${projectIndex + 1} of ${config.softwareProjectCount}`,
+      label: `Find or create software project ${projectIndex + 1} of ${config.softwareProjectCount}`,
     });
 
     steps.push({
@@ -7179,6 +7862,13 @@ function buildChunkedExecutionPlan(config) {
       steps.push({
         type: 'generate-worker-date-patch',
         label: 'Generate CSV date patch for REST-created issues',
+      });
+    }
+
+    if (config.softwareProjectCount > 0) {
+      steps.push({
+        type: 'create-planning-artifacts',
+        label: 'Create Jira planning and roadmap artifacts',
       });
     }
   }
@@ -7335,11 +8025,17 @@ async function executeBusinessProjectStep(config, state, step) {
   const timestamp = Date.now();
   const projectName = step.projectName || `${config.environmentName} - ${config.industry} Ops ${step.projectIndex + 1} (${timestamp})`;
   const projectKeyPrefix = step.projectKeyPrefix || deriveRunProjectKeyPrefix(config, config.industry, step.projectIndex);
+  const jsmServiceType = normaliseJsmServiceType(step.jsmServiceType || config.jsmServiceTypes?.[step.projectIndex]);
 
   try {
-    addChunkedDiagnostics(state, [`JSM Project ${step.projectIndex + 1}: creating Jira Service Management ITSM project using template ${getJsmItsmTemplateKeys()[0]}.`]);
+    addChunkedDiagnostics(state, [`JSM Project ${step.projectIndex + 1}: finding or creating Jira Service Management ${jsmServiceType} project using template ${getJsmItsmTemplateKeys()[0]}.`]);
     const expectedKey = generateKey(projectKeyPrefix, 0);
-    const existingProject = await getProjectByKeyIfExists(expectedKey);
+    const existingDomainProject = await findReusableDomainProject(config, {
+      kind: 'business',
+      jsmServiceType,
+      excludeKeys: state.results.jsmProjects.map(project => project?.key),
+    });
+    const existingProject = existingDomainProject || await getProjectByKeyIfExists(expectedKey);
     const project = existingProject
       ? {
           id: existingProject.id,
@@ -7350,15 +8046,29 @@ async function executeBusinessProjectStep(config, state, step) {
       : await createJSMProject(projectName, state.metadata.accountId, projectKeyPrefix, state.results.diagnostics);
 
     if (existingProject) {
-      addChunkedDiagnostics(state, [`JSM Project ${step.projectIndex + 1}: reused existing project ${existingProject.key} after a prior create attempt.`]);
+      addChunkedDiagnostics(state, [`JSM Project ${step.projectIndex + 1}: reused existing ${jsmServiceType} project ${existingProject.key} for ${config.industry}.`]);
     }
+
+    const existingIssueCount = await getIssueCountForProject(project.key);
+    const addVolumeToExistingProject = Boolean(existingProject && shouldAddVolumeToExistingProject(config, project.key));
+    await saveProjectDemoDomainMetadata(project, {
+      domain: config.industry,
+      kind: 'business',
+      jsmServiceType,
+      generatedBy: 'jira-demo-data-setup',
+      issueTarget: config.incidentsPerProject,
+    }, state.results.diagnostics);
 
     state.results.jsmProjects[step.projectIndex] = {
       id: project.id,
       key: project.key,
-      name: projectName,
+      name: existingProject?.name || projectName,
       serviceDeskAvailable: project.serviceDeskAvailable !== false,
       projectTypeKey: project.projectTypeKey || 'service_desk',
+      reusedExistingDomainData: Boolean(existingProject && existingIssueCount > 0),
+      addVolumeToExistingDomainData: addVolumeToExistingProject,
+      existingIssueCount,
+      jsmServiceType,
       incidents: [],
       itsmWorkItems: [],
       smartForm: null,
@@ -7506,6 +8216,13 @@ async function executeBusinessIncidentBatchStep(config, state, step) {
     addChunkedDiagnostics(state, [`JSM Project ${step.projectIndex + 1}: skipped ITSM work item batch because the ITSM/JSM project was not created.`]);
     return;
   }
+  if (project.reusedExistingDomainData && !project.addVolumeToExistingDomainData) {
+    addChunkedDiagnostics(state, [`JSM Project ${project.key}: reused ${project.existingIssueCount || 0} existing domain work items; skipped duplicate ITSM creation.`]);
+    return;
+  }
+  if (project.addVolumeToExistingDomainData && step.start === 0) {
+    addChunkedDiagnostics(state, [`JSM Project ${project.key}: adding a new volume batch (${formatItsmWorkMix(config.itsmWorkCounts)}) to existing domain data.`]);
+  }
 
   const content = getConfiguredContent(config);
   const boardStatusCycle = ['To Do', 'In Progress', 'Done'];
@@ -7603,6 +8320,10 @@ async function executeBusinessIncidentBatchStep(config, state, step) {
         status: targetStatus,
         workType: workItem.workType,
         requestTypeName,
+        createdAt: lifecycleForStatus.createdAt,
+        resolvedAt: lifecycleForStatus.resolvedAt,
+        dueDate,
+        assigneeAccountId,
       };
       addHistoricalDatePatchIssue(state, {
         key: created.key,
@@ -7630,20 +8351,40 @@ async function executeSoftwareProjectStep(config, state, step) {
   try {
     addChunkedDiagnostics(state, [`Software Project ${step.projectIndex + 1}: creating ${getProjectManagementStyleLabel(softwareProjectStyle)} ${softwareTemplate === 'kanban' ? 'Kanban' : 'Scrum'} project from selected dropdown values.`]);
     const expectedKey = generateKey(projectKeyPrefix, 0);
-    const existingProject = await getProjectByKeyIfExists(expectedKey);
+    const existingDomainProject = await findReusableDomainProject(config, {
+      kind: 'software',
+      softwareTemplate,
+      softwareProjectStyle,
+      excludeKeys: state.results.softwareProjects.map(project => project?.key),
+    });
+    const existingProject = existingDomainProject || await getProjectByKeyIfExists(expectedKey);
     const project = existingProject
       ? existingProject
       : await createSoftwareProject(projectName, state.metadata.accountId, projectKeyPrefix, softwareTemplate, softwareProjectStyle);
 
     if (existingProject) {
-      addChunkedDiagnostics(state, [`Software Project ${step.projectIndex + 1}: reused existing project ${existingProject.key} after a prior create attempt.`]);
+      addChunkedDiagnostics(state, [`Software Project ${step.projectIndex + 1}: reused existing ${softwareTemplate} ${getProjectManagementStyleLabel(softwareProjectStyle)} project ${existingProject.key} for ${config.industry}.`]);
     }
+
+    const existingIssueCount = await getIssueCountForProject(project.key);
+    const addVolumeToExistingProject = Boolean(existingProject && shouldAddVolumeToExistingProject(config, project.key));
+    await saveProjectDemoDomainMetadata(project, {
+      domain: config.industry,
+      kind: 'software',
+      softwareTemplate,
+      softwareProjectStyle,
+      generatedBy: 'jira-demo-data-setup',
+      issueTarget: softwareProjectConfig.issuesPerProject,
+    }, state.results.diagnostics);
 
     state.results.softwareProjects[step.projectIndex] = {
       id: project.id,
       key: project.key,
-      name: projectName,
-      issueCount: 0,
+      name: existingProject?.name || projectName,
+      reusedExistingDomainData: Boolean(existingProject && existingIssueCount > 0),
+      addVolumeToExistingDomainData: addVolumeToExistingProject,
+      existingIssueCount,
+      issueCount: existingProject && existingIssueCount > 0 ? existingIssueCount : 0,
       issueKeys: [],
       issueRecords: [],
       firstIssueKey: null,
@@ -7763,13 +8504,26 @@ async function executeSoftwareVersionBatchStep(state, step) {
     addChunkedError(state, `Software Project ${step.projectIndex + 1}: skipped version batch because the project was not created.`);
     return;
   }
+  if (project.reusedExistingDomainData && !project.addVolumeToExistingDomainData) {
+    addChunkedDiagnostics(state, [`Version ${project.key}: reused existing domain project data; skipped duplicate version creation.`]);
+    return;
+  }
 
   for (let offset = 0; offset < step.count; offset++) {
     const releaseIndex = (step.startRelease ?? step.startMonth ?? 0) + offset;
     const releasePlan = getSoftwareReleasePlan(project, releaseIndex);
 
     try {
-      const createdVersion = await createVersion(project.id, releasePlan.name, releasePlan.releaseDate, releasePlan.released);
+      let createdVersion = null;
+      if (project.reusedExistingDomainData || project.addVolumeToExistingDomainData) {
+        const existingVersions = project._existingVersions || await getProjectVersions(project.key);
+        project._existingVersions = existingVersions;
+        createdVersion = existingVersions.find(version => String(version.name || '').toLowerCase() === releasePlan.name.toLowerCase()) || null;
+      }
+
+      if (!createdVersion) {
+        createdVersion = await createVersion(project.id, releasePlan.name, releasePlan.releaseDate, releasePlan.released);
+      }
       project.versions.push({
         ...createdVersion,
         name: createdVersion.name || releasePlan.name,
@@ -7778,7 +8532,7 @@ async function executeSoftwareVersionBatchStep(state, step) {
         releaseStage: releasePlan.stage,
         methodology: releasePlan.methodology,
       });
-      addChunkedDiagnostics(state, [`Version ${project.key}: created ${releasePlan.stage} ${releasePlan.name} (${releasePlan.releaseDate}).`]);
+      addChunkedDiagnostics(state, [`Version ${project.key}: ${createdVersion.name === releasePlan.name && project._existingVersions?.some(version => version.id === createdVersion.id) ? 'reused' : 'created'} ${releasePlan.stage} ${releasePlan.name} (${releasePlan.releaseDate}).`]);
     } catch (err) {
       addChunkedError(state, `Version ${releasePlan.name} for ${project.key}: ${err.message}`);
     }
@@ -7789,6 +8543,10 @@ async function executeSoftwareComponentsStep(config, state, step) {
   const project = state.results.softwareProjects[step.projectIndex];
   if (!project?.key) {
     addChunkedError(state, `Software Project ${step.projectIndex + 1}: skipped components because the project was not created.`);
+    return;
+  }
+  if (project.reusedExistingDomainData && !project.addVolumeToExistingDomainData) {
+    addChunkedDiagnostics(state, [`Component ${project.key}: reused existing domain project data; skipped duplicate component creation.`]);
     return;
   }
 
@@ -7836,7 +8594,9 @@ async function executeCompassComponentsStep(config, state, step) {
 
   try {
     const cloudId = await resolveAtlassianCloudId();
-    const templates = getCompassComponentTemplates(config, project);
+    const siteDetails = await getCurrentSiteDetails().catch(() => ({}));
+    const projectDashboard = (state.results.dashboards || []).find(dashboard => dashboard?.projectKey === project.key) || null;
+    const templates = getCompassComponentTemplates(config, project, siteDetails, projectDashboard);
     const createdCompassComponents = [];
 
     for (const template of templates) {
@@ -7848,16 +8608,19 @@ async function executeCompassComponentsStep(config, state, step) {
           typeId: component.typeId || template.typeId,
           projectKey: project.key,
           repositoryLinked: Boolean(component.repositoryLinked),
+          relatedLinkCount: Number(component.relatedLinkCount || 0),
           ownerConfigured: Boolean(component.ownerConfigured),
           richPayloadApplied: Boolean(component.richPayloadApplied),
+          metadataApplied: Boolean(component.metadataApplied),
+          createMode: component.createMode || (component.richPayloadApplied ? 'rich' : 'simple'),
         };
         project.compassComponents = project.compassComponents || [];
         project.compassComponents.push(record);
         state.results.compassComponents.push(record);
         createdCompassComponents.push(record);
-        addChunkedDiagnostics(state, [`Compass ${project.key}: created ${record.name} (${record.typeId})${record.repositoryLinked ? ' with repository link' : ''}${record.ownerConfigured ? ' and owner team' : ''}.`]);
-        if (component.richPayloadApplied === false) {
-          addChunkedDiagnostics(state, [`Compass ${project.key}: "${record.name}" used simple create fallback after rich metadata was rejected: ${component.richPayloadError}`]);
+        addChunkedDiagnostics(state, [`Compass ${project.key}: created ${record.name} (${record.typeId}) using ${record.createMode} payload${record.repositoryLinked ? ' with repository link' : ''}${record.relatedLinkCount ? ` and ${record.relatedLinkCount} related link(s)` : ''}${record.ownerConfigured ? ' and owner team' : ''}.`]);
+        if (component.richPayloadApplied === false && component.richPayloadError) {
+          addChunkedDiagnostics(state, [`Compass ${project.key}: "${record.name}" used metadata/simple fallback after richer metadata was rejected: ${component.richPayloadError}`]);
         }
       } catch (componentErr) {
         addChunkedDiagnostics(state, [`Compass ${project.key}: component "${template.name}" skipped: ${componentErr.message}`]);
@@ -7958,6 +8721,7 @@ async function executeAtlassianGoalsStep(config, state, step) {
           status: statusPlan.status,
           statusLabel: statusPlan.label,
           score: statusPlan.score,
+          progressPercent: statusPlan.progressPercent,
           linkedIssueKey: nativeLinkIssueKey,
           linkedIssueType: nativeLinkIssueType,
         };
@@ -7995,6 +8759,10 @@ async function executeSoftwareEpicBatchStep(config, state, step) {
   const project = state.results.softwareProjects[step.projectIndex];
   if (!project?.key) {
     addChunkedError(state, `Software Project ${step.projectIndex + 1}: skipped epic batch because the project was not created.`);
+    return;
+  }
+  if (project.reusedExistingDomainData && !project.addVolumeToExistingDomainData) {
+    addChunkedDiagnostics(state, [`Epic ${project.key}: reused existing domain project data; skipped duplicate epic creation.`]);
     return;
   }
 
@@ -8081,6 +8849,13 @@ async function executeSoftwareIssueBatchStep(config, state, step) {
     addChunkedError(state, `Software Project ${step.projectIndex + 1}: skipped issue batch because the project was not created.`);
     return;
   }
+  if (project.reusedExistingDomainData && !project.addVolumeToExistingDomainData) {
+    addChunkedDiagnostics(state, [`Issues ${project.key}: reused ${project.existingIssueCount || 0} existing domain issues; skipped duplicate software issue creation.`]);
+    return;
+  }
+  if (project.addVolumeToExistingDomainData && step.start === 0) {
+    addChunkedDiagnostics(state, [`Issues ${project.key}: adding a new 60-issue volume batch to existing domain data.`]);
+  }
 
   const content = getConfiguredContent(config);
   const priorities = ['Highest', 'High', 'High', 'Medium', 'Medium', 'Medium', 'Low', 'Lowest'];
@@ -8151,6 +8926,7 @@ async function executeSoftwareIssueBatchStep(config, state, step) {
           skipEpicLink: softwareTemplate === 'kanban',
           labels: getSoftwareMethodologyLabels(project, variantIndex, template.type),
           components: chooseSoftwareComponentNames(project, variantIndex, template.type),
+          issueIndex: variantIndex,
         }
       );
 
@@ -8166,6 +8942,11 @@ async function executeSoftwareIssueBatchStep(config, state, step) {
         affectsVersionId: releaseVersions.affectsVersionId,
         methodologyPhase: getWaterfallPhase(variantIndex),
         variantSeed: projectVariantSeed,
+        createdAt: lifecycleForStatus.createdAt,
+        resolvedAt: lifecycleForStatus.resolvedAt,
+        dueDate,
+        startDate,
+        assigneeAccountId,
       });
       project.issueCount++;
       state.results.totalIssues++;
@@ -8194,6 +8975,10 @@ async function executeSoftwareSprintStep(config, state, step) {
   const project = state.results.softwareProjects[step.projectIndex];
   if (!project?.key) {
     addChunkedError(state, `Software Project ${step.projectIndex + 1}: skipped sprint ${step.sprintIndex + 1} because the project was not created.`);
+    return;
+  }
+  if (project.reusedExistingDomainData && !project.addVolumeToExistingDomainData) {
+    addChunkedDiagnostics(state, [`Sprint ${project.key}: reused existing domain project data; skipped duplicate sprint creation.`]);
     return;
   }
 
@@ -8304,6 +9089,10 @@ async function executeKanbanBoardPopulationStep(config, state, step) {
     addChunkedError(state, `Software Project ${step.projectIndex + 1}: skipped Kanban board population because the project was not created.`);
     return;
   }
+  if (project.reusedExistingDomainData && !project.addVolumeToExistingDomainData) {
+    addChunkedDiagnostics(state, [`Kanban ${project.key}: reused existing domain project data; skipped duplicate board population.`]);
+    return;
+  }
 
   const softwareTemplate = normaliseSoftwareTemplate(project.softwareTemplate || config.softwareTemplate);
   if (softwareTemplate !== 'kanban') {
@@ -8311,7 +9100,7 @@ async function executeKanbanBoardPopulationStep(config, state, step) {
   }
 
   try {
-    project.boardId = await getBoardId(project.key, 'kanban');
+    project.boardId = project.boardId || await getBoardId(project.key, 'kanban');
 
     if (!project.boardId) {
       addChunkedError(state, `Kanban ${project.key}: native Kanban board was not found, so app-created board fallback was skipped to avoid wiring work to the wrong board.`);
@@ -8319,11 +9108,7 @@ async function executeKanbanBoardPopulationStep(config, state, step) {
     }
 
     const issueRecords = Array.isArray(project.issueRecords) ? project.issueRecords : [];
-    for (const record of issueRecords) {
-      if (record?.key && record.status && record.status !== 'To Do') {
-        await transitionIssue(record.key, record.status);
-      }
-    }
+    addChunkedDiagnostics(state, [`Kanban ${project.key}: skipped duplicate status transition pass; generated issues were already transitioned during issue creation.`]);
 
     if (project.boardId) {
       const boardIssues = await jiraGet(`/rest/agile/1.0/board/${encodeURIComponent(project.boardId)}/issue?jql=${encodeURIComponent(`project = ${project.key} ORDER BY Rank ASC`)}&maxResults=1`);
@@ -8339,6 +9124,138 @@ async function executeKanbanBoardPopulationStep(config, state, step) {
   }
 }
 
+async function createNativeJiraPlan(config, project, state, siteDetails) {
+  const planName = `${config.environmentName} ${project.key} delivery plan`;
+  const issueSourceJql = `project = ${project.key} ORDER BY Rank ASC`;
+  const payloadAttempts = [
+    {
+      label: 'plans-plan-jql',
+      path: '/rest/api/3/plans/plan',
+      body: {
+        name: planName,
+        issueSources: [{
+          type: 'JQL',
+          value: issueSourceJql,
+        }],
+      },
+    },
+    {
+      label: 'plans-plan-project',
+      path: '/rest/api/3/plans/plan',
+      body: {
+        name: planName,
+        issueSources: [{
+          type: 'PROJECT',
+          value: project.id || project.key,
+        }],
+      },
+    },
+  ];
+  const errors = [];
+
+  for (const attempt of payloadAttempts) {
+    try {
+      const created = await jiraPost(attempt.path, attempt.body);
+      const planId = created?.id || created?.planId || null;
+      return {
+        success: true,
+        id: planId,
+        name: created?.name || planName,
+        projectKey: project.key,
+        viewUrl: planId ? buildAtlassianSiteUrl(siteDetails.baseUrl, `/jira/plans/${planId}`) : buildAtlassianSiteUrl(siteDetails.baseUrl, '/jira/plans'),
+        mode: attempt.label,
+      };
+    } catch (err) {
+      errors.push(`${attempt.label}: ${err.message}`);
+    }
+  }
+
+  return {
+    success: false,
+    name: planName,
+    projectKey: project.key,
+    viewUrl: buildAtlassianSiteUrl(siteDetails.baseUrl, '/jira/plans'),
+    message: errors.join(' | '),
+  };
+}
+
+async function executePlanningArtifactsStep(config, state) {
+  const project = (state.results.softwareProjects || []).find(candidate => candidate?.key);
+  if (!project?.key) {
+    addChunkedDiagnostics(state, ['Planning artifacts: skipped because no software project was created.']);
+    return;
+  }
+
+  const siteDetails = await getCurrentSiteDetails().catch(() => ({}));
+  const roadmapUrl = buildAtlassianSiteUrl(siteDetails.baseUrl, `/jira/software/c/projects/${project.key}/timeline`)
+    || buildAtlassianSiteUrl(siteDetails.baseUrl, `/jira/software/c/projects/${project.key}/summary`);
+  const boardUrl = project.boardId
+    ? buildAtlassianSiteUrl(siteDetails.baseUrl, `/jira/software/c/projects/${project.key}/boards/${project.boardId}`)
+    : buildAtlassianSiteUrl(siteDetails.baseUrl, `/jira/software/c/projects/${project.key}/board`);
+  const releaseUrl = buildAtlassianSiteUrl(siteDetails.baseUrl, `/jira/software/c/projects/${project.key}/versions`);
+  const dashboard = (state.results.dashboards || []).find(item => item?.projectKey === project.key);
+  const dashboardUrl = dashboard?.viewUrl ? buildAtlassianSiteUrl(siteDetails.baseUrl, dashboard.viewUrl) : null;
+  const plan = await createNativeJiraPlan(config, project, state, siteDetails);
+
+  state.results.jiraPlans.push(plan);
+  if (plan.success) {
+    addChunkedDiagnostics(state, [`Jira Plan ${project.key}: created "${plan.name}" (${plan.mode}).`]);
+  } else {
+    addChunkedDiagnostics(state, [`Jira Plan ${project.key}: native plan creation was not available through REST; roadmap-ready data remains in Jira. ${plan.message}`]);
+  }
+
+  const roadmapRecord = {
+    projectKey: project.key,
+    name: `${config.environmentName} ${project.key} roadmap`,
+    viewUrl: roadmapUrl,
+    epicCount: (project.epicKeys || []).length,
+    versionCount: (project.versions || []).length,
+    sprintCount: (project.sprints || []).length,
+  };
+  state.results.jiraRoadmaps.push(roadmapRecord);
+
+  const evidenceIssueKeys = [
+    ...(project.epicKeys || []).slice(0, 1),
+    ...(project.issueKeys || []).slice(0, 1),
+  ].filter(Boolean);
+  for (const issueKey of evidenceIssueKeys) {
+    await addIssueComment(issueKey, [
+      `Planning artifact: ${roadmapRecord.name}.`,
+      `Roadmap: ${roadmapUrl || 'Jira project timeline'}.`,
+      `Board: ${boardUrl || 'Jira software board'}.`,
+      `Releases: ${releaseUrl || 'Jira releases page'}.`,
+      dashboardUrl ? `Dashboard: ${dashboardUrl}.` : 'Dashboard: generated project dashboard if selected.',
+      plan.success ? `Native Jira Plan: ${plan.viewUrl || plan.name}.` : 'Native Jira Plan: Jira Cloud did not expose plan creation through the project/issue REST API for this tenant.',
+    ], state.results.diagnostics);
+    if (roadmapUrl) {
+      await addIssueRemoteLink(issueKey, {
+        url: roadmapUrl,
+        title: `${project.key} roadmap`,
+        relationship: 'tracked by',
+        summary: 'Generated Jira roadmap/timeline for this software project.',
+      }, state.results.diagnostics);
+    }
+    if (releaseUrl) {
+      await addIssueRemoteLink(issueKey, {
+        url: releaseUrl,
+        title: `${project.key} releases`,
+        relationship: 'planned in',
+        summary: 'Generated release roadmap with past, current, and upcoming versions.',
+      }, state.results.diagnostics);
+    }
+    if (dashboardUrl) {
+      await addIssueRemoteLink(issueKey, {
+        url: dashboardUrl,
+        title: `${project.key} delivery dashboard`,
+        relationship: 'reported by',
+        summary: 'Generated dashboard for delivery, risk, and release reporting.',
+      }, state.results.diagnostics);
+    }
+  }
+
+  addChunkedDiagnostics(state, [`Jira Roadmap ${project.key}: seeded with ${roadmapRecord.epicCount} epic(s), ${roadmapRecord.versionCount} version(s), and ${roadmapRecord.sprintCount} sprint(s).`]);
+}
+
 async function executeDependencyStep(state, step = {}) {
   const linked = [];
   const failedLinks = [];
@@ -8346,10 +9263,12 @@ async function executeDependencyStep(state, step = {}) {
   const deadlineMs = Date.now() + 18000;
   let skippedAfterLimit = false;
   let attemptedLinks = 0;
+  let evidenceWrites = 0;
+  const evidenceWriteLimit = 10;
   const scope = step.dependencyScope || 'all';
   const shouldRunScope = candidate => scope === 'all' || scope === candidate;
 
-  const linkAndTrack = async (fromKey, toKey, typeName, label) => {
+  const linkAndTrack = async (fromKey, toKey, typeName, label, evidence = {}) => {
     if (attemptedLinks >= maxLinks || Date.now() >= deadlineMs) {
       skippedAfterLimit = true;
       return;
@@ -8359,6 +9278,14 @@ async function executeDependencyStep(state, step = {}) {
     const result = await createIssueLink(fromKey, toKey, typeName);
     if (result.ok) {
       linked.push(label || `${fromKey} ${typeName} ${toKey}`);
+      if (evidenceWrites < evidenceWriteLimit && Date.now() < deadlineMs - 2500) {
+        evidenceWrites += await addRelationshipEvidence(state, {
+          ...evidence,
+          fromKey,
+          toKey,
+          typeName: result.typeName || typeName,
+        });
+      }
     } else {
       failedLinks.push(`${fromKey} -> ${toKey} (${typeName}): ${result.message}`);
     }
@@ -8383,9 +9310,31 @@ async function executeDependencyStep(state, step = {}) {
           }
 
           if (String(current.issueType || '').toLowerCase() === 'bug') {
-            await linkAndTrack(current.key, previous.key, 'Blocks', `Software dependency: defect ${current.key} blocks ${previous.key}.`);
+            await linkAndTrack(
+              current.key,
+              previous.key,
+              'Blocks',
+              `Software dependency: defect ${current.key} blocks ${previous.key}.`,
+              {
+                category: 'software',
+                project,
+                fromRecord: current,
+                toRecord: previous,
+              }
+            );
           } else if (current.epicKey) {
-            await linkAndTrack(current.key, current.epicKey, 'Relates', `Software traceability: ${current.key} relates to epic ${current.epicKey}.`);
+            await linkAndTrack(
+              current.key,
+              current.epicKey,
+              'Relates',
+              `Software traceability: ${current.key} relates to epic ${current.epicKey}.`,
+              {
+                category: 'software',
+                project,
+                fromRecord: current,
+                toRecord: { key: current.epicKey, title: 'parent epic' },
+              }
+            );
           } else if (isKanbanProject) {
             const relationType = index % 2 === 0 ? 'Relates' : 'Blocks';
             await linkAndTrack(
@@ -8394,10 +9343,27 @@ async function executeDependencyStep(state, step = {}) {
               relationType,
               relationType === 'Blocks'
                 ? `Kanban flow dependency: ${previous.key} blocks ${current.key}.`
-                : `Kanban flow relationship: ${current.key} relates to ${previous.key}.`
+                : `Kanban flow relationship: ${current.key} relates to ${previous.key}.`,
+              {
+                category: 'software',
+                project,
+                fromRecord: relationType === 'Blocks' ? previous : current,
+                toRecord: relationType === 'Blocks' ? current : previous,
+              }
             );
           } else if (index % 3 === 0) {
-            await linkAndTrack(current.key, previous.key, 'Relates', `Software dependency: ${current.key} relates to ${previous.key}.`);
+            await linkAndTrack(
+              current.key,
+              previous.key,
+              'Relates',
+              `Software dependency: ${current.key} relates to ${previous.key}.`,
+              {
+                category: 'software',
+                project,
+                fromRecord: current,
+                toRecord: previous,
+              }
+            );
           }
         }
       }
@@ -8408,7 +9374,12 @@ async function executeDependencyStep(state, step = {}) {
       const secondSoftwareIssue = state.results.softwareProjects[1]?.firstIssueKey;
 
       if (firstSoftwareIssue && secondSoftwareIssue) {
-        await linkAndTrack(firstSoftwareIssue, secondSoftwareIssue, 'Blocks', `Cross-project software dependency: ${firstSoftwareIssue} blocks ${secondSoftwareIssue}.`);
+        await linkAndTrack(firstSoftwareIssue, secondSoftwareIssue, 'Blocks', `Cross-project software dependency: ${firstSoftwareIssue} blocks ${secondSoftwareIssue}.`, {
+          category: 'software',
+          project: state.results.softwareProjects[0],
+          fromRecord: { key: firstSoftwareIssue, title: 'cross-project delivery work' },
+          toRecord: { key: secondSoftwareIssue, title: 'dependent delivery work' },
+        });
       }
     }
 
@@ -8445,7 +9416,12 @@ async function executeDependencyStep(state, step = {}) {
           }
 
           linkedPairs.add(pairKey);
-          await linkAndTrack(fromItem.key, toItem.key, typeName, labelBuilder(fromItem.key, toItem.key));
+          await linkAndTrack(fromItem.key, toItem.key, typeName, labelBuilder(fromItem.key, toItem.key), {
+            category: 'itsm',
+            project: jsmProject,
+            fromRecord: fromItem,
+            toRecord: toItem,
+          });
         }
       };
 
@@ -8484,7 +9460,12 @@ async function executeDependencyStep(state, step = {}) {
       const firstSoftwareIssue = state.results.softwareProjects[0]?.firstIssueKey;
 
       if (firstIncident && firstSoftwareIssue) {
-        await linkAndTrack(firstSoftwareIssue, firstIncident, 'Blocks', `DevOps relationship: software issue ${firstSoftwareIssue} blocks incident ${firstIncident}.`);
+        await linkAndTrack(firstSoftwareIssue, firstIncident, 'Blocks', `DevOps relationship: software issue ${firstSoftwareIssue} blocks incident ${firstIncident}.`, {
+          category: 'software',
+          project: state.results.softwareProjects[0],
+          fromRecord: { key: firstSoftwareIssue, title: 'software remediation work' },
+          toRecord: { key: firstIncident, title: 'customer-impacting incident' },
+        });
       }
     }
 
@@ -8493,6 +9474,9 @@ async function executeDependencyStep(state, step = {}) {
     }
     if (skippedAfterLimit) {
       addChunkedDiagnostics(state, [`Dependency linking stopped after ${attemptedLinks} attempted link(s), ${linked.length} successful, to stay inside the Forge 25-second resolver limit.`]);
+    }
+    if (evidenceWrites > 0) {
+      addChunkedDiagnostics(state, [`Relationship evidence: added ${evidenceWrites} comment/reference link artifact(s) across generated work items.`]);
     }
     if (failedLinks.length > 0) {
       addChunkedDiagnostics(state, [
@@ -9235,6 +10219,92 @@ function calculateAverageResolutionDays(issues, config = {}) {
   return Math.round((totalDays / resolvedIssues.length) * 10) / 10;
 }
 
+function getIssueResolutionDays(issue, config = {}) {
+  const createdAt = getDemoCreatedDate(issue, config);
+  const resolvedAt = getDashboardResolvedDate(issue, config);
+  return getWholeDaysBetween(createdAt, resolvedAt);
+}
+
+function calculateSlaCompliancePercent(issues, config = {}) {
+  const today = new Date().toISOString().split('T')[0];
+  const measurable = (issues || []).filter(issue => issue.fields?.duedate);
+  if (measurable.length === 0) {
+    return null;
+  }
+
+  const compliant = measurable.filter(issue => {
+    const dueDate = issue.fields?.duedate;
+    const isDone = issue.fields?.status?.statusCategory?.key === 'done';
+    if (isDone) {
+      const resolvedAt = getDashboardResolvedDate(issue, config);
+      return resolvedAt ? resolvedAt <= dueDate : true;
+    }
+    return dueDate >= today;
+  }).length;
+
+  return Math.round((compliant / measurable.length) * 100);
+}
+
+function calculateFirstContactResolutionRate(issues, config = {}) {
+  const eligible = (issues || []).filter(issue => {
+    const typeName = String(issue.fields?.issuetype?.name || '').toLowerCase();
+    return (
+      issue.fields?.status?.statusCategory?.key === 'done' &&
+      (typeName.includes('incident') || typeName.includes('service request') || typeName.includes('request'))
+    );
+  });
+
+  if (eligible.length === 0) {
+    return null;
+  }
+
+  const firstContact = eligible.filter(issue => {
+    const resolutionDays = getIssueResolutionDays(issue, config);
+    const priority = issue.fields?.priority?.name || '';
+    const thresholdDays = ['Highest', 'High', 'Critical'].includes(priority) ? 1 : 3;
+    return resolutionDays !== null && resolutionDays <= thresholdDays;
+  }).length;
+
+  return Math.round((firstContact / eligible.length) * 100);
+}
+
+function calculateCustomerSatisfactionScore(issues, config = {}) {
+  if (!issues || issues.length === 0) {
+    return null;
+  }
+
+  const slaCompliance = calculateSlaCompliancePercent(issues, config) ?? 75;
+  const firstContactRate = calculateFirstContactResolutionRate(issues, config) ?? 65;
+  const averageResolutionDays = calculateAverageResolutionDays(issues, config) ?? 10;
+  const highPriorityOpen = issues.filter(issue => (
+    issue.fields?.status?.statusCategory?.key !== 'done' &&
+    ['Highest', 'High', 'Critical'].includes(issue.fields?.priority?.name || '')
+  )).length;
+  const highPriorityPenalty = Math.min(0.5, highPriorityOpen * 0.04);
+  const resolutionPenalty = Math.min(0.6, averageResolutionDays / 60);
+  const score = 3.1
+    + (slaCompliance / 100) * 1.0
+    + (firstContactRate / 100) * 0.6
+    - resolutionPenalty
+    - highPriorityPenalty;
+
+  return Math.round(Math.max(2.8, Math.min(4.9, score)) * 10) / 10;
+}
+
+function buildServiceSummaryMetrics(issues, config = {}) {
+  const averageResolutionDays = calculateAverageResolutionDays(issues, config);
+  const slaCompliance = calculateSlaCompliancePercent(issues, config);
+  const firstContactRate = calculateFirstContactResolutionRate(issues, config);
+  const customerSatisfactionScore = calculateCustomerSatisfactionScore(issues, config);
+
+  return {
+    averageResolutionDays,
+    slaCompliance,
+    firstContactRate,
+    customerSatisfactionScore,
+  };
+}
+
 function buildDashboardKpiCards(config, issues) {
   const total = issues.length;
   const done = issues.filter(issue => issue.fields?.status?.statusCategory?.key === 'done').length;
@@ -9256,13 +10326,18 @@ function buildDashboardKpiCards(config, issues) {
   const defectRate = total === 0 ? 0 : Math.round((defects / total) * 100);
   const openDefectRate = total === 0 ? 0 : Math.round((openDefects / total) * 100);
   const flowEfficiency = total === 0 ? 0 : Math.round((done / Math.max(done + inProgress + open, 1)) * 100);
+  const onTimeDelivery = Math.max(0, 100 - breachRate);
+  const serviceMetrics = buildServiceSummaryMetrics(issues, config);
+  const slaCompliance = serviceMetrics.slaCompliance ?? onTimeDelivery;
+  const firstContactRate = serviceMetrics.firstContactRate ?? resolutionRate;
+  const customerSatisfactionScore = serviceMetrics.customerSatisfactionScore;
   const projectHealthScore = Math.max(0, Math.min(100, 100 - breachRate - Math.round(highPriorityRate / 2) - Math.round(openDefectRate / 2)));
   const releaseSuccess = Math.max(0, 100 - openDefectRate - Math.round(breachRate / 2));
-  const onTimeDelivery = Math.max(0, 100 - breachRate);
   const valueByKpi = {
-    'sla compliance %': { value: `${onTimeDelivery}%`, detail: `${overdue} open ticket(s) past due` },
-    'sla achievement %': { value: `${onTimeDelivery}%`, detail: `${overdue} ticket(s) currently breaching due date` },
-    'response sla %': { value: `${onTimeDelivery}%`, detail: 'Open due-date risk proxy' },
+    'sla compliance %': { value: `${slaCompliance}%`, detail: 'Due date compared with generated resolved/open state' },
+    'sla compliance': { value: `${slaCompliance}%`, detail: 'Due date compared with generated resolved/open state' },
+    'sla achievement %': { value: `${slaCompliance}%`, detail: `${overdue} ticket(s) currently breaching due date` },
+    'response sla %': { value: `${slaCompliance}%`, detail: 'Generated lifecycle and due-date proxy' },
     'resolution sla %': { value: `${resolutionRate}%`, detail: 'Done work / total work' },
     'breach %': { value: `${breachRate}%`, detail: 'Open work past due' },
     'sla breach %': { value: `${breachRate}%`, detail: 'Open work past due' },
@@ -9306,10 +10381,14 @@ function buildDashboardKpiCards(config, issues) {
     'escalation %': { value: `${highPriorityRate}%`, detail: 'High priority / total work' },
     'escalation rate': { value: `${highPriorityRate}%`, detail: 'High priority / total work' },
     'major incident frequency': { value: criticalPriority, detail: 'Critical/highest priority work' },
-    'csat score': { value: 'N/A', detail: 'CSAT field is not captured in generated tickets' },
-    csat: { value: 'N/A', detail: 'CSAT field is not captured in generated tickets' },
+    'customer satisfaction': { value: customerSatisfactionScore === null ? 'N/A' : `${customerSatisfactionScore}/5`, detail: 'Generated from SLA, first-contact, and custom date resolution data' },
+    'customer satisfaction score': { value: customerSatisfactionScore === null ? 'N/A' : `${customerSatisfactionScore}/5`, detail: 'Generated from SLA, first-contact, and custom date resolution data' },
+    'csat score': { value: customerSatisfactionScore === null ? 'N/A' : `${customerSatisfactionScore}/5`, detail: 'Generated from SLA, first-contact, and custom date resolution data' },
+    csat: { value: customerSatisfactionScore === null ? 'N/A' : `${customerSatisfactionScore}/5`, detail: 'Generated from SLA, first-contact, and custom date resolution data' },
+    'first contact resolution rate': { value: `${firstContactRate}%`, detail: 'Resolved incident/request work within first-contact threshold' },
+    'first contact resolution %': { value: `${firstContactRate}%`, detail: 'Resolved incident/request work within first-contact threshold' },
     'service availability %': { value: 'N/A', detail: 'Availability telemetry is not captured in Jira tickets' },
-    'service satisfaction score': { value: 'N/A', detail: 'CSAT field is not captured in generated tickets' },
+    'service satisfaction score': { value: customerSatisfactionScore === null ? 'N/A' : `${customerSatisfactionScore}/5`, detail: 'Generated demo satisfaction score from ticket lifecycle data' },
     'portal adoption %': { value: 'N/A', detail: 'Portal analytics are not captured by this generator' },
     'knowledge deflection %': { value: 'N/A', detail: 'Requires portal/search analytics' },
     'article usefulness %': { value: 'N/A', detail: 'Requires knowledge feedback analytics' },
@@ -9339,7 +10418,6 @@ function buildDashboardDataNotes(config) {
   }
 
   const unsupportedSignals = [
-    'csat',
     'service availability',
     'portal',
     'knowledge deflection',
@@ -9396,6 +10474,7 @@ function buildDemoInsightsResponse(config, issues, projects = []) {
     priorityCounts: countIssuesByField(issues, 'priority', 'None'),
     issueTypeCounts: countIssuesByField(issues, 'issuetype', 'Issue'),
     kpiCards: buildDashboardKpiCards(config, issues),
+    serviceMetrics: buildServiceSummaryMetrics(issues, config),
     dataNotes: buildDashboardDataNotes(config),
     overdueByProject: countOverdueIssuesByProject(issues),
     averageTimeInStatus: buildAverageTimeInStatus(issues, config),
@@ -9442,6 +10521,108 @@ resolver.define('getDemoDashboardGadgetData', async ({ payload }) => {
       message: err.message,
     };
   }
+});
+
+resolver.define('getBusinessDomainInventory', async ({ payload }) => {
+  const rawIndustry = String(payload?.industry || '').trim();
+  const rawCustomIndustry = String(payload?.customIndustry || '').trim();
+  const isCustomIndustry = Boolean(payload?.isCustomIndustry || rawIndustry.toLowerCase() === 'other' || rawIndustry.toLowerCase() === 'others');
+  const domain = isCustomIndustry ? (rawCustomIndustry || rawIndustry) : rawIndustry;
+
+  if (!domain) {
+    return {
+      success: false,
+      message: 'Select a business domain to check existing Jira data.',
+      projects: [],
+    };
+  }
+
+  try {
+    const requestedSpaceType = String(payload?.spaceType || '').trim();
+    const projects = await searchDomainProjects(domain, { spaceType: requestedSpaceType });
+    const serviceProjects = projects.filter(project => project.kind === 'business');
+    const softwareProjects = projects.filter(project => project.kind === 'software');
+    const businessProjects = projects.filter(project => project.kind === 'business-project');
+    const productDiscoveryProjects = projects.filter(project => project.kind === 'product-discovery');
+    return {
+      success: true,
+      domain,
+      spaceType: requestedSpaceType,
+      projects,
+      serviceProjects,
+      softwareProjects,
+      businessProjects,
+      productDiscoveryProjects,
+      summary: projects.length
+        ? `${projects.length} existing ${domain}${requestedSpaceType ? ' matching' : ''} project(s) found. Select one to add volume, delete, or add a new project below.`
+        : `No existing ${domain}${requestedSpaceType ? ' matching' : ''} project found for this selection yet.`,
+    };
+  } catch (err) {
+    return {
+      success: false,
+      domain,
+      message: `Existing domain lookup failed: ${err.message}`,
+      projects: [],
+      serviceProjects: [],
+      softwareProjects: [],
+    };
+  }
+});
+
+resolver.define('deleteBusinessDomainProjects', async ({ payload }) => {
+  const projectKeys = Array.isArray(payload?.projectKeys)
+    ? [...new Set(payload.projectKeys.map(key => String(key || '').trim()).filter(Boolean))]
+    : [];
+
+  if (projectKeys.length === 0) {
+    return {
+      success: false,
+      summary: 'Select at least one project to delete.',
+      deleted: [],
+      errors: [],
+    };
+  }
+
+  if (projectKeys.length > 25) {
+    return {
+      success: false,
+      summary: 'For safety, delete 25 or fewer projects at a time.',
+      deleted: [],
+      errors: [],
+    };
+  }
+
+  const access = await validateAdminAccess();
+  if (!access.ok) {
+    return {
+      success: false,
+      summary: access.message,
+      deleted: [],
+      errors: [],
+    };
+  }
+
+  const deleted = [];
+  const errors = [];
+
+  for (const projectKey of projectKeys) {
+    try {
+      await jiraDelete(`/rest/api/3/project/${encodeURIComponent(projectKey)}`);
+      deleted.push(projectKey);
+    } catch (err) {
+      errors.push(`${projectKey}: ${err.message}`);
+    }
+  }
+
+  return {
+    success: errors.length === 0,
+    deleted,
+    errors,
+    summary: [
+      deleted.length ? `Deleted ${deleted.length} project(s): ${deleted.join(', ')}` : 'No projects were deleted.',
+      errors.length ? `Skipped ${errors.length} project(s): ${errors.join('; ')}` : '',
+    ].filter(Boolean).join('\n'),
+  };
 });
 
 resolver.define('getProjectInsightsData', async ({ payload }) => {
@@ -9621,6 +10802,8 @@ function buildChunkedSummary(config, state) {
   const dashboards = results.dashboards?.filter(Boolean) || [];
   const savedFilters = results.savedFilters?.filter(Boolean) || [];
   const reports = results.reports?.filter(Boolean) || [];
+  const jiraPlans = results.jiraPlans?.filter(Boolean) || [];
+  const jiraRoadmaps = results.jiraRoadmaps?.filter(Boolean) || [];
   const confluenceSpaces = results.confluenceSpaces?.filter(space => space?.success) || [];
   const githubActivity = results.githubActivity?.filter(Boolean) || [];
   const compassComponents = results.compassComponents?.filter(Boolean) || [];
@@ -9678,12 +10861,13 @@ function buildChunkedSummary(config, state) {
     `- Dashboard Template: ${results.dashboardTemplateId || 'Generated gadget layout'}`,
     `- Saved Filters: ${savedFilters.length > 0 ? `${savedFilters.length} auto-created` : 'Auto-created filter not available'}`,
     `- Report Filters: ${reports.length > 0 ? `${reports.length} auto-created` : 'Not created'}`,
+    `- Jira Plans: ${jiraPlans.length > 0 ? `${jiraPlans.filter(plan => plan.success).length} native plan(s) created, ${jiraRoadmaps.length} roadmap seed(s) prepared` : 'Not created'}`,
     `- Knowledge Bases: ${confluenceSpaces.length > 0 ? `${confluenceSpaces.length} Confluence space(s) created` : 'Not created'}`,
     `- GitHub Development Activity: ${githubActivity.length > 0 ? `${githubActivity.length} linked branch/commit/PR/deployment item(s) created` : 'Not created or not configured'}`,
     `- Jira Project Components: ${softwareComponents.length > 0 ? `${softwareComponents.length} created and assigned to generated software issues` : 'Not created'}`,
     `- Compass Components: ${compassComponents.length > 0 ? `${compassComponents.length} created, ${linkedCompassComponents.length} linked to work items, ${repositoryLinkedCompassComponents.length} repository link(s), ${dependencyLinkedCompassComponents.length} dependency link(s), ${ownedCompassComponents.length} owner assignment(s)` : 'Not created or not configured'}`,
     `- Goal Work Items: ${projectGoals.length > 0 ? `${projectGoals.length} Jira work item(s) created with goal labels` : 'Not created'}`,
-    `- Native Atlassian Goals: ${atlassianGoals.length > 0 ? `${atlassianGoals.length} created, ${linkedAtlassianGoals.length} linked through Jira Goals field, ${atlassianGoals.filter(goal => goal.statusUpdated).length} status update(s) applied` : 'Not created or not configured'}`,
+    `- Native Atlassian Goals: ${atlassianGoals.length > 0 ? `${atlassianGoals.length} created, ${linkedAtlassianGoals.length} linked through Jira Goals field, ${atlassianGoals.filter(goal => goal.statusUpdated).length} status update(s) applied with varied target progress` : 'Not created or not configured'}`,
     `- Dashboard Filter Wiring: ${dashboards.length > 0 && dashboards.every(dashboard => dashboard.filterApplied) ? 'Applied automatically' : 'Needs verification'}`,
     '',
   ];
@@ -9781,6 +10965,17 @@ function buildChunkedSummary(config, state) {
     lines.push('');
   }
 
+  if (jiraPlans.length > 0 || jiraRoadmaps.length > 0) {
+    lines.push('Jira Plans / Roadmaps:');
+    for (const plan of jiraPlans) {
+      lines.push(`- ${plan.projectKey}: ${plan.name} (${plan.success ? 'created' : 'native plan API unavailable'})${plan.viewUrl ? ` - ${plan.viewUrl}` : ''}`);
+    }
+    for (const roadmap of jiraRoadmaps) {
+      lines.push(`- ${roadmap.projectKey}: ${roadmap.name} (${roadmap.epicCount} epics, ${roadmap.versionCount} versions, ${roadmap.sprintCount} sprints)${roadmap.viewUrl ? ` - ${roadmap.viewUrl}` : ''}`);
+    }
+    lines.push('');
+  }
+
   if (githubActivity.length > 0) {
     lines.push('GitHub Development Activity Created:');
     lines.push(...githubActivity.slice(0, 20).map(record => (
@@ -9828,7 +11023,7 @@ function buildChunkedSummary(config, state) {
   if (atlassianGoals.length > 0) {
     lines.push('Atlassian Goals Created:');
     lines.push(...atlassianGoals.slice(0, 20).map(goal => (
-      `- ${goal.projectKey}: ${goal.name} (target ${goal.targetDate}; status ${goal.statusUpdated ? goal.statusLabel : 'PENDING'})${goal.nativeLinked ? ` linked to ${goal.linkedIssueType || 'work item'} ${goal.linkedIssueKey}` : ' not linked to Jira Goals field'}`
+      `- ${goal.projectKey}: ${goal.name} (target ${goal.targetDate}; status ${goal.statusUpdated ? goal.statusLabel : 'PENDING'}; progress target ${goal.progressPercent || goal.score || 0}%)${goal.nativeLinked ? ` linked to ${goal.linkedIssueType || 'work item'} ${goal.linkedIssueKey}` : ' not linked to Jira Goals field'}`
     )));
     if (atlassianGoals.length > 20) {
       lines.push(`- ...and ${atlassianGoals.length - 20} more goal(s).`);
@@ -10017,6 +11212,9 @@ resolver.define('executeDemoEnvironmentStep', async ({ payload }) => {
       break;
     case 'create-github-development-activity':
       await executeGitHubDevelopmentActivityStep(config, state, step);
+      break;
+    case 'create-planning-artifacts':
+      await executePlanningArtifactsStep(config, state);
       break;
     case 'prepare-dashboard-catalog':
       await executeDashboardCatalogStep(config, state);

@@ -1,7 +1,28 @@
 import React, { useEffect, useState } from 'react';
 import { invoke, router, view } from '@forge/bridge';
 
-const industries = ['Banking', 'Healthcare', 'Retail', 'Insurance', 'Telecom', 'E-commerce', 'SaaS', 'Manufacturing'];
+const industries = ['Banking', 'Healthcare', 'Insurance', 'Telecom', 'Retail', 'Manufacturing', 'SaaS', 'Public Sector', 'Education', 'Energy & Utilities'];
+const jsmServiceTypeOptions = ['ITSM', 'HRSM', 'CSM'];
+const spaceTypeOptions = [
+  { value: 'jpd:product-discovery', label: 'Jira Product Discovery', group: 'Product Management' },
+  { value: 'business:task-tracking', label: 'Task Tracking', group: 'Business Projects / Work Management' },
+  { value: 'business:budget-planning', label: 'Budget Planning', group: 'Business Projects / Work Management' },
+  { value: 'business:recruitment-tracking', label: 'Recruitment Management', group: 'Business Projects / Work Management' },
+  { value: 'business:procurement-management', label: 'Procurement Management', group: 'Business Projects / Work Management' },
+  { value: 'jsm:ITSM', label: 'IT Service Management', group: 'Jira Service Management' },
+  { value: 'jsm:HRSM', label: 'HR Service Management', group: 'Jira Service Management' },
+  { value: 'jsm:CSM', label: 'Customer Service Management', group: 'Jira Service Management' },
+  { value: 'software:scrum', label: 'Software Project - Scrum', group: 'Jira Software Projects' },
+  { value: 'software:kanban', label: 'Software Project - Kanban', group: 'Jira Software Projects' },
+];
+const groupedSpaceTypeOptions = spaceTypeOptions.reduce((groups, option) => {
+  if (!groups[option.group]) {
+    groups[option.group] = [];
+  }
+  groups[option.group].push(option);
+  return groups;
+}, {});
+const DEFAULT_DEMO_ISSUE_COUNT = 60;
 
 const opsDashboardOptions = [
   {
@@ -1123,6 +1144,43 @@ function DashboardGadget({ context, source = 'dashboard' }) {
       return Math.max(0, Math.round((end - start) / 86400000));
     }).filter(value => value !== null);
     const avgResolutionDays = durations.length === 0 ? 0 : Math.round(durations.reduce((sum, value) => sum + value, 0) / durations.length);
+    const getIssueDurationDays = issue => {
+      const start = issue.createdAt ? new Date(`${issue.createdAt}T00:00:00`) : null;
+      const end = issue.resolvedAt ? new Date(`${issue.resolvedAt}T00:00:00`) : null;
+      if (!start || !end || Number.isNaN(start.getTime()) || Number.isNaN(end.getTime())) return null;
+      return Math.max(0, Math.round((end - start) / 86400000));
+    };
+    const isWithinSla = issue => {
+      if (!issue.dueDate) return true;
+      if (issue.status === 'Done') {
+        return !issue.resolvedAt || issue.resolvedAt <= issue.dueDate;
+      }
+      return issue.dueDate >= (config.generatedAt || new Date().toISOString().split('T')[0]);
+    };
+    const slaMeasurableIssues = filteredIssues.filter(issue => issue.dueDate);
+    const slaComplianceRate = slaMeasurableIssues.length === 0
+      ? 0
+      : Math.round((slaMeasurableIssues.filter(isWithinSla).length / slaMeasurableIssues.length) * 100);
+    const firstContactEligibleIssues = doneIssues.filter(issue => {
+      const typeName = String(issue.issueType || '').toLowerCase();
+      return typeName.includes('incident') || typeName.includes('service request') || typeName.includes('request');
+    });
+    const firstContactResolvedIssues = firstContactEligibleIssues.filter(issue => {
+      const resolutionDays = getIssueDurationDays(issue);
+      const thresholdDays = ['Critical', 'Highest', 'High'].includes(issue.priority) ? 1 : 3;
+      return resolutionDays !== null && resolutionDays <= thresholdDays;
+    });
+    const firstContactRate = firstContactEligibleIssues.length === 0
+      ? 0
+      : Math.round((firstContactResolvedIssues.length / firstContactEligibleIssues.length) * 100);
+    const customerSatisfactionScore = (() => {
+      if (filteredIssues.length === 0) return 0;
+      const highPriorityOpen = filteredIssues.filter(issue => issue.status !== 'Done' && ['Critical', 'Highest', 'High'].includes(issue.priority)).length;
+      const resolutionPenalty = Math.min(0.6, avgResolutionDays / 60);
+      const priorityPenalty = Math.min(0.5, highPriorityOpen * 0.04);
+      const score = 3.1 + (slaComplianceRate / 100) * 1.0 + (firstContactRate / 100) * 0.6 - resolutionPenalty - priorityPenalty;
+      return Math.round(Math.max(2.8, Math.min(4.9, score)) * 10) / 10;
+    })();
     const median = values => {
       if (!values.length) return 0;
       const sorted = [...values].sort((a, b) => a - b);
@@ -1140,12 +1198,12 @@ function DashboardGadget({ context, source = 'dashboard' }) {
       return { name: priority.name, count: median(ages) };
     });
     const slaItems = [
-      { name: 'Within SLA', count: Math.max(0, filteredIssues.length - highPriorityIssues.length) },
-      { name: 'At risk', count: highPriorityIssues.length },
+      { name: 'Within SLA', count: slaComplianceRate },
+      { name: 'At risk or breached', count: Math.max(0, 100 - slaComplianceRate) },
     ];
     const firstContactItems = [
-      { name: 'Resolved', count: doneIssues.length },
-      { name: 'Open', count: openIssues.length },
+      { name: 'First contact', count: firstContactRate },
+      { name: 'Follow-up needed', count: Math.max(0, 100 - firstContactRate) },
     ];
     const recentIssues = [...filteredIssues].sort((a, b) => String(b.resolvedAt || b.createdAt || '').localeCompare(String(a.resolvedAt || a.createdAt || ''))).slice(0, 4);
     const baseTrendItems = data.createdResolvedTrend || [];
@@ -1287,17 +1345,47 @@ function DashboardGadget({ context, source = 'dashboard' }) {
     };
     const lineChart = (title, yAxis, xAxis, color, useResolved) => {
       const trend = summaryTrendItems.slice(-8);
-      const maxValue = Math.max(...trend.map(item => Math.max(item.created || 0, item.resolved || 0)), avgResolutionDays || 1, 1);
+      const metricMode = typeof useResolved === 'string'
+        ? useResolved
+        : useResolved
+          ? 'resolution-time'
+          : 'created-count';
+      const bucketIssues = bucket => filteredIssues.filter(issue => (
+        getSummaryTrendKey(metricMode === 'resolution-time' ? issue.resolvedAt : issue.createdAt) === bucket.key
+      ));
+      const bucketMetric = bucket => {
+        const scopedIssues = bucketIssues(bucket);
+        if (metricMode === 'satisfaction') {
+          if (scopedIssues.length === 0) return customerSatisfactionScore;
+          const scopedSla = scopedIssues.filter(isWithinSla).length / Math.max(scopedIssues.length, 1);
+          const scopedDone = scopedIssues.filter(issue => issue.status === 'Done').length / Math.max(scopedIssues.length, 1);
+          return Math.round(Math.max(2.8, Math.min(4.9, 3.0 + scopedSla + (scopedDone * 0.6))) * 10) / 10;
+        }
+        if (metricMode === 'resolution-time') {
+          const scopedDurations = scopedIssues.map(getIssueDurationDays).filter(value => value !== null);
+          return scopedDurations.length === 0
+            ? avgResolutionDays
+            : Math.round(scopedDurations.reduce((sum, value) => sum + value, 0) / scopedDurations.length);
+        }
+        return metricMode === 'resolved-count' ? bucket.resolved || 0 : bucket.created || 0;
+      };
+      const metricValues = trend.map(bucketMetric);
+      const maxValue = Math.max(...metricValues, metricMode === 'satisfaction' ? 5 : avgResolutionDays || 1, 1);
       const pointData = trend.map((item, index) => {
         const x = trend.length === 1 ? 8 : 8 + ((index / (trend.length - 1)) * 84);
-        const metric = useResolved ? item.resolved || 0 : item.created || 0;
+        const metric = metricValues[index] || 0;
         const y = 92 - ((metric / maxValue) * 76);
+        const metricLabel = metricMode === 'satisfaction'
+          ? `${metric}/5`
+          : metricMode === 'resolution-time'
+            ? `${metric} day${metric === 1 ? '' : 's'}`
+            : formatSummaryValue(metric);
         return {
           x,
           y,
           metric,
           name: item.name,
-          label: `${title}\n${xAxis}: ${item.name}\n${yAxis}: ${formatSummaryValue(metric)}${useResolved ? `\nAverage time to resolution: ${avgResolutionDays} day${avgResolutionDays === 1 ? '' : 's'}` : ''}`,
+          label: `${title}\n${xAxis}: ${item.name}\n${yAxis}: ${metricLabel}${metricMode === 'resolution-time' ? `\nOverall average time to resolution: ${avgResolutionDays} day${avgResolutionDays === 1 ? '' : 's'}` : ''}`,
         };
       });
       const points = pointData.map(point => `${point.x},${point.y}`).join(' ');
@@ -1374,8 +1462,8 @@ function DashboardGadget({ context, source = 'dashboard' }) {
           <button type="button" onClick={resetSummaryFilters} style={{ border: 0, background: 'transparent', color: '#5e6c84', fontSize: '12px', marginLeft: '4px', cursor: 'pointer', padding: '6px 4px' }}>Reset to default</button>
         </div>
         <div style={{ padding: '22px 16px', background: '#ffffff', display: 'grid', gridTemplateColumns: 'repeat(2, minmax(0, 1fr))', gap: '16px' }}>
-          {lineChart('Customer satisfaction', 'Average satisfaction rating', 'Work item resolution date', '#6554c0', false)}
-          {lineChart('Average time to resolution', 'Average elapsed time in seconds', 'Work item resolution date', '#0052cc', true)}
+          {lineChart('Customer satisfaction', 'Average satisfaction rating', 'Generated lifecycle date', '#6554c0', 'satisfaction')}
+          {lineChart('Average time to resolution', 'Average elapsed time in days', 'Work item resolution date', '#0052cc', 'resolution-time')}
           {barChart('First contact resolution rate', firstContactItems, '% of work items resolved on first contact', 'Request types', '#0052cc', { tall: true })}
           {barChart('Unresolved work items by request types', issueTypeItems, 'Request types', 'Count of work items', '#0052cc', { horizontal: true, tall: true })}
           {stackedChart()}
@@ -1403,24 +1491,57 @@ function DashboardGadget({ context, source = 'dashboard' }) {
     const incidentIssues = issues.filter(issue => String(issue.issueType || '').toLowerCase().includes('incident') || String(issue.issueType || '').toLowerCase().includes('bug'));
     const problemIssues = issues.filter(issue => String(issue.issueType || '').toLowerCase().includes('problem'));
     const changeIssues = issues.filter(issue => String(issue.issueType || '').toLowerCase().includes('change'));
+    const serviceMetrics = data.serviceMetrics || {};
+    const getResolutionDays = issue => {
+      const start = issue.createdAt ? new Date(`${issue.createdAt}T00:00:00`) : null;
+      const end = issue.resolvedAt ? new Date(`${issue.resolvedAt}T00:00:00`) : null;
+      if (!start || !end || Number.isNaN(start.getTime()) || Number.isNaN(end.getTime())) return null;
+      return Math.max(0, Math.round((end - start) / 86400000));
+    };
+    const isWithinSla = issue => {
+      if (!issue.dueDate) return true;
+      if (issue.status === 'Done') {
+        return !issue.resolvedAt || issue.resolvedAt <= issue.dueDate;
+      }
+      return issue.dueDate >= (config.generatedAt || new Date().toISOString().split('T')[0]);
+    };
+    const slaMeasuredIssues = issues.filter(issue => issue.dueDate);
+    const slaMetCount = slaMeasuredIssues.filter(isWithinSla).length;
+    const slaBreachedCount = Math.max(0, slaMeasuredIssues.length - slaMetCount);
+    const slaComplianceRate = serviceMetrics.slaCompliancePercent ?? (slaMeasuredIssues.length === 0 ? 0 : Math.round((slaMetCount / slaMeasuredIssues.length) * 100));
+    const firstContactRate = serviceMetrics.firstContactResolutionRate ?? (() => {
+      const eligible = doneIssues.filter(issue => {
+        const typeName = String(issue.issueType || '').toLowerCase();
+        return typeName.includes('incident') || typeName.includes('service request') || typeName.includes('request');
+      });
+      const resolvedFast = eligible.filter(issue => {
+        const duration = getResolutionDays(issue);
+        return duration !== null && duration <= (['Highest', 'Critical', 'High'].includes(issue.priority) ? 1 : 3);
+      });
+      return eligible.length === 0 ? 0 : Math.round((resolvedFast.length / eligible.length) * 100);
+    })();
+    const customerSatisfactionScore = serviceMetrics.customerSatisfactionScore ?? (() => {
+      if (issues.length === 0) return 0;
+      const durations = doneIssues.map(getResolutionDays).filter(value => value !== null);
+      const average = durations.length === 0 ? 0 : durations.reduce((sum, value) => sum + value, 0) / durations.length;
+      const score = 3.2 + (slaComplianceRate / 100) * 0.9 + (firstContactRate / 100) * 0.5 - Math.min(0.7, average / 50);
+      return Math.round(Math.max(2.8, Math.min(4.9, score)) * 10) / 10;
+    })();
     const avgResolutionDays = (() => {
-      const durations = doneIssues
-        .map(issue => {
-          const start = issue.createdAt ? new Date(`${issue.createdAt}T00:00:00`) : null;
-          const end = issue.resolvedAt ? new Date(`${issue.resolvedAt}T00:00:00`) : null;
-          if (!start || !end || Number.isNaN(start.getTime()) || Number.isNaN(end.getTime())) return null;
-          return Math.max(0, Math.round((end - start) / 86400000));
-        })
-        .filter(value => value !== null);
+      if (serviceMetrics.averageTimeToResolutionDays !== undefined) return `${serviceMetrics.averageTimeToResolutionDays}d`;
+      const durations = doneIssues.map(getResolutionDays).filter(value => value !== null);
       return durations.length === 0 ? 'N/A' : `${Math.round(durations.reduce((sum, value) => sum + value, 0) / durations.length)}d`;
     })();
+    const deflectedRate = issues.length === 0
+      ? 0
+      : Math.round(Math.min(72, Math.max(18, ((serviceRequestIssues.length + problemIssues.length) / Math.max(issues.length, 1)) * 100 + 12)));
     const reportCatalog = [
       {
         section: 'Default',
         reports: [
           { id: 'workload', title: 'Workload', value: openIssues.length, type: 'bars', detail: 'Open work by assignee from generated Jira data.' },
-          { id: 'satisfaction', title: 'Satisfaction', value: 'N/A', type: 'rating', detail: 'CSAT is not generated; shown as not captured.' },
-          { id: 'requests-deflected', title: 'Requests deflected', value: 'N/A', type: 'line', detail: 'Portal deflection analytics are not available to the generator.' },
+          { id: 'satisfaction', title: 'Satisfaction', value: customerSatisfactionScore ? `${customerSatisfactionScore}/5` : '0/5', type: 'rating', detail: 'Generated CSAT proxy from custom lifecycle dates, SLA compliance, and first-contact resolution.' },
+          { id: 'requests-deflected', title: 'Requests deflected', value: `${deflectedRate}%`, type: 'line', detail: 'Generated knowledge-deflection proxy from request mix and knowledge-base setup.' },
           { id: 'requests-resolved', title: 'Requests resolved', value: doneIssues.length, type: 'line-check', detail: 'Resolved count from generated custom Resolved Date values.' },
           { id: 'atlassian-analytics', title: 'Atlassian Analytics', value: issues.length, type: 'analytics', detail: 'Generated project totals and trend signals.' },
         ],
@@ -1442,15 +1563,15 @@ function DashboardGadget({ context, source = 'dashboard' }) {
           {
             id: 'sla-met-breached',
             title: 'SLA met vs breached',
-            value: highPriorityIssues.length,
+            value: `${slaMetCount}/${slaBreachedCount}`,
             type: 'analytics',
-            detail: 'High-priority pressure proxy from generated issues.',
+            detail: 'SLA met and breached from generated due dates, custom Created Date, and custom Resolved Date.',
             url: urgentWorkReport?.viewUrl || fallbackReportUrl(' AND priority in (Highest, High, Critical)'),
             hasSavedReportFilter: Boolean(urgentWorkReport?.viewUrl),
             customDateFilterApplied: urgentWorkReport?.customDateFilterApplied,
           },
           { id: 'incidents-priority', title: 'Incidents by priority', value: incidentIssues.length, type: 'analytics', detail: 'Incident and defect mix by priority.' },
-          { id: 'sla-success-rate', title: 'SLA success rate', value: issues.length === 0 ? '0%' : `${Math.round(((issues.length - highPriorityIssues.length) / issues.length) * 100)}%`, type: 'analytics', detail: 'Demo SLA success proxy using priority pressure.' },
+          { id: 'sla-success-rate', title: 'SLA success rate', value: `${slaComplianceRate}%`, type: 'analytics', detail: 'Generated SLA success using due date and custom lifecycle fields.' },
           { id: 'service-requests', title: 'Service requests', value: serviceRequestIssues.length, type: 'analytics', detail: 'Generated service request volume.' },
           { id: 'problems-priority', title: 'Problems by priority', value: problemIssues.length, type: 'analytics', detail: 'Problem records grouped by priority.' },
           { id: 'change-type', title: 'Change by type', value: changeIssues.length, type: 'analytics', detail: 'Generated change records and delivery change work.' },
@@ -1475,22 +1596,35 @@ function DashboardGadget({ context, source = 'dashboard' }) {
       }, {});
       return Object.entries(counts).map(([name, count]) => ({ name, count }));
     };
+    const fallbackItems = (items, field = 'status', fallback = 'Unknown') => {
+      const source = items.length > 0 ? items : issues;
+      const counted = countBy(source, field, fallback);
+      return counted.length > 0 ? counted : [{ name: 'Generated demo data', count: 1 }];
+    };
     const getReportItems = (report) => {
-      if (report.id === 'workload') return countBy(openIssues, 'assignee', 'Unassigned');
-      if (report.id === 'incidents-priority') return countBy(incidentIssues, 'priority', 'None');
-      if (report.id === 'problems-priority') return countBy(problemIssues, 'priority', 'None');
-      if (report.id === 'change-type') return countBy(changeIssues, 'status', 'Unknown');
-      if (report.id === 'service-requests') return countBy(serviceRequestIssues, 'status', 'Unknown');
+      if (report.id === 'workload') return fallbackItems(openIssues, 'assignee', 'Unassigned');
+      if (report.id === 'satisfaction') return [
+        { name: 'CSAT score', count: Math.round(customerSatisfactionScore * 20) },
+        { name: 'Opportunity gap', count: Math.max(0, 100 - Math.round(customerSatisfactionScore * 20)) },
+      ];
+      if (report.id === 'requests-deflected') return [
+        { name: 'Deflected by KB', count: deflectedRate },
+        { name: 'Agent assisted', count: Math.max(0, 100 - deflectedRate) },
+      ];
+      if (report.id === 'incidents-priority') return fallbackItems(incidentIssues, 'priority', 'None');
+      if (report.id === 'problems-priority') return fallbackItems(problemIssues, 'priority', 'None');
+      if (report.id === 'change-type') return fallbackItems(changeIssues, 'status', 'Unknown');
+      if (report.id === 'service-requests') return fallbackItems(serviceRequestIssues, 'status', 'Unknown');
       if (report.id === 'sla-met-breached') return [
-        { name: 'Met', count: Math.max(0, issues.length - highPriorityIssues.length) },
-        { name: 'Breached risk', count: highPriorityIssues.length },
+        { name: 'Met', count: slaMetCount },
+        { name: 'Breached risk', count: slaBreachedCount },
       ];
       if (report.id === 'sla-success-rate') return [
-        { name: 'Within SLA', count: Math.max(0, issues.length - highPriorityIssues.length) },
-        { name: 'At risk', count: highPriorityIssues.length },
+        { name: 'Within SLA', count: slaComplianceRate },
+        { name: 'At risk', count: Math.max(0, 100 - slaComplianceRate) },
       ];
-      if (report.id === 'requests-resolved') return countBy(doneIssues, 'status', 'Done');
-      return countBy(issues, 'status', 'Unknown');
+      if (report.id === 'requests-resolved') return fallbackItems(doneIssues, 'status', 'Done');
+      return fallbackItems(issues, 'status', 'Unknown');
     };
     const getReportLinkLabel = (report) => (
       report.hasSavedReportFilter ? 'Open saved filter' : 'Open issue search'
@@ -1567,6 +1701,7 @@ function DashboardGadget({ context, source = 'dashboard' }) {
               : selectedReport.id === 'requests-resolved' || selectedReport.id === 'time-resolution'
                 ? doneIssues
                 : issues;
+      const visibleDetailIssues = detailIssues.length > 0 ? detailIssues : issues;
 
       return (
         <div style={{ margin: '0 16px 14px' }}>
@@ -1601,7 +1736,7 @@ function DashboardGadget({ context, source = 'dashboard' }) {
               <span style={mutedStyle}>{getReportLinkNote(selectedReport)}</span>
             </div>
           ), { display: 'block' })}
-          {renderIssueCards(detailIssues, 'No matching work found.')}
+          {renderIssueCards(visibleDetailIssues, 'No matching work found.')}
         </div>
       );
     }
@@ -2391,21 +2526,23 @@ function App() {
   const [isSuccess, setIsSuccess] = useState(false);
   const [progress, setProgress] = useState('');
   const [openDashboardPicker, setOpenDashboardPicker] = useState(null);
+  const [domainInventory, setDomainInventory] = useState(null);
+  const [domainInventoryLoading, setDomainInventoryLoading] = useState(false);
+  const [selectionFeedback, setSelectionFeedback] = useState('');
+  const [selectedVolumeProjectKeys, setSelectedVolumeProjectKeys] = useState([]);
+  const [selectedDeleteProjectKeys, setSelectedDeleteProjectKeys] = useState([]);
 
   const [form, setForm] = useState({
     industry: '',
     customIndustry: '',
-    environmentName: '',
     opsDashboardTypes: [],
     opsDashboardPrompt: '',
     softwareDashboardTypes: [],
     softwareDashboardPrompt: '',
     dateRange: '6 months',
-    jsmProjectCount: 0,
-    incidentRequestsPerProject: 1,
-    problemRequestsPerProject: 1,
-    changeRequestsPerProject: 1,
-    serviceRequestsPerProject: 1,
+    spaceType: '',
+    softwareProjectStyle: 'team-managed',
+    jsmServiceTypes: [],
     softwareProjects: [],
     retentionPeriodDays: 180,
   });
@@ -2413,6 +2550,60 @@ function App() {
   useEffect(() => {
     view.getContext().then(setContext).catch(() => setContext({}));
   }, []);
+
+  const getSelectedIndustry = (sourceForm = form) => (
+    sourceForm.industry === 'Other' ? sourceForm.customIndustry.trim() : sourceForm.industry
+  );
+
+  const loadDomainInventory = async (sourceForm = form) => {
+    const selectedIndustry = getSelectedIndustry(sourceForm);
+    if (!selectedIndustry) {
+      setDomainInventory(null);
+      return;
+    }
+    if (!sourceForm.spaceType) {
+      setDomainInventory(null);
+      return;
+    }
+
+    setDomainInventoryLoading(true);
+    try {
+      const response = await invoke('getBusinessDomainInventory', {
+        industry: selectedIndustry,
+        customIndustry: sourceForm.customIndustry,
+        isCustomIndustry: sourceForm.industry === 'Other',
+        spaceType: sourceForm.spaceType,
+      });
+      const availableKeys = new Set((response?.projects || []).map(project => project.key));
+      setSelectedVolumeProjectKeys(keys => keys.filter(key => availableKeys.has(key)));
+      setSelectedDeleteProjectKeys(keys => keys.filter(key => availableKeys.has(key)));
+      setDomainInventory(response);
+    } catch (err) {
+      setDomainInventory({
+        success: false,
+        message: `Existing domain lookup failed: ${err.message}`,
+        projects: [],
+      });
+      setSelectedVolumeProjectKeys([]);
+      setSelectedDeleteProjectKeys([]);
+    } finally {
+      setDomainInventoryLoading(false);
+    }
+  };
+
+  useEffect(() => {
+    const selectedIndustry = getSelectedIndustry(form);
+    if (!selectedIndustry || !form.spaceType || (form.industry === 'Other' && !form.customIndustry.trim())) {
+      setDomainInventory(null);
+      return undefined;
+    }
+
+    const timer = setTimeout(() => {
+      loadDomainInventory(form);
+    }, 450);
+
+    return () => clearTimeout(timer);
+  }, [form.industry, form.customIndustry, form.spaceType]);
 
   if (context?.extension?.type === 'jira:dashboardGadget') {
     return <DashboardGadget context={context} />;
@@ -2428,7 +2619,13 @@ function App() {
       ...form,
       [name]: value,
       ...(name === 'industry' && value !== 'Other' ? { customIndustry: '' } : {}),
+      ...(name === 'industry' ? { spaceType: '' } : {}),
     });
+    if (name === 'industry' || name === 'customIndustry' || name === 'spaceType') {
+      setSelectedVolumeProjectKeys([]);
+      setSelectedDeleteProjectKeys([]);
+      setSelectionFeedback('');
+    }
   };
 
   const toggleDashboardSelection = (fieldName, promptFieldName, options, value) => {
@@ -2485,43 +2682,56 @@ function App() {
       return;
     }
 
-    const selectedIndustry = form.industry === 'Other' ? form.customIndustry.trim() : form.industry;
+    const selectedIndustry = getSelectedIndustry(form);
+    const selectedVolumeProjects = (domainInventory?.projects || [])
+      .filter(project => selectedVolumeProjectKeys.includes(project.key));
+    const selectedVolumeJsmServiceTypes = selectedVolumeProjects
+      .filter(project => project.kind === 'business')
+      .map(project => project.jsmServiceType || 'ITSM');
+    const selectedVolumeSoftwareProjects = selectedVolumeProjects
+      .filter(project => project.kind === 'software')
+      .map(project => ({
+        softwareTemplate: project.softwareTemplate || 'scrum',
+        softwareProjectStyle: project.softwareProjectStyle || 'team-managed',
+        issuesPerProject: DEFAULT_DEMO_ISSUE_COUNT,
+      }));
+    const jsmServiceTypesForRun = [
+      ...selectedVolumeJsmServiceTypes,
+      ...form.jsmServiceTypes,
+    ];
+    const softwareProjectsForRun = [
+      ...selectedVolumeSoftwareProjects,
+      ...form.softwareProjects,
+    ];
 
     if (form.industry === 'Other' && !selectedIndustry) {
       setResult('Please enter a custom Domain');
       return;
     }
 
-    if (!form.environmentName.trim()) {
-      setResult('Please enter a Client Name');
+    if (!form.spaceType) {
+      setResult('Please select the type of space you need.');
       return;
     }
 
-    if (parseInt(form.jsmProjectCount, 10) > 0) {
-      const requiredItsmFields = [
-        ['incidentRequestsPerProject', 'Incidents'],
-        ['serviceRequestsPerProject', 'Service Requests'],
-        ['changeRequestsPerProject', 'Changes'],
-        ['problemRequestsPerProject', 'Problems'],
-      ];
-      const missingItsmField = requiredItsmFields.find(([fieldName]) => (
-        !Number.isFinite(parseInt(form[fieldName], 10)) || parseInt(form[fieldName], 10) < 1
-      ));
-
-      if (missingItsmField) {
-        setResult(`Please enter at least 1 ${missingItsmField[1]} item for JSM ITSM linking.`);
-        return;
-      }
+    if ((isSelectedBusinessSpace || isSelectedJpdSpace) && selectedVolumeProjects.length === 0) {
+      setResult(`Select an existing ${selectedSpaceTypeLabel} space above, or choose a supported project type to create new demo data now: IT Service Management, HR Service Management, Customer Service Management, Software Project - Scrum, or Software Project - Kanban.`);
+      setIsSuccess(false);
+      return;
     }
 
-    const incompleteSoftwareProjectIndex = form.softwareProjects.findIndex(project => (
+    if (jsmServiceTypesForRun.length === 0 && softwareProjectsForRun.length === 0) {
+      setResult('Please select at least one JSM service area, software project, or existing project to add volume to.');
+      return;
+    }
+
+    const incompleteSoftwareProjectIndex = softwareProjectsForRun.findIndex(project => (
       !project.softwareTemplate
       || !project.softwareProjectStyle
-      || !String(project.issuesPerProject || '').trim()
     ));
 
     if (incompleteSoftwareProjectIndex >= 0) {
-      setResult(`Please complete Project Template, Management, and Issues for Software Project ${incompleteSoftwareProjectIndex + 1}`);
+      setResult(`Please complete Project Template and Management for Software Project ${incompleteSoftwareProjectIndex + 1}`);
       return;
     }
 
@@ -2545,7 +2755,9 @@ function App() {
         industry: selectedIndustry,
         customIndustry: form.customIndustry.trim(),
         isCustomIndustry: form.industry === 'Other',
-        environmentName: form.environmentName,
+        environmentName: selectedIndustry,
+        reuseExistingDomainData: true,
+        volumeProjectKeys: selectedVolumeProjectKeys,
         opsDashboardTypes: form.opsDashboardTypes,
         opsDashboardSelections: form.opsDashboardTypes
           .map(value => opsDashboardOptions.find(option => option.value === value))
@@ -2559,20 +2771,21 @@ function App() {
           .map(option => ({ value: option.value, label: option.label, prompt: option.prompt })),
         softwareDashboardPrompt: selectedSoftwareDashboardPrompt,
         dateRange: form.dateRange,
-        jsmProjectCount: parseInt(form.jsmProjectCount, 10),
-        incidentRequestsPerProject: parseInt(form.incidentRequestsPerProject, 10),
-        problemRequestsPerProject: parseInt(form.problemRequestsPerProject, 10),
-        changeRequestsPerProject: parseInt(form.changeRequestsPerProject, 10),
-        serviceRequestsPerProject: parseInt(form.serviceRequestsPerProject, 10),
-        softwareProjects: form.softwareProjects.map(project => ({
+        jsmProjectCount: jsmServiceTypesForRun.length,
+        jsmServiceTypes: jsmServiceTypesForRun,
+        incidentRequestsPerProject: DEFAULT_DEMO_ISSUE_COUNT,
+        problemRequestsPerProject: DEFAULT_DEMO_ISSUE_COUNT,
+        changeRequestsPerProject: DEFAULT_DEMO_ISSUE_COUNT,
+        serviceRequestsPerProject: DEFAULT_DEMO_ISSUE_COUNT,
+        softwareProjects: softwareProjectsForRun.map(project => ({
           softwareTemplate: project.softwareTemplate,
           softwareProjectStyle: project.softwareProjectStyle,
-          issuesPerProject: parseInt(project.issuesPerProject, 10),
+          issuesPerProject: DEFAULT_DEMO_ISSUE_COUNT,
         })),
-        softwareProjectCount: form.softwareProjects.length,
-        softwareTemplate: form.softwareProjects[0]?.softwareTemplate || 'scrum',
-        softwareProjectStyle: form.softwareProjects[0]?.softwareProjectStyle || 'team-managed',
-        issuesPerProject: parseInt(form.softwareProjects[0]?.issuesPerProject || 10, 10),
+        softwareProjectCount: softwareProjectsForRun.length,
+        softwareTemplate: softwareProjectsForRun[0]?.softwareTemplate || 'scrum',
+        softwareProjectStyle: softwareProjectsForRun[0]?.softwareProjectStyle || 'team-managed',
+        issuesPerProject: DEFAULT_DEMO_ISSUE_COUNT,
         sprintsPerProject: 6,
         retentionPeriodDays: parseInt(form.retentionPeriodDays, 10),
       });
@@ -2865,8 +3078,113 @@ function App() {
   };
 
   const selectedSoftwareProjectCount = form.softwareProjects.length;
-  const selectedJsmProjectCount = Number.parseInt(form.jsmProjectCount, 10) || 0;
+  const selectedJsmProjectCount = form.jsmServiceTypes.length;
   const softwareDashboardOptions = getSoftwareDashboardOptions(form.softwareProjects);
+  const toggleProjectKeySelection = (projectKey, selectedKeys, setter) => {
+    setter(selectedKeys.includes(projectKey)
+      ? selectedKeys.filter(key => key !== projectKey)
+      : [...selectedKeys, projectKey]);
+  };
+
+  const getProjectInventoryLabel = (project) => {
+    if (project.kind === 'business') {
+      const serviceLabels = {
+        ITSM: 'IT Service Management',
+        HRSM: 'HR Service Management',
+        CSM: 'Customer Service Management',
+      };
+      return serviceLabels[project.jsmServiceType] || project.detailLabel || 'Jira Service Management';
+    }
+
+    if (project.kind === 'software') {
+      const template = project.softwareTemplate === 'kanban' ? 'Kanban' : project.softwareTemplate === 'scrum' ? 'Scrum' : 'Project';
+      return `Software Projects - ${template}`;
+    }
+
+    if (project.kind === 'business-project') {
+      return `Business Projects / Work Management - ${project.detailLabel || 'Work Management'}`;
+    }
+
+    if (project.kind === 'product-discovery') {
+      return 'Jira Product Discovery';
+    }
+
+    if (project.categoryLabel && project.detailLabel) {
+      return `${project.categoryLabel} - ${project.detailLabel}`;
+    }
+
+    return project.projectTypeKey || project.kind || 'Project';
+  };
+
+  const selectedSpaceTypeOption = spaceTypeOptions.find(option => option.value === form.spaceType);
+  const selectedSpaceTypeLabel = selectedSpaceTypeOption?.label || '';
+  const isSelectedJsmSpace = form.spaceType.startsWith('jsm:');
+  const isSelectedSoftwareSpace = form.spaceType.startsWith('software:');
+  const isSelectedBusinessSpace = form.spaceType.startsWith('business:');
+  const isSelectedJpdSpace = form.spaceType === 'jpd:product-discovery';
+
+  const addSelectedSpace = () => {
+    if (isSelectedJsmSpace) {
+      const serviceType = form.spaceType.replace(/^jsm:/, '');
+      setForm({
+        ...form,
+        jsmServiceTypes: [...form.jsmServiceTypes, serviceType],
+      });
+      setSelectionFeedback(`${selectedSpaceTypeLabel} added below. It will create 60 incidents, 60 problems, 60 changes, and 60 service requests with relationship links, queues, forms, knowledge base, SLA/report fields, and dashboards.`);
+      return;
+    }
+
+    if (isSelectedSoftwareSpace) {
+      const softwareTemplate = form.spaceType.replace(/^software:/, '');
+      setForm({
+        ...form,
+        softwareProjects: [
+          ...form.softwareProjects,
+          {
+            softwareTemplate,
+            softwareProjectStyle: form.softwareProjectStyle || 'team-managed',
+            issuesPerProject: DEFAULT_DEMO_ISSUE_COUNT,
+          },
+        ],
+      });
+      setSelectionFeedback(`${selectedSpaceTypeLabel} added below. It will create 60 software issues with releases, bugs, dependencies, timeline fields, sprints or Kanban flow, Compass/Goals links where configured, development activity, and dashboards.`);
+      return;
+    }
+
+    setSelectionFeedback(`Select an existing ${selectedSpaceTypeLabel || 'space'} above to manage it, or choose IT Service Management, HR Service Management, Customer Service Management, Software Project - Scrum, or Software Project - Kanban to create new demo data now.`);
+  };
+
+  const deleteSelectedDomainProjects = async () => {
+    if (selectedDeleteProjectKeys.length === 0) {
+      return;
+    }
+
+    const confirmed = window.confirm(`Delete ${selectedDeleteProjectKeys.length} selected Jira project(s)?\n\n${selectedDeleteProjectKeys.join(', ')}\n\nThis cannot be undone.`);
+    if (!confirmed) {
+      return;
+    }
+
+    setLoading(true);
+    setProgress('Deleting selected Jira projects...');
+    setResult('');
+    setIsSuccess(false);
+
+    try {
+      const response = await invoke('deleteBusinessDomainProjects', {
+        projectKeys: selectedDeleteProjectKeys,
+      });
+      setResult(response.summary || 'Delete request completed.');
+      setIsSuccess(Boolean(response.success));
+      setSelectedDeleteProjectKeys([]);
+      await loadDomainInventory(form);
+    } catch (err) {
+      setResult(`Delete request failed: ${err.message}`);
+      setIsSuccess(false);
+    } finally {
+      setProgress('');
+      setLoading(false);
+    }
+  };
 
   const addJsmProject = () => {
     if (selectedJsmProjectCount >= 10) {
@@ -2875,23 +3193,32 @@ function App() {
 
     setForm({
       ...form,
-      jsmProjectCount: selectedJsmProjectCount + 1,
+      jsmServiceTypes: [...form.jsmServiceTypes, 'ITSM'],
     });
   };
 
-  const removeJsmProject = () => {
-    const nextJsmProjectCount = Math.max(0, selectedJsmProjectCount - 1);
+  const updateJsmServiceType = (index, value) => {
+    setForm({
+      ...form,
+      jsmServiceTypes: form.jsmServiceTypes.map((serviceType, serviceIndex) => (
+        serviceIndex === index ? value : serviceType
+      )),
+    });
+  };
+
+  const removeJsmProject = (index) => {
+    const nextJsmServiceTypes = form.jsmServiceTypes.filter((_, serviceIndex) => serviceIndex !== index);
 
     setForm({
       ...form,
-      jsmProjectCount: nextJsmProjectCount,
-      ...(nextJsmProjectCount === 0 ? {
+      jsmServiceTypes: nextJsmServiceTypes,
+      ...(nextJsmServiceTypes.length === 0 ? {
         opsDashboardTypes: [],
         opsDashboardPrompt: '',
       } : {}),
     });
 
-    if (nextJsmProjectCount === 0 && openDashboardPicker === 'ops') {
+    if (nextJsmServiceTypes.length === 0 && openDashboardPicker === 'ops') {
       setOpenDashboardPicker(null);
     }
   };
@@ -2919,7 +3246,7 @@ function App() {
     const source = {
       softwareTemplate: '',
       softwareProjectStyle: '',
-      issuesPerProject: 10,
+      issuesPerProject: DEFAULT_DEMO_ISSUE_COUNT,
     };
 
     setForm({
@@ -3041,17 +3368,6 @@ function App() {
         </div>
         <div style={{ ...fieldStyle, display: 'grid', gridTemplateColumns: form.industry === 'Other' ? 'repeat(3, minmax(0, 1fr))' : 'repeat(2, minmax(0, 1fr))', gap: '16px', alignItems: 'end' }}>
           <div>
-            <label style={labelStyle}>Client Name</label>
-            <input
-              type="text"
-              name="environmentName"
-              value={form.environmentName}
-              onChange={handleChange}
-              placeholder="e.g., Acme Hospital"
-              style={inputStyle}
-            />
-          </div>
-          <div>
             <label style={labelStyle}>
               Business Domain
               <span
@@ -3088,7 +3404,147 @@ function App() {
               />
             </div>
           )}
+          <div>
+            <label style={labelStyle}>Space Type</label>
+            <select
+              name="spaceType"
+              value={form.spaceType}
+              onChange={handleChange}
+              style={selectStyle}
+              disabled={!getSelectedIndustry(form)}
+            >
+              <option value="">Select space type</option>
+              {Object.entries(groupedSpaceTypeOptions).map(([groupLabel, options]) => (
+                <optgroup key={groupLabel} label={groupLabel}>
+                  {options.map(option => (
+                    <option key={option.value} value={option.value}>{option.label}</option>
+                  ))}
+                </optgroup>
+              ))}
+            </select>
+          </div>
         </div>
+
+        {(domainInventoryLoading || domainInventory) && (
+          <div style={{ ...optionalSectionStyle, marginTop: 0 }}>
+            <div style={{ display: 'flex', justifyContent: 'space-between', gap: '12px', alignItems: 'center', marginBottom: '10px' }}>
+              <div style={sectionTitleStyle}>Matching existing spaces</div>
+              <button type="button" onClick={() => loadDomainInventory(form)} disabled={domainInventoryLoading} style={{ ...removeButtonStyle, padding: '8px 12px' }}>
+                {domainInventoryLoading ? 'Checking...' : 'Refresh'}
+              </button>
+            </div>
+            <div style={{ color: domainInventory?.success === false ? '#bf2600' : '#42526e', fontSize: '13px', marginBottom: domainInventory?.projects?.length ? '12px' : 0 }}>
+              {domainInventoryLoading ? 'Checking Jira for matching projects...' : domainInventory?.summary || domainInventory?.message}
+            </div>
+            {domainInventory?.projects?.length > 0 && (
+              <div style={{ display: 'grid', gap: '10px' }}>
+                <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', gap: '12px', flexWrap: 'wrap', padding: '10px', border: '1px solid #dfe1e6', borderRadius: '4px', backgroundColor: '#fff' }}>
+                  <div style={{ color: '#42526e', fontSize: '13px' }}>
+                    Select individual projects to add a new demo volume batch or delete old demo projects. JSM volume means 60 incidents, 60 problems, 60 changes, and 60 service requests per selected JSM project; Software volume means 60 issues per selected software project.
+                  </div>
+                  <button
+                    type="button"
+                    onClick={deleteSelectedDomainProjects}
+                    disabled={loading || selectedDeleteProjectKeys.length === 0}
+                    style={{
+                      ...removeButtonStyle,
+                      minWidth: '180px',
+                      backgroundColor: selectedDeleteProjectKeys.length ? '#ffebe6' : '#f4f5f7',
+                      color: selectedDeleteProjectKeys.length ? '#bf2600' : '#6b778c',
+                      borderColor: selectedDeleteProjectKeys.length ? '#ff8f73' : '#dfe1e6',
+                    }}
+                  >
+                    Delete selected ({selectedDeleteProjectKeys.length})
+                  </button>
+                </div>
+                <div style={{ display: 'grid', gridTemplateColumns: '88px 72px 90px minmax(0, 1fr) 170px 90px', gap: '10px', alignItems: 'center', padding: '8px 10px', color: '#42526e', fontSize: '12px', fontWeight: 700, textTransform: 'uppercase' }}>
+                  <span>Add</span>
+                  <span>Delete</span>
+                  <span>Key</span>
+                  <span>Project</span>
+                  <span>Type</span>
+                  <span>Items</span>
+                </div>
+                {domainInventory.projects.map(project => (
+                  (() => {
+                    const canAddVolume = project.kind === 'business' || project.kind === 'software';
+                    return (
+                  <div key={project.key} style={{ display: 'grid', gridTemplateColumns: '88px 72px 90px minmax(0, 1fr) 170px 90px', gap: '10px', alignItems: 'center', padding: '10px', border: '1px solid #dfe1e6', borderRadius: '4px', backgroundColor: '#fafbfc', fontSize: '13px' }}>
+                    <label style={{ display: 'flex', alignItems: 'center', gap: '6px', cursor: 'pointer' }}>
+                      <input
+                        type="checkbox"
+                        disabled={!canAddVolume}
+                        checked={selectedVolumeProjectKeys.includes(project.key)}
+                        onChange={() => toggleProjectKeySelection(project.key, selectedVolumeProjectKeys, setSelectedVolumeProjectKeys)}
+                      />
+                      <span>{canAddVolume ? 'Volume' : 'N/A'}</span>
+                    </label>
+                    <label style={{ display: 'flex', alignItems: 'center', gap: '6px', cursor: 'pointer' }}>
+                      <input
+                        type="checkbox"
+                        checked={selectedDeleteProjectKeys.includes(project.key)}
+                        onChange={() => toggleProjectKeySelection(project.key, selectedDeleteProjectKeys, setSelectedDeleteProjectKeys)}
+                      />
+                      <span>Delete</span>
+                    </label>
+                    <strong>{project.key}</strong>
+                    <span>{project.name}</span>
+                    <span>{getProjectInventoryLabel(project)}</span>
+                    <span>
+                      {Number.isFinite(Number(project.issueCount))
+                        ? `${Number(project.issueCount)} items`
+                        : 'count unavailable'}
+                    </span>
+                  </div>
+                    );
+                  })()
+                ))}
+              </div>
+            )}
+          </div>
+        )}
+
+        {form.spaceType && (
+          <div style={{ ...sectionStyle, marginTop: '16px' }}>
+            <div style={sectionTitleStyle}>Selected setup</div>
+            <div style={{ color: '#42526e', fontSize: '13px', marginBottom: '12px' }}>
+              {selectedSpaceTypeLabel} for {getSelectedIndustry(form)}. Select existing rows above to add volume or delete{(isSelectedJsmSpace || isSelectedSoftwareSpace) ? ', or add a new matching project below.' : '.'}
+            </div>
+            {isSelectedSoftwareSpace && (
+              <div style={{ ...fieldStyle, maxWidth: '260px' }}>
+                <label style={labelStyle}>Management</label>
+                <select
+                  name="softwareProjectStyle"
+                  value={form.softwareProjectStyle}
+                  onChange={handleChange}
+                  style={selectStyle}
+                >
+                  <option value="team-managed">Team-managed</option>
+                  <option value="company-managed">Company-managed</option>
+                </select>
+              </div>
+            )}
+            {(isSelectedBusinessSpace || isSelectedJpdSpace) && (
+              <div style={{ color: '#42526e', fontSize: '13px', marginBottom: '12px', padding: '12px', border: '1px solid #dfe1e6', borderRadius: '4px', backgroundColor: '#fff' }}>
+                Select an existing {selectedSpaceTypeLabel} space above to manage matching domain data. To create a new demo environment now, choose IT Service Management, HR Service Management, Customer Service Management, Software Project - Scrum, or Software Project - Kanban.
+              </div>
+            )}
+            {(isSelectedJsmSpace || isSelectedSoftwareSpace) && (
+              <button
+                type="button"
+                onClick={addSelectedSpace}
+                style={{ ...buttonStyle, width: '240px', padding: '10px 18px', fontSize: '14px', whiteSpace: 'nowrap' }}
+              >
+                Add new {selectedSpaceTypeLabel}
+              </button>
+            )}
+            {selectionFeedback && (
+              <div style={{ color: '#42526e', fontSize: '13px', marginTop: '10px', padding: '10px', border: '1px solid #dfe1e6', borderRadius: '4px', backgroundColor: '#fff' }}>
+                {selectionFeedback}
+              </div>
+            )}
+          </div>
+        )}
 
         <div style={fieldStyle}>
           <label style={labelStyle}>
@@ -3113,24 +3569,39 @@ function App() {
           </select>
         </div>
 
+        {isSelectedJsmSpace && (
         <div style={sectionStyle}>
-          <div style={sectionTitleStyle}>Jira Service Management (ITSM)</div>
+          <div style={sectionTitleStyle}>Jira Service Management</div>
+          <div style={{ color: '#42526e', fontSize: '13px', marginBottom: '12px' }}>
+            Select the JSM service areas to reuse or create. Each selected service area uses 60 incidents, 60 problems, 60 changes, and 60 service requests connected for reports and dashboards.
+          </div>
           <div style={{ marginBottom: selectedJsmProjectCount > 0 ? '12px' : 0 }}>
             <button type="button" onClick={addJsmProject} disabled={selectedJsmProjectCount >= 10} style={{ ...buttonStyle, width: '220px', padding: '10px 18px', fontSize: '14px', whiteSpace: 'nowrap' }}>
-              Add Project
+              Add JSM Service
             </button>
           </div>
-          {Array.from({ length: selectedJsmProjectCount }).map((_, index) => (
+          {form.jsmServiceTypes.map((serviceType, index) => (
             <div key={`jsm-project-${index}`} style={projectCardStyle}>
-              <div style={jsmProjectRowStyle}>
+              <div style={{ ...jsmProjectRowStyle, gridTemplateColumns: '150px minmax(170px, 1fr) minmax(0, 1fr) 82px' }}>
                 <div style={{ fontWeight: 600, color: '#172b4d', paddingBottom: '10px', whiteSpace: 'nowrap' }}>
-                  JSM Project {index + 1}
+                  JSM Service {index + 1}
                 </div>
-                {renderItsmCountField('incidentRequestsPerProject', 'Incidents', 1)}
-                {renderItsmCountField('serviceRequestsPerProject', 'Service Requests', 1)}
-                {renderItsmCountField('changeRequestsPerProject', 'Changes', 1)}
-                {renderItsmCountField('problemRequestsPerProject', 'Problems', 1)}
-                <button type="button" onClick={removeJsmProject} style={removeButtonStyle}>
+                <div>
+                  <label style={labelStyle}>Service Type</label>
+                  <select
+                    value={serviceType}
+                    onChange={(event) => updateJsmServiceType(index, event.target.value)}
+                    style={selectStyle}
+                  >
+                    {jsmServiceTypeOptions.map(option => (
+                      <option key={option} value={option}>{option}</option>
+                    ))}
+                  </select>
+                </div>
+                <div style={{ color: '#42526e', fontSize: '13px', paddingBottom: '10px' }}>
+                  60 incidents, 60 problems, 60 changes, 60 service requests, relationship links, queues, forms, knowledge base, SLA/report fields
+                </div>
+                <button type="button" onClick={() => removeJsmProject(index)} style={removeButtonStyle}>
                   Remove
                 </button>
               </div>
@@ -3152,9 +3623,14 @@ function App() {
             </div>
           )}
         </div>
+        )}
 
+        {isSelectedSoftwareSpace && (
         <div style={sectionStyle}>
           <div style={sectionTitleStyle}>Jira Software (Dev)</div>
+          <div style={{ color: '#42526e', fontSize: '13px', marginBottom: '12px' }}>
+            Select Scrum/Kanban projects to reuse or create. Each selected software project uses 60 default issues with releases, sprints or flow data, dependencies, bugs, Compass, Goals, development activity, and dashboards.
+          </div>
           <div style={{ marginBottom: '12px' }}>
             <button type="button" onClick={addSoftwareProject} disabled={selectedSoftwareProjectCount >= 10} style={{ ...buttonStyle, width: '220px', padding: '10px 18px', fontSize: '14px', whiteSpace: 'nowrap' }}>
               Add Project
@@ -3162,7 +3638,7 @@ function App() {
           </div>
           {form.softwareProjects.map((project, index) => (
             <div key={`software-project-${index}`} style={projectCardStyle}>
-              <div style={softwareProjectRowStyle}>
+              <div style={{ ...softwareProjectRowStyle, gridTemplateColumns: '150px minmax(150px, 1fr) minmax(170px, 1fr) minmax(0, 1fr) 82px' }}>
                 <div style={{ fontWeight: 600, color: '#172b4d', paddingBottom: '10px', whiteSpace: 'nowrap' }}>
                   Software Project {index + 1}
                 </div>
@@ -3190,16 +3666,8 @@ function App() {
                     <option value="company-managed">Company-managed</option>
                   </select>
                 </div>
-                <div>
-                  <label style={labelStyle}>Issues</label>
-                  <input
-                    type="number"
-                    min="1"
-                    max="60"
-                    value={project.issuesPerProject}
-                    onChange={(event) => updateSoftwareProject(index, 'issuesPerProject', event.target.value)}
-                    style={inputStyle}
-                  />
+                <div style={{ color: '#42526e', fontSize: '13px', paddingBottom: '10px' }}>
+                  60 default issues with release versions, bugs, dependencies, timeline, and development signals
                 </div>
                 <button type="button" onClick={() => removeSoftwareProject(index)} style={removeButtonStyle}>
                   Remove
@@ -3223,6 +3691,7 @@ function App() {
             </div>
           )}
         </div>
+        )}
 
         <button
           onClick={handleSubmit}
