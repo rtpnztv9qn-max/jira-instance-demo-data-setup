@@ -2740,11 +2740,6 @@ function App() {
       return;
     }
 
-    if (!form.spaceType) {
-      setResult('Please select the type of space you need.');
-      return;
-    }
-
     if (
       jsmServiceTypesForRun.length === 0
       && softwareProjectsForRun.length === 0
@@ -3589,9 +3584,9 @@ function App() {
 
         {form.spaceType && (
           <div style={{ ...sectionStyle, marginTop: '16px' }}>
-            <div style={sectionTitleStyle}>Selected setup</div>
+            <div style={sectionTitleStyle}>Add selected space</div>
             <div style={{ color: '#42526e', fontSize: '13px', marginBottom: '12px' }}>
-              {selectedSpaceTypeLabel} for {getSelectedIndustry(form)}. Select existing rows above to add volume or delete, or add a new matching space below.
+              Add {selectedSpaceTypeLabel} for {getSelectedIndustry(form)}. You can switch the dropdown and add multiple space types before creating the demo.
             </div>
             {isSelectedSoftwareSpace && (
               <div style={{ ...fieldStyle, maxWidth: '260px' }}>
@@ -3645,7 +3640,7 @@ function App() {
           </select>
         </div>
 
-        {isSelectedJsmSpace && (
+        {form.jsmServiceTypes.length > 0 && (
         <div style={sectionStyle}>
           <div style={sectionTitleStyle}>Jira Service Management</div>
           <div style={{ color: '#42526e', fontSize: '13px', marginBottom: '12px' }}>
@@ -3701,7 +3696,7 @@ function App() {
         </div>
         )}
 
-        {isSelectedBusinessSpace && form.businessProjects.length > 0 && (
+        {form.businessProjects.length > 0 && (
         <div style={sectionStyle}>
           <div style={sectionTitleStyle}>Business Projects / Work Management</div>
           <div style={{ color: '#42526e', fontSize: '13px', marginBottom: '12px' }}>
@@ -3728,7 +3723,7 @@ function App() {
         </div>
         )}
 
-        {isSelectedJpdSpace && form.productDiscoveryProjects.length > 0 && (
+        {form.productDiscoveryProjects.length > 0 && (
         <div style={sectionStyle}>
           <div style={sectionTitleStyle}>Jira Product Discovery</div>
           <div style={{ color: '#42526e', fontSize: '13px', marginBottom: '12px' }}>
@@ -3755,7 +3750,7 @@ function App() {
         </div>
         )}
 
-        {isSelectedSoftwareSpace && (
+        {form.softwareProjects.length > 0 && (
         <div style={sectionStyle}>
           <div style={sectionTitleStyle}>Jira Software (Dev)</div>
           <div style={{ color: '#42526e', fontSize: '13px', marginBottom: '12px' }}>

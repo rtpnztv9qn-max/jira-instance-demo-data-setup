@@ -3302,18 +3302,44 @@ async function createWorkManagementProject(name, leadAccountId, keyPrefix, busin
 }
 
 async function createProductDiscoveryProject(name, leadAccountId, keyPrefix) {
-  return await createProjectWithRetries({
-    name,
-    leadAccountId,
-    keyPrefix,
-    projectTypeKey: 'product_discovery',
-    maxAttempts: 12,
-    templateKeys: [
-      'com.atlassian.jira-product-discovery:project-template',
-      'com.atlassian.jira-product-discovery:default',
-    ],
-    allowTemplateOmission: true,
-  });
+  try {
+    return await createProjectWithRetries({
+      name,
+      leadAccountId,
+      keyPrefix,
+      projectTypeKey: 'product_discovery',
+      maxAttempts: 12,
+      templateKeys: [
+        'com.atlassian.jira-product-discovery:project-template',
+        'com.atlassian.jira-product-discovery:default',
+      ],
+      allowTemplateOmission: true,
+    });
+  } catch (err) {
+    const message = String(err?.message || '');
+    if (!/invalid project type|projectType|product_discovery/i.test(message)) {
+      throw err;
+    }
+
+    const fallback = await createProjectWithRetries({
+      name: `${name} Discovery Workspace`,
+      leadAccountId,
+      keyPrefix,
+      projectTypeKey: 'business',
+      maxAttempts: 12,
+      templateKeys: [
+        'com.atlassian.jira-core-project-templates:jira-core-task-management',
+        'com.atlassian.jira-core-project-templates:jira-core-project-management',
+      ],
+      allowTemplateOmission: true,
+    });
+
+    return {
+      ...fallback,
+      productDiscoveryFallback: true,
+      productDiscoveryFallbackReason: message,
+    };
+  }
 }
 
 async function createProjectWithRetries({ name, leadAccountId, keyPrefix, projectTypeKey, templateKeys, maxAttempts = 26, allowTemplateOmission = true, diagnostics = [] }) {
@@ -8680,8 +8706,10 @@ async function executeProductDiscoveryProjectStep(config, state, step) {
       id: project.id,
       key: project.key,
       name: existingProject?.name || projectName,
-      projectTypeKey: project.projectTypeKey || 'product_discovery',
+      projectTypeKey: project.projectTypeKey || (project.productDiscoveryFallback ? 'business' : 'product_discovery'),
       productDiscoveryType: 'product-discovery',
+      productDiscoveryFallback: Boolean(project.productDiscoveryFallback),
+      productDiscoveryFallbackReason: project.productDiscoveryFallbackReason || '',
       reusedExistingDomainData: Boolean(existingProject && existingIssueCount > 0),
       addVolumeToExistingDomainData: addVolumeToExistingProject,
       existingIssueCount,
@@ -8692,7 +8720,11 @@ async function executeProductDiscoveryProjectStep(config, state, step) {
       demoDateFields: null,
       demoDateFieldsReady: false,
     };
-    addChunkedDiagnostics(state, [`Product Discovery ${project.key}: ${existingProject ? 'reused existing' : 'created'} discovery space.`]);
+    addChunkedDiagnostics(state, [
+      project.productDiscoveryFallback
+        ? `Product Discovery ${project.key}: Jira blocked native Product Discovery project creation, so a discovery-style Work Management space was created and tagged as Product Discovery demo data.`
+        : `Product Discovery ${project.key}: ${existingProject ? 'reused existing' : 'created'} discovery space.`,
+    ]);
   } catch (err) {
     state.results.productDiscoveryProjects[step.projectIndex] = {
       id: null,
