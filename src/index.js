@@ -2094,13 +2094,22 @@ function quoteJqlValue(value) {
 
 function classifyDomainProject(project, metadata = null) {
   const value = metadata?.value || metadata || {};
-  if (value.kind === 'business' || value.kind === 'software') {
+  if (value.kind === 'business' || value.kind === 'software' || value.kind === 'business-project' || value.kind === 'product-discovery') {
+    const isServiceProject = value.kind === 'business';
+    const isSoftwareProject = value.kind === 'software';
+    const businessSpaceType = normaliseBusinessSpaceType(value.businessSpaceType);
     return {
       ...value,
-      categoryLabel: value.kind === 'business' ? 'JSM' : 'Software',
-      detailLabel: value.kind === 'business'
+      categoryLabel: isServiceProject ? 'JSM' : isSoftwareProject ? 'Software' : value.kind === 'product-discovery' ? 'JPD' : 'Business',
+      detailLabel: isServiceProject
         ? normaliseJsmServiceType(value.jsmServiceType)
-        : `${normaliseSoftwareTemplate(value.softwareTemplate)} ${getProjectManagementStyleLabel(value.softwareProjectStyle || '')}`.trim(),
+        : isSoftwareProject
+          ? `${normaliseSoftwareTemplate(value.softwareTemplate)} ${getProjectManagementStyleLabel(value.softwareProjectStyle || '')}`.trim()
+          : value.kind === 'product-discovery'
+            ? 'Product discovery'
+            : getBusinessSpaceTypeLabel(businessSpaceType),
+      ...(value.kind === 'business-project' ? { businessSpaceType } : {}),
+      ...(value.kind === 'product-discovery' ? { productDiscoveryType: 'product-discovery' } : {}),
     };
   }
 
@@ -2189,7 +2198,8 @@ async function searchDomainProjects(domain, options = {}) {
       continue;
     }
 
-    const issueCount = getProjectInsightIssueCount(project) ?? await getIssueCountForProject(project.key);
+    const liveIssueCount = await getIssueCountForProject(project.key);
+    const issueCount = liveIssueCount ?? getProjectInsightIssueCount(project);
     projects.push({
       id: project.id,
       key: project.key,
@@ -2256,6 +2266,14 @@ async function findReusableDomainProject(config, criteria = {}) {
       const templateMatches = !criteria.softwareTemplate || !project.softwareTemplate || normaliseSoftwareTemplate(project.softwareTemplate) === normaliseSoftwareTemplate(criteria.softwareTemplate);
       const styleMatches = !criteria.softwareProjectStyle || !project.softwareProjectStyle || normaliseProjectManagementStyle(project.softwareProjectStyle) === normaliseProjectManagementStyle(criteria.softwareProjectStyle);
       return templateMatches && styleMatches;
+    }
+
+    if (criteria.kind === 'business-project') {
+      return normaliseBusinessSpaceType(project.businessSpaceType) === normaliseBusinessSpaceType(criteria.businessSpaceType);
+    }
+
+    if (criteria.kind === 'product-discovery') {
+      return project.kind === 'product-discovery';
     }
 
     return true;
@@ -3246,6 +3264,55 @@ async function createSoftwareProject(name, leadAccountId, keyPrefix, softwareTem
     maxAttempts: 12,
     templateKeys: getSoftwareTemplateKeys(softwareTemplate, projectManagementStyle),
     allowTemplateOmission: false,
+  });
+}
+
+function getBusinessProjectTemplateKeys(businessSpaceType) {
+  const normalized = normaliseBusinessSpaceType(businessSpaceType);
+  const templateMap = {
+    'task-tracking': [
+      'com.atlassian.jira-core-project-templates:jira-core-task-management',
+    ],
+    'budget-planning': [
+      'com.atlassian.jira-core-project-templates:jira-core-project-management',
+      'com.atlassian.jira-core-project-templates:jira-core-task-management',
+    ],
+    'procurement-management': [
+      'com.atlassian.jira-core-project-templates:jira-core-process-management',
+      'com.atlassian.jira-core-project-templates:jira-core-task-management',
+    ],
+    'recruitment-tracking': [
+      'com.atlassian.jira-core-project-templates:jira-core-task-management',
+    ],
+  };
+
+  return templateMap[normalized] || templateMap['task-tracking'];
+}
+
+async function createWorkManagementProject(name, leadAccountId, keyPrefix, businessSpaceType) {
+  return await createProjectWithRetries({
+    name,
+    leadAccountId,
+    keyPrefix,
+    projectTypeKey: 'business',
+    maxAttempts: 12,
+    templateKeys: getBusinessProjectTemplateKeys(businessSpaceType),
+    allowTemplateOmission: true,
+  });
+}
+
+async function createProductDiscoveryProject(name, leadAccountId, keyPrefix) {
+  return await createProjectWithRetries({
+    name,
+    leadAccountId,
+    keyPrefix,
+    projectTypeKey: 'product_discovery',
+    maxAttempts: 12,
+    templateKeys: [
+      'com.atlassian.jira-product-discovery:project-template',
+      'com.atlassian.jira-product-discovery:default',
+    ],
+    allowTemplateOmission: true,
   });
 }
 
@@ -5029,6 +5096,7 @@ function removeOptionalIssueFields(fields) {
 
   delete safeFields.assignee;
   delete safeFields.duedate;
+  delete safeFields.priority;
   delete safeFields.customfield_10014;
   delete safeFields.customfield_10015;
   delete safeFields.fixVersions;
@@ -5482,6 +5550,7 @@ async function createIssue(projectKey, title, type, epicKey, priority, dueDate, 
       lowerError.includes('fixversions') ||
       lowerError.includes('versions') ||
       lowerError.includes('components') ||
+      lowerError.includes('priority') ||
       lowerError.includes('labels') ||
       lowerError.includes('not on the appropriate screen')
     ) {
@@ -7347,6 +7416,34 @@ function getBusinessSpaceTypeLabel(value) {
   return labels[normalized] || 'Task tracking';
 }
 
+function normaliseBusinessProjectConfigs(payload = {}) {
+  if (!Array.isArray(payload.businessProjects)) {
+    return [];
+  }
+
+  return payload.businessProjects
+    .slice(0, 10)
+    .map(project => ({
+      projectKey: String(project?.projectKey || '').trim(),
+      businessSpaceType: normaliseBusinessSpaceType(project?.businessSpaceType),
+      issuesPerProject: normalisePositiveInteger(project?.issuesPerProject, DEFAULT_SOFTWARE_ISSUES_PER_PROJECT, 1, MAX_ISSUES_PER_PROJECT),
+    }));
+}
+
+function normaliseProductDiscoveryProjectConfigs(payload = {}) {
+  if (!Array.isArray(payload.productDiscoveryProjects)) {
+    return [];
+  }
+
+  return payload.productDiscoveryProjects
+    .slice(0, 10)
+    .map(project => ({
+      projectKey: String(project?.projectKey || '').trim(),
+      productDiscoveryType: String(project?.productDiscoveryType || 'product-discovery').trim() || 'product-discovery',
+      issuesPerProject: normalisePositiveInteger(project?.issuesPerProject, DEFAULT_SOFTWARE_ISSUES_PER_PROJECT, 1, MAX_ISSUES_PER_PROJECT),
+    }));
+}
+
 function normalisePositiveInteger(value, fallback, min, max) {
   const parsed = Number.parseInt(value, 10);
   if (Number.isNaN(parsed)) return fallback;
@@ -7373,6 +7470,14 @@ function createDomainProjectName(domain, projectKind, index, details = {}) {
   if (projectKind === 'business') {
     const serviceType = normaliseJsmServiceType(details.serviceType);
     return `${cleanDomain} - ${serviceType} Ops ${index + 1}`;
+  }
+
+  if (projectKind === 'business-project') {
+    return `${cleanDomain} - ${getBusinessSpaceTypeLabel(details.businessSpaceType)} ${index + 1}`;
+  }
+
+  if (projectKind === 'product-discovery') {
+    return `${cleanDomain} - Product Discovery ${index + 1}`;
   }
 
   const template = normaliseSoftwareTemplate(details.softwareTemplate);
@@ -7483,6 +7588,20 @@ function getSoftwareProjectConfig(config, projectIndex) {
   };
 }
 
+function getBusinessProjectConfig(config, projectIndex) {
+  return config.businessProjects?.[projectIndex] || {
+    businessSpaceType: 'task-tracking',
+    issuesPerProject: DEFAULT_SOFTWARE_ISSUES_PER_PROJECT,
+  };
+}
+
+function getProductDiscoveryProjectConfig(config, projectIndex) {
+  return config.productDiscoveryProjects?.[projectIndex] || {
+    productDiscoveryType: 'product-discovery',
+    issuesPerProject: DEFAULT_SOFTWARE_ISSUES_PER_PROJECT,
+  };
+}
+
 function getTotalItsmWorkCount(itsmWorkCounts = {}) {
   return ACTIVE_ITSM_WORK_COUNT_KEYS.reduce((total, key) => total + (Number(itsmWorkCounts[key]) || 0), 0);
 }
@@ -7528,6 +7647,8 @@ function normalisePayload(payload) {
   const softwareTemplate = normaliseSoftwareTemplate(payload.softwareTemplate);
   const softwareProjectStyle = normaliseProjectManagementStyle(payload.softwareProjectStyle);
   const softwareProjects = normaliseSoftwareProjectConfigs(payload);
+  const businessProjects = normaliseBusinessProjectConfigs(payload);
+  const productDiscoveryProjects = normaliseProductDiscoveryProjectConfigs(payload);
   const itsmWorkCounts = normaliseItsmWorkCounts(payload);
   const incidentsPerProject = getTotalItsmWorkCount(itsmWorkCounts);
   const jsmServiceTypes = normaliseJsmServiceTypes(payload);
@@ -7573,6 +7694,10 @@ function normalisePayload(payload) {
     jsmProjectCount: jsmServiceTypes.length,
     incidentsPerProject,
     itsmWorkCounts,
+    businessProjects,
+    businessProjectCount: businessProjects.length,
+    productDiscoveryProjects,
+    productDiscoveryProjectCount: productDiscoveryProjects.length,
     softwareProjects,
     aiGeneratedContent: payload.aiGeneratedContent || null,
     softwareProjectCount: softwareProjects.length,
@@ -7622,6 +7747,8 @@ function createChunkedExecutionState(accountId) {
     results: {
       jsmProjects: [],
       softwareProjects: [],
+      businessProjects: [],
+      productDiscoveryProjects: [],
       confluenceSpaces: [],
       githubActivity: [],
       dashboards: [],
@@ -7698,6 +7825,70 @@ function buildChunkedExecutionPlan(config) {
     }
   }
 
+  for (let projectIndex = 0; projectIndex < config.businessProjectCount; projectIndex++) {
+    const businessProjectConfig = getBusinessProjectConfig(config, projectIndex);
+    const issueCount = businessProjectConfig.issuesPerProject;
+    const globalIndex = config.jsmProjectCount + projectIndex;
+
+    steps.push({
+      type: 'create-work-management-project-shell',
+      projectIndex,
+      projectName: createDomainProjectName(config.industry, 'business-project', projectIndex, businessProjectConfig),
+      projectKeyPrefix: deriveRunProjectKeyPrefix({ ...config, runSeed }, config.industry, globalIndex),
+      label: `Find or create ${getBusinessSpaceTypeLabel(businessProjectConfig.businessSpaceType)} space ${projectIndex + 1} of ${config.businessProjectCount}`,
+    });
+
+    steps.push({
+      type: 'configure-work-management-date-fields',
+      projectIndex,
+      label: `Configure demo date fields for Work Management space ${projectIndex + 1}`,
+    });
+
+    if (!csvIssueCreation) {
+      for (let start = 0; start < issueCount; start += ISSUE_BATCH_SIZE) {
+        steps.push({
+          type: 'create-work-management-issues-batch',
+          projectIndex,
+          start,
+          count: Math.min(ISSUE_BATCH_SIZE, issueCount - start),
+          label: `Create Work Management items ${start + 1}-${Math.min(start + ISSUE_BATCH_SIZE, issueCount)} for space ${projectIndex + 1}`,
+        });
+      }
+    }
+  }
+
+  for (let projectIndex = 0; projectIndex < config.productDiscoveryProjectCount; projectIndex++) {
+    const productDiscoveryProjectConfig = getProductDiscoveryProjectConfig(config, projectIndex);
+    const issueCount = productDiscoveryProjectConfig.issuesPerProject;
+    const globalIndex = config.jsmProjectCount + config.businessProjectCount + projectIndex;
+
+    steps.push({
+      type: 'create-product-discovery-project-shell',
+      projectIndex,
+      projectName: createDomainProjectName(config.industry, 'product-discovery', projectIndex, productDiscoveryProjectConfig),
+      projectKeyPrefix: deriveRunProjectKeyPrefix({ ...config, runSeed }, config.industry, globalIndex),
+      label: `Find or create Jira Product Discovery space ${projectIndex + 1} of ${config.productDiscoveryProjectCount}`,
+    });
+
+    steps.push({
+      type: 'configure-product-discovery-date-fields',
+      projectIndex,
+      label: `Configure demo date fields for Product Discovery space ${projectIndex + 1}`,
+    });
+
+    if (!csvIssueCreation) {
+      for (let start = 0; start < issueCount; start += ISSUE_BATCH_SIZE) {
+        steps.push({
+          type: 'create-product-discovery-ideas-batch',
+          projectIndex,
+          start,
+          count: Math.min(ISSUE_BATCH_SIZE, issueCount - start),
+          label: `Create Product Discovery ideas ${start + 1}-${Math.min(start + ISSUE_BATCH_SIZE, issueCount)} for space ${projectIndex + 1}`,
+        });
+      }
+    }
+  }
+
   for (let projectIndex = 0; projectIndex < config.softwareProjectCount; projectIndex++) {
     const softwareProjectConfig = getSoftwareProjectConfig(config, projectIndex);
     const issueCount = softwareProjectConfig.issuesPerProject;
@@ -7707,7 +7898,7 @@ function buildChunkedExecutionPlan(config) {
       type: 'create-software-project-shell',
       projectIndex,
       projectName: createDomainProjectName(config.industry, 'software', projectIndex, softwareProjectConfig),
-      projectKeyPrefix: deriveRunProjectKeyPrefix({ ...config, runSeed }, config.industry, projectIndex + config.jsmProjectCount),
+      projectKeyPrefix: deriveRunProjectKeyPrefix({ ...config, runSeed }, config.industry, projectIndex + config.jsmProjectCount + config.businessProjectCount + config.productDiscoveryProjectCount),
       label: `Find or create software project ${projectIndex + 1} of ${config.softwareProjectCount}`,
     });
 
@@ -8336,6 +8527,328 @@ async function executeBusinessIncidentBatchStep(config, state, step) {
       state.results.totalIncidents++;
     } catch (err) {
       addChunkedError(state, `${workItem.workType} ${workIndex + 1} for ${project.key}: ${err.message}`);
+    }
+  }
+}
+
+function getWorkManagementItemTemplate(config, businessSpaceType, index) {
+  const domain = config.industry || 'Business';
+  const type = normaliseBusinessSpaceType(businessSpaceType);
+  const catalog = {
+    'task-tracking': [
+      'Coordinate stakeholder review',
+      'Prepare operational checklist',
+      'Track delivery dependency',
+      'Update monthly execution plan',
+    ],
+    'budget-planning': [
+      'Review budget variance',
+      'Prepare funding request',
+      'Validate spend forecast',
+      'Reconcile vendor allocation',
+    ],
+    'procurement-management': [
+      'Review purchase request',
+      'Approve vendor quote',
+      'Track fulfilment dependency',
+      'Validate procurement handoff',
+    ],
+    'recruitment-tracking': [
+      'Screen candidate pipeline',
+      'Schedule interview panel',
+      'Prepare offer approval',
+      'Complete onboarding handoff',
+    ],
+  };
+  const verbs = catalog[type] || catalog['task-tracking'];
+  const title = `${verbs[index % verbs.length]} for ${domain} initiative ${index + 1}`;
+  return {
+    title,
+    type: 'Task',
+    description: `${getBusinessSpaceTypeLabel(type)} demo work for ${domain}. Includes realistic scheduling, ownership, comment, and dependency signals for the selected business domain.`,
+    labels: [
+      'demo-data',
+      slugifyGitHubPart(domain, 'domain'),
+      normaliseBusinessSpaceType(type),
+      index % 3 === 0 ? 'dependency-tracking' : 'operational-follow-up',
+    ],
+  };
+}
+
+function getProductDiscoveryIdeaTemplate(config, index) {
+  const content = getConfiguredContent(config);
+  const source = content.issues?.[index % (content.issues.length || 1)] || { title: 'Improve customer experience', description: 'Discovery idea for the selected domain.' };
+  return {
+    title: `${config.industry} discovery idea ${index + 1}: ${source.title}`,
+    type: 'Idea',
+    description: `${source.description || 'Product discovery item.'}\n\nOpportunity: evaluate customer value, delivery confidence, and roadmap fit before implementation.`,
+    labels: [
+      'demo-data',
+      'product-discovery',
+      slugifyGitHubPart(config.industry, 'domain'),
+      index % 3 === 0 ? 'roadmap-candidate' : 'customer-insight',
+    ],
+  };
+}
+
+async function executeWorkManagementProjectStep(config, state, step) {
+  const projectConfig = getBusinessProjectConfig(config, step.projectIndex);
+  const projectName = step.projectName || createDomainProjectName(config.industry, 'business-project', step.projectIndex, projectConfig);
+  const projectKeyPrefix = step.projectKeyPrefix || deriveRunProjectKeyPrefix(config, config.industry, step.projectIndex + config.jsmProjectCount);
+  const businessSpaceType = normaliseBusinessSpaceType(projectConfig.businessSpaceType);
+
+  try {
+    const expectedProject = projectConfig.projectKey ? await getProjectByKeyIfExists(projectConfig.projectKey) : null;
+    const existingDomainProject = expectedProject || await findReusableDomainProject(config, {
+      kind: 'business-project',
+      businessSpaceType,
+      excludeKeys: state.results.businessProjects.map(project => project?.key),
+    });
+    const existingProject = existingDomainProject || await getProjectByKeyIfExists(generateKey(projectKeyPrefix, 0));
+    const project = existingProject
+      ? existingProject
+      : await createWorkManagementProject(projectName, state.metadata.accountId, projectKeyPrefix, businessSpaceType);
+
+    const existingIssueCount = await getIssueCountForProject(project.key);
+    const addVolumeToExistingProject = Boolean(existingProject && shouldAddVolumeToExistingProject(config, project.key));
+    await saveProjectDemoDomainMetadata(project, {
+      domain: config.industry,
+      kind: 'business-project',
+      businessSpaceType,
+      generatedBy: 'jira-demo-data-setup',
+      issueTarget: projectConfig.issuesPerProject,
+    }, state.results.diagnostics);
+
+    state.results.businessProjects[step.projectIndex] = {
+      id: project.id,
+      key: project.key,
+      name: existingProject?.name || projectName,
+      projectTypeKey: project.projectTypeKey || 'business',
+      businessSpaceType,
+      reusedExistingDomainData: Boolean(existingProject && existingIssueCount > 0),
+      addVolumeToExistingDomainData: addVolumeToExistingProject,
+      existingIssueCount,
+      issueCount: existingProject && existingIssueCount > 0 ? existingIssueCount : 0,
+      issueKeys: [],
+      issueRecords: [],
+      configuredIssueCount: projectConfig.issuesPerProject,
+      demoDateFields: null,
+      demoDateFieldsReady: false,
+    };
+    addChunkedDiagnostics(state, [`Work Management ${project.key}: ${existingProject ? 'reused existing' : 'created'} ${getBusinessSpaceTypeLabel(businessSpaceType)} space.`]);
+  } catch (err) {
+    state.results.businessProjects[step.projectIndex] = {
+      id: null,
+      key: null,
+      name: projectName,
+      failed: true,
+      failureMessage: err.message,
+      businessSpaceType,
+      issueKeys: [],
+    };
+    addChunkedError(state, `Work Management space ${step.projectIndex + 1}: ${err.message}`);
+  }
+}
+
+async function executeProductDiscoveryProjectStep(config, state, step) {
+  const projectConfig = getProductDiscoveryProjectConfig(config, step.projectIndex);
+  const projectName = step.projectName || createDomainProjectName(config.industry, 'product-discovery', step.projectIndex, projectConfig);
+  const projectKeyPrefix = step.projectKeyPrefix || deriveRunProjectKeyPrefix(config, config.industry, step.projectIndex + config.jsmProjectCount + config.businessProjectCount);
+
+  try {
+    const expectedProject = projectConfig.projectKey ? await getProjectByKeyIfExists(projectConfig.projectKey) : null;
+    const existingDomainProject = expectedProject || await findReusableDomainProject(config, {
+      kind: 'product-discovery',
+      excludeKeys: state.results.productDiscoveryProjects.map(project => project?.key),
+    });
+    const existingProject = existingDomainProject || await getProjectByKeyIfExists(generateKey(projectKeyPrefix, 0));
+    const project = existingProject
+      ? existingProject
+      : await createProductDiscoveryProject(projectName, state.metadata.accountId, projectKeyPrefix);
+
+    const existingIssueCount = await getIssueCountForProject(project.key);
+    const addVolumeToExistingProject = Boolean(existingProject && shouldAddVolumeToExistingProject(config, project.key));
+    await saveProjectDemoDomainMetadata(project, {
+      domain: config.industry,
+      kind: 'product-discovery',
+      productDiscoveryType: 'product-discovery',
+      generatedBy: 'jira-demo-data-setup',
+      issueTarget: projectConfig.issuesPerProject,
+    }, state.results.diagnostics);
+
+    state.results.productDiscoveryProjects[step.projectIndex] = {
+      id: project.id,
+      key: project.key,
+      name: existingProject?.name || projectName,
+      projectTypeKey: project.projectTypeKey || 'product_discovery',
+      productDiscoveryType: 'product-discovery',
+      reusedExistingDomainData: Boolean(existingProject && existingIssueCount > 0),
+      addVolumeToExistingDomainData: addVolumeToExistingProject,
+      existingIssueCount,
+      issueCount: existingProject && existingIssueCount > 0 ? existingIssueCount : 0,
+      issueKeys: [],
+      issueRecords: [],
+      configuredIssueCount: projectConfig.issuesPerProject,
+      demoDateFields: null,
+      demoDateFieldsReady: false,
+    };
+    addChunkedDiagnostics(state, [`Product Discovery ${project.key}: ${existingProject ? 'reused existing' : 'created'} discovery space.`]);
+  } catch (err) {
+    state.results.productDiscoveryProjects[step.projectIndex] = {
+      id: null,
+      key: null,
+      name: projectName,
+      failed: true,
+      failureMessage: err.message,
+      productDiscoveryType: 'product-discovery',
+      issueKeys: [],
+    };
+    addChunkedError(state, `Product Discovery space ${step.projectIndex + 1}: ${err.message}`);
+  }
+}
+
+async function executeGenericProjectDateFieldStep(state, step, resultKey, label) {
+  const project = state.results[resultKey]?.[step.projectIndex];
+  if (!project?.key) {
+    addChunkedDiagnostics(state, [`${label} ${step.projectIndex + 1}: skipped date field setup because the project was not created.`]);
+    return;
+  }
+
+  const diagnostics = [];
+  const demoDateFields = await resolveDemoDateFieldsWithoutScreenSetup(project.key, diagnostics);
+  project.demoDateFields = demoDateFields;
+  project.demoDateFieldsReady = Boolean(demoDateFields.createdDateFieldId || demoDateFields.resolvedDateFieldId);
+  addChunkedDiagnostics(state, diagnostics);
+}
+
+async function executeWorkManagementIssueBatchStep(config, state, step) {
+  const project = state.results.businessProjects[step.projectIndex];
+  if (!project?.key) {
+    addChunkedDiagnostics(state, [`Work Management space ${step.projectIndex + 1}: skipped work item batch because the project was not created.`]);
+    return;
+  }
+  if (project.reusedExistingDomainData && !project.addVolumeToExistingDomainData) {
+    addChunkedDiagnostics(state, [`Work Management ${project.key}: reused ${project.existingIssueCount || 0} existing work items; skipped duplicate item creation.`]);
+    return;
+  }
+
+  const assignableUsers = await getAssignableUsers(project.key, state.metadata.accountId);
+  const demoDateFields = project.demoDateFields || await getProjectDemoDateFieldIds(project.key, state.results.diagnostics);
+  project.demoDateFields = demoDateFields;
+  const priorities = ['High', 'Medium', 'Medium', 'Low'];
+  const statusCycle = ['To Do', 'In Progress', 'Done'];
+
+  for (let offset = 0; offset < step.count; offset += 1) {
+    const issueIndex = step.start + offset;
+    const template = getWorkManagementItemTemplate(config, project.businessSpaceType, issueIndex);
+    const priority = priorities[issueIndex % priorities.length];
+    const status = statusCycle[issueIndex % statusCycle.length];
+    const lifecycle = ensureResolvedLifecycleForStatus(createLifecycleForIssue({
+      index: issueIndex,
+      priority,
+      issueType: template.type,
+      maxAgeDays: config.dateRangeDays,
+    }), status);
+    const dueDate = buildDueDateFromLifecycle(lifecycle, priority, issueIndex);
+    const assigneeAccountId = chooseDemoAssigneeAccountId(assignableUsers, issueIndex, step.projectIndex);
+
+    try {
+      const issue = await createIssue(project.key, template.title, template.type, null, priority, dueDate, null, {
+        assigneeAccountId,
+        demoDateFields,
+        diagnostics: state.results.diagnostics,
+        environmentName: config.environmentName,
+        lifecycle,
+        projectKind: 'business-project',
+        retentionPeriodDays: config.retentionPeriodDays,
+        description: template.description,
+        labels: template.labels,
+        issueIndex,
+      });
+      if (status !== 'To Do') {
+        await transitionIssue(issue.key, status);
+      }
+      await addIssueComment(issue.key, [
+        `Demo update: ${getBusinessSpaceTypeLabel(project.businessSpaceType)} item created for ${config.industry}.`,
+        `Related context: due ${dueDate}; status target ${status}; use this item for timeline, calendar, and operational tracking demos.`,
+      ], state.results.diagnostics);
+
+      const previousKey = project.issueKeys[project.issueKeys.length - 1];
+      if (previousKey && issueIndex % 4 === 0) {
+        await createIssueLink(issue.key, previousKey, 'Blocks');
+      }
+
+      project.issueKeys.push(issue.key);
+      project.issueRecords.push({ key: issue.key, title: template.title, status, priority, dueDate, createdAt: lifecycle.createdAt, resolvedAt: lifecycle.resolvedAt });
+      project.issueCount++;
+    } catch (err) {
+      addChunkedError(state, `Work Management item ${issueIndex + 1} for ${project.key}: ${err.message}`);
+    }
+  }
+}
+
+async function executeProductDiscoveryIdeaBatchStep(config, state, step) {
+  const project = state.results.productDiscoveryProjects[step.projectIndex];
+  if (!project?.key) {
+    addChunkedDiagnostics(state, [`Product Discovery space ${step.projectIndex + 1}: skipped idea batch because the project was not created.`]);
+    return;
+  }
+  if (project.reusedExistingDomainData && !project.addVolumeToExistingDomainData) {
+    addChunkedDiagnostics(state, [`Product Discovery ${project.key}: reused ${project.existingIssueCount || 0} existing ideas; skipped duplicate idea creation.`]);
+    return;
+  }
+
+  const assignableUsers = await getAssignableUsers(project.key, state.metadata.accountId);
+  const demoDateFields = project.demoDateFields || await getProjectDemoDateFieldIds(project.key, state.results.diagnostics);
+  project.demoDateFields = demoDateFields;
+  const priorities = ['Highest', 'High', 'Medium', 'Low'];
+  const statusCycle = ['To Do', 'In Progress', 'Done'];
+
+  for (let offset = 0; offset < step.count; offset += 1) {
+    const issueIndex = step.start + offset;
+    const template = getProductDiscoveryIdeaTemplate(config, issueIndex);
+    const priority = priorities[issueIndex % priorities.length];
+    const status = statusCycle[issueIndex % statusCycle.length];
+    const lifecycle = ensureResolvedLifecycleForStatus(createLifecycleForIssue({
+      index: issueIndex,
+      priority,
+      issueType: template.type,
+      maxAgeDays: config.dateRangeDays,
+    }), status);
+    const dueDate = buildDueDateFromLifecycle(lifecycle, priority, issueIndex);
+    const assigneeAccountId = chooseDemoAssigneeAccountId(assignableUsers, issueIndex, step.projectIndex);
+
+    try {
+      const issue = await createIssue(project.key, template.title, template.type, null, priority, dueDate, null, {
+        assigneeAccountId,
+        demoDateFields,
+        diagnostics: state.results.diagnostics,
+        environmentName: config.environmentName,
+        lifecycle,
+        projectKind: 'product-discovery',
+        retentionPeriodDays: config.retentionPeriodDays,
+        description: template.description,
+        labels: template.labels,
+        issueIndex,
+      });
+      if (status !== 'To Do') {
+        await transitionIssue(issue.key, status);
+      }
+      await addIssueComment(issue.key, [
+        `Discovery signal: ${config.industry} idea created for roadmap prioritization.`,
+        `Suggested evaluation: customer impact, effort, confidence, and release fit.`,
+      ], state.results.diagnostics);
+
+      const previousKey = project.issueKeys[project.issueKeys.length - 1];
+      if (previousKey && issueIndex % 5 === 0) {
+        await createIssueLink(issue.key, previousKey, 'Relates');
+      }
+
+      project.issueKeys.push(issue.key);
+      project.issueRecords.push({ key: issue.key, title: template.title, status, priority, dueDate, createdAt: lifecycle.createdAt, resolvedAt: lifecycle.resolvedAt });
+      project.issueCount++;
+    } catch (err) {
+      addChunkedError(state, `Product Discovery idea ${issueIndex + 1} for ${project.key}: ${err.message}`);
     }
   }
 }
@@ -10774,7 +11287,12 @@ function buildChunkedSummary(config, state) {
 
   const results = state.results;
   const createdJsmProjects = results.jsmProjects.filter(project => project?.key && !project.failed);
-  const hasProjects = createdJsmProjects.length > 0 || results.softwareProjects.length > 0;
+  const createdBusinessProjects = (results.businessProjects || []).filter(project => project?.key && !project.failed);
+  const createdProductDiscoveryProjects = (results.productDiscoveryProjects || []).filter(project => project?.key && !project.failed);
+  const hasProjects = createdJsmProjects.length > 0
+    || results.softwareProjects.length > 0
+    || createdBusinessProjects.length > 0
+    || createdProductDiscoveryProjects.length > 0;
   const softwareTemplates = Array.from(new Set((config.softwareProjects || []).map(project => normaliseSoftwareTemplate(project.softwareTemplate))));
   const softwareStyles = Array.from(new Set((config.softwareProjects || []).map(project => getProjectManagementStyleLabel(project.softwareProjectStyle))));
   const softwareTemplateSummary = softwareTemplates.length === 0
@@ -10816,6 +11334,8 @@ function buildChunkedSummary(config, state) {
   const projectGoals = results.projectGoals?.filter(Boolean) || [];
   const projectKeys = [
     ...createdJsmProjects.map(project => project.key),
+    ...createdBusinessProjects.map(project => project.key),
+    ...createdProductDiscoveryProjects.map(project => project.key),
     ...results.softwareProjects.map(project => project.key),
   ].filter(Boolean);
   const automationBlueprints = buildAutomationBlueprints(projectKeys);
@@ -10835,6 +11355,8 @@ function buildChunkedSummary(config, state) {
     `- Ticket Data Duration: ${config.dateRange}`,
     `- JSM ITSM Projects: ${createdJsmProjects.length} (${results.totalIncidents} ITSM work items total)`,
     `- ITSM Work Mix per JSM Project: ${formatItsmWorkMix(config.itsmWorkCounts)}`,
+    `- Business / Work Management Spaces: ${createdBusinessProjects.length} (${createdBusinessProjects.reduce((total, project) => total + (project.issueRecords?.length || 0), 0)} work items created this run)`,
+    `- Jira Product Discovery Spaces: ${createdProductDiscoveryProjects.length} (${createdProductDiscoveryProjects.reduce((total, project) => total + (project.issueRecords?.length || 0), 0)} ideas created this run)`,
     `- Software Projects: ${results.softwareProjects.length} (${results.totalIssues} issues total)`,
     `- Software Templates: ${softwareTemplateSummary}`,
     `- Dev Project Management: ${softwareStyleSummary}`,
@@ -10901,6 +11423,18 @@ function buildChunkedSummary(config, state) {
         return `- ${project.key}: request types=${requestTypes}; queues=${queues}; knowledge base=${kb}`;
       }));
     }
+    lines.push('');
+  }
+
+  if (createdBusinessProjects.length > 0) {
+    lines.push('Business / Work Management Spaces Created:');
+    lines.push(...createdBusinessProjects.map(project => `- ${project.key}: ${project.name} (${getBusinessSpaceTypeLabel(project.businessSpaceType)}; ${project.issueRecords?.length || 0} new work items${project.reusedExistingDomainData ? `; reused existing project with ${project.existingIssueCount || 0} existing items` : ''})`));
+    lines.push('');
+  }
+
+  if (createdProductDiscoveryProjects.length > 0) {
+    lines.push('Jira Product Discovery Spaces Created:');
+    lines.push(...createdProductDiscoveryProjects.map(project => `- ${project.key}: ${project.name} (${project.issueRecords?.length || 0} new ideas${project.reusedExistingDomainData ? `; reused existing space with ${project.existingIssueCount || 0} existing ideas` : ''})`));
     lines.push('');
   }
 
@@ -11170,6 +11704,24 @@ resolver.define('executeDemoEnvironmentStep', async ({ payload }) => {
       break;
     case 'create-business-incidents-batch':
       await executeBusinessIncidentBatchStep(config, state, step);
+      break;
+    case 'create-work-management-project-shell':
+      await executeWorkManagementProjectStep(config, state, step);
+      break;
+    case 'configure-work-management-date-fields':
+      await executeGenericProjectDateFieldStep(state, step, 'businessProjects', 'Work Management space');
+      break;
+    case 'create-work-management-issues-batch':
+      await executeWorkManagementIssueBatchStep(config, state, step);
+      break;
+    case 'create-product-discovery-project-shell':
+      await executeProductDiscoveryProjectStep(config, state, step);
+      break;
+    case 'configure-product-discovery-date-fields':
+      await executeGenericProjectDateFieldStep(state, step, 'productDiscoveryProjects', 'Product Discovery space');
+      break;
+    case 'create-product-discovery-ideas-batch':
+      await executeProductDiscoveryIdeaBatchStep(config, state, step);
       break;
     case 'create-software-project-shell':
       await executeSoftwareProjectStep(config, state, step);

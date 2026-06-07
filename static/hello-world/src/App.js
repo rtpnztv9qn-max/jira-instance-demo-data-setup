@@ -2544,6 +2544,8 @@ function App() {
     softwareProjectStyle: 'team-managed',
     jsmServiceTypes: [],
     softwareProjects: [],
+    businessProjects: [],
+    productDiscoveryProjects: [],
     retentionPeriodDays: 180,
   });
 
@@ -2642,10 +2644,17 @@ function App() {
   };
 
   const invokeDemoStepWithRetry = async ({ currentConfig, currentState, step }) => {
-    const isProjectCreationStep = ['create-business-project', 'create-software-project-shell'].includes(step.type);
+    const isProjectCreationStep = [
+      'create-business-project',
+      'create-software-project-shell',
+      'create-work-management-project-shell',
+      'create-product-discovery-project-shell',
+    ].includes(step.type);
     const isTransientStep = [
       'create-business-incidents-batch',
       'create-software-issues-batch',
+      'create-work-management-issues-batch',
+      'create-product-discovery-ideas-batch',
       'create-software-sprint',
       'populate-kanban-board',
       'create-dependencies',
@@ -2695,6 +2704,20 @@ function App() {
         softwareProjectStyle: project.softwareProjectStyle || 'team-managed',
         issuesPerProject: DEFAULT_DEMO_ISSUE_COUNT,
       }));
+    const selectedVolumeBusinessProjects = selectedVolumeProjects
+      .filter(project => project.kind === 'business-project')
+      .map(project => ({
+        projectKey: project.key,
+        businessSpaceType: project.businessSpaceType || form.spaceType.replace(/^business:/, '') || 'task-tracking',
+        issuesPerProject: DEFAULT_DEMO_ISSUE_COUNT,
+      }));
+    const selectedVolumeProductDiscoveryProjects = selectedVolumeProjects
+      .filter(project => project.kind === 'product-discovery')
+      .map(project => ({
+        projectKey: project.key,
+        productDiscoveryType: project.productDiscoveryType || 'product-discovery',
+        issuesPerProject: DEFAULT_DEMO_ISSUE_COUNT,
+      }));
     const jsmServiceTypesForRun = [
       ...selectedVolumeJsmServiceTypes,
       ...form.jsmServiceTypes,
@@ -2702,6 +2725,14 @@ function App() {
     const softwareProjectsForRun = [
       ...selectedVolumeSoftwareProjects,
       ...form.softwareProjects,
+    ];
+    const businessProjectsForRun = [
+      ...selectedVolumeBusinessProjects,
+      ...form.businessProjects,
+    ];
+    const productDiscoveryProjectsForRun = [
+      ...selectedVolumeProductDiscoveryProjects,
+      ...form.productDiscoveryProjects,
     ];
 
     if (form.industry === 'Other' && !selectedIndustry) {
@@ -2714,14 +2745,14 @@ function App() {
       return;
     }
 
-    if ((isSelectedBusinessSpace || isSelectedJpdSpace) && selectedVolumeProjects.length === 0) {
-      setResult(`Select an existing ${selectedSpaceTypeLabel} space above, or choose a supported project type to create new demo data now: IT Service Management, HR Service Management, Customer Service Management, Software Project - Scrum, or Software Project - Kanban.`);
-      setIsSuccess(false);
-      return;
-    }
-
-    if (jsmServiceTypesForRun.length === 0 && softwareProjectsForRun.length === 0) {
-      setResult('Please select at least one JSM service area, software project, or existing project to add volume to.');
+    if (
+      jsmServiceTypesForRun.length === 0
+      && softwareProjectsForRun.length === 0
+      && businessProjectsForRun.length === 0
+      && productDiscoveryProjectsForRun.length === 0
+      && selectedVolumeProjects.length === 0
+    ) {
+      setResult('Please select at least one space to create, or select an existing project to add volume to.');
       return;
     }
 
@@ -2780,6 +2811,16 @@ function App() {
         softwareProjects: softwareProjectsForRun.map(project => ({
           softwareTemplate: project.softwareTemplate,
           softwareProjectStyle: project.softwareProjectStyle,
+          issuesPerProject: DEFAULT_DEMO_ISSUE_COUNT,
+        })),
+        businessProjects: businessProjectsForRun.map(project => ({
+          projectKey: project.projectKey || '',
+          businessSpaceType: project.businessSpaceType,
+          issuesPerProject: DEFAULT_DEMO_ISSUE_COUNT,
+        })),
+        productDiscoveryProjects: productDiscoveryProjectsForRun.map(project => ({
+          projectKey: project.projectKey || '',
+          productDiscoveryType: project.productDiscoveryType || 'product-discovery',
           issuesPerProject: DEFAULT_DEMO_ISSUE_COUNT,
         })),
         softwareProjectCount: softwareProjectsForRun.length,
@@ -3151,7 +3192,35 @@ function App() {
       return;
     }
 
-    setSelectionFeedback(`Select an existing ${selectedSpaceTypeLabel || 'space'} above to manage it, or choose IT Service Management, HR Service Management, Customer Service Management, Software Project - Scrum, or Software Project - Kanban to create new demo data now.`);
+    if (isSelectedBusinessSpace) {
+      const businessSpaceType = form.spaceType.replace(/^business:/, '');
+      setForm({
+        ...form,
+        businessProjects: [
+          ...form.businessProjects,
+          {
+            businessSpaceType,
+            issuesPerProject: DEFAULT_DEMO_ISSUE_COUNT,
+          },
+        ],
+      });
+      setSelectionFeedback(`${selectedSpaceTypeLabel} added below. It will create 60 realistic work-management items with due dates, generated custom dates, labels, relationship links, comments, and domain-specific tracking fields where Jira allows them.`);
+      return;
+    }
+
+    if (isSelectedJpdSpace) {
+      setForm({
+        ...form,
+        productDiscoveryProjects: [
+          ...form.productDiscoveryProjects,
+          {
+            productDiscoveryType: 'product-discovery',
+            issuesPerProject: DEFAULT_DEMO_ISSUE_COUNT,
+          },
+        ],
+      });
+      setSelectionFeedback(`${selectedSpaceTypeLabel} added below. It will create 60 product discovery ideas with roadmap-style dates, opportunity/impact labels, comments, and relationship links where Jira allows them.`);
+    }
   };
 
   const deleteSelectedDomainProjects = async () => {
@@ -3265,6 +3334,20 @@ function App() {
       softwareProjects: updatedProjects,
       softwareDashboardTypes: selectedValues,
       softwareDashboardPrompt: buildDashboardPromptFromValues(availableOptions, selectedValues),
+    });
+  };
+
+  const removeBusinessProject = (index) => {
+    setForm({
+      ...form,
+      businessProjects: form.businessProjects.filter((_, projectIndex) => projectIndex !== index),
+    });
+  };
+
+  const removeProductDiscoveryProject = (index) => {
+    setForm({
+      ...form,
+      productDiscoveryProjects: form.productDiscoveryProjects.filter((_, projectIndex) => projectIndex !== index),
     });
   };
 
@@ -3467,7 +3550,7 @@ function App() {
                 </div>
                 {domainInventory.projects.map(project => (
                   (() => {
-                    const canAddVolume = project.kind === 'business' || project.kind === 'software';
+                    const canAddVolume = ['business', 'software', 'business-project', 'product-discovery'].includes(project.kind);
                     return (
                   <div key={project.key} style={{ display: 'grid', gridTemplateColumns: '88px 72px 90px minmax(0, 1fr) 170px 90px', gap: '10px', alignItems: 'center', padding: '10px', border: '1px solid #dfe1e6', borderRadius: '4px', backgroundColor: '#fafbfc', fontSize: '13px' }}>
                     <label style={{ display: 'flex', alignItems: 'center', gap: '6px', cursor: 'pointer' }}>
@@ -3508,7 +3591,7 @@ function App() {
           <div style={{ ...sectionStyle, marginTop: '16px' }}>
             <div style={sectionTitleStyle}>Selected setup</div>
             <div style={{ color: '#42526e', fontSize: '13px', marginBottom: '12px' }}>
-              {selectedSpaceTypeLabel} for {getSelectedIndustry(form)}. Select existing rows above to add volume or delete{(isSelectedJsmSpace || isSelectedSoftwareSpace) ? ', or add a new matching project below.' : '.'}
+              {selectedSpaceTypeLabel} for {getSelectedIndustry(form)}. Select existing rows above to add volume or delete, or add a new matching space below.
             </div>
             {isSelectedSoftwareSpace && (
               <div style={{ ...fieldStyle, maxWidth: '260px' }}>
@@ -3524,20 +3607,13 @@ function App() {
                 </select>
               </div>
             )}
-            {(isSelectedBusinessSpace || isSelectedJpdSpace) && (
-              <div style={{ color: '#42526e', fontSize: '13px', marginBottom: '12px', padding: '12px', border: '1px solid #dfe1e6', borderRadius: '4px', backgroundColor: '#fff' }}>
-                Select an existing {selectedSpaceTypeLabel} space above to manage matching domain data. To create a new demo environment now, choose IT Service Management, HR Service Management, Customer Service Management, Software Project - Scrum, or Software Project - Kanban.
-              </div>
-            )}
-            {(isSelectedJsmSpace || isSelectedSoftwareSpace) && (
-              <button
-                type="button"
-                onClick={addSelectedSpace}
-                style={{ ...buttonStyle, width: '240px', padding: '10px 18px', fontSize: '14px', whiteSpace: 'nowrap' }}
-              >
-                Add new {selectedSpaceTypeLabel}
-              </button>
-            )}
+            <button
+              type="button"
+              onClick={addSelectedSpace}
+              style={{ ...buttonStyle, width: '260px', padding: '10px 18px', fontSize: '14px', whiteSpace: 'nowrap' }}
+            >
+              Add new {selectedSpaceTypeLabel}
+            </button>
             {selectionFeedback && (
               <div style={{ color: '#42526e', fontSize: '13px', marginTop: '10px', padding: '10px', border: '1px solid #dfe1e6', borderRadius: '4px', backgroundColor: '#fff' }}>
                 {selectionFeedback}
@@ -3622,6 +3698,60 @@ function App() {
               </div>
             </div>
           )}
+        </div>
+        )}
+
+        {isSelectedBusinessSpace && form.businessProjects.length > 0 && (
+        <div style={sectionStyle}>
+          <div style={sectionTitleStyle}>Business Projects / Work Management</div>
+          <div style={{ color: '#42526e', fontSize: '13px', marginBottom: '12px' }}>
+            Each selected Work Management space creates 60 domain-specific work items with due dates, generated custom dates, comments, relationship links, and tracking labels.
+          </div>
+          {form.businessProjects.map((project, index) => (
+            <div key={`business-project-${index}`} style={projectCardStyle}>
+              <div style={{ ...softwareProjectRowStyle, gridTemplateColumns: '170px minmax(170px, 1fr) minmax(0, 1fr) 82px' }}>
+                <div style={{ fontWeight: 600, color: '#172b4d', paddingBottom: '10px', whiteSpace: 'nowrap' }}>
+                  Business Space {index + 1}
+                </div>
+                <div style={{ color: '#172b4d', fontSize: '14px', paddingBottom: '10px', fontWeight: 600 }}>
+                  {spaceTypeOptions.find(option => option.value === `business:${project.businessSpaceType}`)?.label || 'Task Tracking'}
+                </div>
+                <div style={{ color: '#42526e', fontSize: '13px', paddingBottom: '10px' }}>
+                  60 work items with schedule data, owner-ready fields, dependencies, and comments
+                </div>
+                <button type="button" onClick={() => removeBusinessProject(index)} style={removeButtonStyle}>
+                  Remove
+                </button>
+              </div>
+            </div>
+          ))}
+        </div>
+        )}
+
+        {isSelectedJpdSpace && form.productDiscoveryProjects.length > 0 && (
+        <div style={sectionStyle}>
+          <div style={sectionTitleStyle}>Jira Product Discovery</div>
+          <div style={{ color: '#42526e', fontSize: '13px', marginBottom: '12px' }}>
+            Each selected Product Discovery space creates 60 discovery ideas with opportunity, impact, roadmap, comments, and relationship signals where Jira allows them.
+          </div>
+          {form.productDiscoveryProjects.map((project, index) => (
+            <div key={`jpd-project-${index}`} style={projectCardStyle}>
+              <div style={{ ...softwareProjectRowStyle, gridTemplateColumns: '170px minmax(170px, 1fr) minmax(0, 1fr) 82px' }}>
+                <div style={{ fontWeight: 600, color: '#172b4d', paddingBottom: '10px', whiteSpace: 'nowrap' }}>
+                  Discovery Space {index + 1}
+                </div>
+                <div style={{ color: '#172b4d', fontSize: '14px', paddingBottom: '10px', fontWeight: 600 }}>
+                  Jira Product Discovery
+                </div>
+                <div style={{ color: '#42526e', fontSize: '13px', paddingBottom: '10px' }}>
+                  60 product ideas with discovery labels, roadmap dates, comments, and links
+                </div>
+                <button type="button" onClick={() => removeProductDiscoveryProject(index)} style={removeButtonStyle}>
+                  Remove
+                </button>
+              </div>
+            </div>
+          ))}
         </div>
         )}
 
