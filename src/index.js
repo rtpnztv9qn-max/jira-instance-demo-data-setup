@@ -5866,6 +5866,46 @@ async function getSprintIssueCount(sprintId) {
   return Number.isFinite(Number(data.total)) ? Number(data.total) : issues.length;
 }
 
+function sprintFieldValueContainsSprint(value, sprintId) {
+  const expectedId = String(sprintId);
+  const values = Array.isArray(value) ? value : [value];
+
+  return values.some(item => {
+    if (item === null || item === undefined) {
+      return false;
+    }
+
+    if (typeof item === 'object') {
+      return String(item.id || item.value || item.name || '').includes(expectedId);
+    }
+
+    return String(item).includes(`id=${expectedId}`) || String(item) === expectedId;
+  });
+}
+
+async function getIssueSprintMembershipCount(sprintId, issueKeys, diagnostics = []) {
+  const sprintFieldId = await getSprintFieldId(diagnostics);
+  const keys = Array.isArray(issueKeys) ? issueKeys.filter(Boolean) : [];
+
+  if (!sprintFieldId || keys.length === 0) {
+    return 0;
+  }
+
+  let count = 0;
+  for (const issueKey of keys) {
+    try {
+      const issue = await jiraGet(`/rest/api/3/issue/${encodeURIComponent(issueKey)}?fields=${encodeURIComponent(sprintFieldId)}`);
+      if (sprintFieldValueContainsSprint(issue?.fields?.[sprintFieldId], sprintId)) {
+        count += 1;
+      }
+    } catch (err) {
+      diagnostics.push(`Sprint ${sprintId}: could not verify Sprint field on ${issueKey}: ${err.message}`);
+    }
+  }
+
+  return count;
+}
+
 async function assignAndVerifyIssuesToSprint(sprintId, issueKeys, diagnostics = []) {
   const keys = Array.isArray(issueKeys) ? issueKeys.filter(Boolean) : [];
   const assignResult = await assignIssuesToSprint(sprintId, keys, diagnostics);
@@ -5876,7 +5916,9 @@ async function assignAndVerifyIssuesToSprint(sprintId, issueKeys, diagnostics = 
 
   let verifiedCount = 0;
   try {
-    verifiedCount = await getSprintIssueCount(sprintId);
+    const boardVisibleCount = await getSprintIssueCount(sprintId);
+    const fieldMembershipCount = await getIssueSprintMembershipCount(sprintId, keys, diagnostics);
+    verifiedCount = Math.max(boardVisibleCount, fieldMembershipCount);
   } catch (verifyErr) {
     diagnostics.push(`Sprint ${sprintId}: issue verification failed after assignment: ${verifyErr.message}`);
   }
@@ -5885,7 +5927,9 @@ async function assignAndVerifyIssuesToSprint(sprintId, issueKeys, diagnostics = 
     try {
       await wait(1200);
       await moveIssuesToSprint(sprintId, keys);
-      verifiedCount = await getSprintIssueCount(sprintId);
+      const boardVisibleCount = await getSprintIssueCount(sprintId);
+      const fieldMembershipCount = await getIssueSprintMembershipCount(sprintId, keys, diagnostics);
+      verifiedCount = Math.max(boardVisibleCount, fieldMembershipCount);
     } catch (retryErr) {
       diagnostics.push(`Sprint ${sprintId}: retry assignment verification failed: ${retryErr.message}`);
     }
@@ -8933,6 +8977,7 @@ async function executeSoftwareProjectStep(config, state, step) {
       issueKeys: [],
       issueRecords: [],
       firstIssueKey: null,
+      goalIssueKeys: [],
       versions: [],
       components: [],
       epicKeys: [],
@@ -9223,7 +9268,7 @@ async function executeAtlassianGoalsStep(config, state, step) {
     try {
       const goalRecord = await createProjectGoalWorkItem(config, project, goalTemplate, goalIndex, state.results.diagnostics);
       project.projectGoals.push(goalRecord);
-      project.issueKeys = Array.from(new Set([...(project.issueKeys || []), goalRecord.key]));
+      project.goalIssueKeys = Array.from(new Set([...(project.goalIssueKeys || []), goalRecord.key]));
       state.results.projectGoals.push(goalRecord);
       addChunkedDiagnostics(state, [`Project goal ${project.key}: created ${goalRecord.key} "${goalRecord.name}" (target ${goalRecord.targetDate}).`]);
     } catch (err) {
@@ -9553,7 +9598,8 @@ async function executeSoftwareSprintStep(config, state, step) {
   try {
     const schedule = getSprintSchedule(step.sprintIndex);
     const sprint = await createSprint(sprintBoardId, `${project.key} Sprint ${step.sprintIndex + 1}`, schedule.startDate, schedule.endDate);
-    const issueChunk = getSprintIssueChunk(project.issueKeys, step.sprintIndex, config.sprintsPerProject);
+    const sprintIssueKeys = (project.issueRecords || []).map(record => record?.key).filter(Boolean);
+    const issueChunk = getSprintIssueChunk(sprintIssueKeys, step.sprintIndex, config.sprintsPerProject);
 
     if (step.sprintIndex === 0 && issueChunk.length === 0) {
       addChunkedError(state, `Sprint ${sprint.id} for ${project.key}: Sprint 1 was created but no software issue keys were available to move into it.`);
