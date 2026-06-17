@@ -2,18 +2,28 @@ import React, { useEffect, useState } from 'react';
 import { invoke, router, view } from '@forge/bridge';
 
 const industries = ['Banking', 'Healthcare', 'Insurance', 'Telecom', 'Retail', 'Manufacturing', 'SaaS', 'Public Sector', 'Education', 'Energy & Utilities'];
-const jsmServiceTypeOptions = ['ITSM', 'HRSM', 'CSM'];
+const jsmServiceTypeOptions = ['ITSM', 'HRSM', 'CSM', 'FSM', 'LSM'];
+const jsmServiceTypeLabels = {
+  ITSM: 'IT Service Management',
+  'ITSM-ESS': 'IT Service Management Essentials',
+  GSM: 'General Service Management',
+  HRSM: 'HR Service Management',
+  CSM: 'Customer Service Management',
+  FSM: 'Facilities Service Management',
+  LSM: 'Legal Service Management',
+};
 const spaceTypeOptions = [
   { value: 'jpd:product-discovery', label: 'Jira Product Discovery', group: 'Product Management' },
-  { value: 'business:task-tracking', label: 'Task Tracking', group: 'Business Projects / Work Management' },
-  { value: 'business:budget-planning', label: 'Budget Planning', group: 'Business Projects / Work Management' },
-  { value: 'business:recruitment-tracking', label: 'Recruitment Management', group: 'Business Projects / Work Management' },
-  { value: 'business:procurement-management', label: 'Procurement Management', group: 'Business Projects / Work Management' },
+  { value: 'business:task-tracking', label: 'Task Tracking', group: 'Work Management' },
+  { value: 'business:budget-planning', label: 'Budget Planning', group: 'Work Management' },
   { value: 'jsm:ITSM', label: 'IT Service Management', group: 'Jira Service Management' },
   { value: 'jsm:HRSM', label: 'HR Service Management', group: 'Jira Service Management' },
   { value: 'jsm:CSM', label: 'Customer Service Management', group: 'Jira Service Management' },
+  { value: 'jsm:FSM', label: 'Facilities Service Management', group: 'Jira Service Management' },
+  { value: 'jsm:LSM', label: 'Legal Service Management', group: 'Jira Service Management' },
   { value: 'software:scrum', label: 'Software Project - Scrum', group: 'Jira Software Projects' },
   { value: 'software:kanban', label: 'Software Project - Kanban', group: 'Jira Software Projects' },
+  { value: 'software:bug-tracking', label: 'Software Project - Bug Tracking', group: 'Jira Software Projects' },
 ];
 const groupedSpaceTypeOptions = spaceTypeOptions.reduce((groups, option) => {
   if (!groups[option.group]) {
@@ -23,6 +33,7 @@ const groupedSpaceTypeOptions = spaceTypeOptions.reduce((groups, option) => {
   return groups;
 }, {});
 const DEFAULT_DEMO_ISSUE_COUNT = 60;
+const PRODUCT_DISCOVERY_VOLUME_ONLY_MESSAGE = 'Jira Product Discovery spaces must be created from Jira UI on this site. The Forge app can add demo ideas to an existing native Product Discovery space selected with Volume, but it will not create a new Product Discovery space through REST because Jira can create an incomplete Polaris shell.';
 
 const opsDashboardOptions = [
   {
@@ -33,6 +44,25 @@ const opsDashboardOptions = [
   { value: 'enterprise-service-health', label: 'Executive Dashboard (Cross-project)', prompt: 'Executive Dashboard for service management leadership. Show service health, total requests raised, open vs resolved requests, ticket trend over time, SLA compliance, tickets nearing SLA breach, breached ticket count, CSAT, escalation trend, major incidents, high-priority open issues, tickets by team/project, and workload distribution. Answer: How healthy are our services? Are commitments being met? Are customers satisfied? Which teams require attention? KPIs: SLA compliance %, MTTR, CSAT, resolution rate %.' },
   { value: 'service-desk-operations', label: 'Project-Level Dashboard (Single Service Project)', prompt: 'Project-Level Dashboard for a single service project. Show queue health, open tickets, aging tickets, tickets by priority, active incidents, escalated incidents, incident trend, tickets approaching SLA breach, breached tickets, tickets by assignee, agent workload, and knowledge/customer signals where available. Answer: What needs immediate action? Which tickets are at risk? Is work balanced? KPIs: first response time, resolution rate %, MTTR, SLA achievement %.' },
 ];
+
+function getJsmDashboardOptions(serviceTypes = []) {
+  const selectedTypes = Array.from(new Set((serviceTypes || []).filter(Boolean)));
+  if (selectedTypes.length === 0 || selectedTypes.every(type => type === 'ITSM')) {
+    return opsDashboardOptions;
+  }
+
+  return selectedTypes.flatMap(serviceType => {
+    const label = jsmServiceTypeLabels[serviceType] || 'Service Management';
+    if (serviceType === 'ITSM') {
+      return opsDashboardOptions.filter(option => option.value !== 'enterprise-service-health');
+    }
+    return [{
+      value: `jsm-${serviceType}-dashboard`,
+      label: `Project-Level Dashboard - ${label}`,
+      prompt: `Project-level dashboard for a Jira Service Management ${label} space. Show open work, work by status, priority mix, owner workload, aging work, overdue or at-risk items, created vs resolved trend, and recent activity for the selected service domain. Answer: What work needs attention for ${label}? Are requests moving and completing? KPIs: open work, high-priority work, overdue work, completion rate %, average age.`,
+    }];
+  });
+}
 
 const baseSoftwareDashboardOptions = [
   {
@@ -65,12 +95,53 @@ function buildDashboardPromptFromValues(options, values) {
 function getSoftwareDashboardOptions(softwareProjects = []) {
   const hasScrumProject = softwareProjects.some(project => project.softwareTemplate === 'scrum');
   const hasKanbanProject = softwareProjects.some(project => project.softwareTemplate === 'kanban');
+  const hasBugTrackingProject = softwareProjects.some(project => project.softwareTemplate === 'bug-tracking');
+
+  if (hasBugTrackingProject && !hasScrumProject && !hasKanbanProject) {
+    return [{
+      value: 'bug-tracking-health',
+      label: 'Project-Level Dashboard - Bug Tracking',
+      prompt: 'Project-Level Dashboard for a Bug Tracking project. Show reported bugs, open defects, priority and severity mix, owner workload, aging bugs, fixed vs unresolved trend, and review status. Answer: Which bugs need attention and is defect resolution improving? KPIs: open defect count, fix rate %, high-priority bugs, average age.',
+    }];
+  }
 
   return [
     ...baseSoftwareDashboardOptions,
     ...(hasScrumProject ? [scrumSoftwareDashboardOption] : []),
     ...(hasKanbanProject ? [kanbanSoftwareDashboardOption] : []),
+    ...(hasBugTrackingProject ? [{
+      value: 'bug-tracking-health',
+      label: 'Project-Level Dashboard - Bug Tracking',
+      prompt: 'Project-Level Dashboard for a Bug Tracking project. Show reported bugs, open defects, priority and severity mix, owner workload, aging bugs, fixed vs unresolved trend, and review status. Answer: Which bugs need attention and is defect resolution improving? KPIs: open defect count, fix rate %, high-priority bugs, average age.',
+    }] : []),
   ];
+}
+
+function getBusinessDashboardOptions(businessProjects = []) {
+  const optionsByValue = new Map();
+  businessProjects.forEach(project => {
+    const businessSpaceType = project.businessSpaceType || 'task-tracking';
+    const spaceOption = spaceTypeOptions.find(option => option.value === `business:${businessSpaceType}`);
+    const label = spaceOption?.label || 'Task Tracking';
+    const group = spaceOption?.group || 'Business';
+    const value = `business-${businessSpaceType}-dashboard`;
+    optionsByValue.set(value, {
+      value,
+      label: `Project-Level Dashboard - ${label}`,
+      prompt: `Project-level dashboard for a Jira ${group} ${label} space. Show created vs resolved work, open work, overdue items, priority mix, owner workload, aging work, and completion trend for the selected business domain. Answer: What work needs attention for ${label}? Are items completing on time? KPIs: open work, overdue work, completion rate %, high-priority count, average age.`,
+    });
+  });
+  return Array.from(optionsByValue.values());
+}
+
+function getProductDiscoveryDashboardOptions(productDiscoveryProjects = []) {
+  return productDiscoveryProjects.length > 0
+    ? [{
+        value: 'product-discovery-dashboard',
+        label: 'Project-Level Dashboard - Jira Product Discovery',
+        prompt: 'Project-level dashboard for Jira Product Discovery. Show idea intake, open opportunities, priority or impact mix, owner workload, aging ideas, completion trend, and delivery readiness for the selected business domain. Answer: Which ideas need attention and what is ready for delivery? KPIs: open ideas, high-impact ideas, completion rate %, average idea age.',
+      }]
+    : [];
 }
 
 function filterDashboardValues(options, values) {
@@ -776,6 +847,190 @@ function DashboardGadget({ context, source = 'dashboard' }) {
     );
   };
 
+  const renderGaugeChart = (items, emptyMessage, drilldownType, label = 'Current risk') => {
+    const visibleItems = (items || []).filter(item => item.count > 0);
+    const total = visibleItems.reduce((sum, item) => sum + item.count, 0);
+    const riskItems = visibleItems.filter(item => /critical|highest|high|breach|overdue|risk|blocked|open|in progress|waiting/i.test(item.name));
+    const riskCount = riskItems.reduce((sum, item) => sum + item.count, 0) || visibleItems[0]?.count || 0;
+    const percent = total === 0 ? 0 : Math.min(100, Math.round((riskCount / total) * 100));
+    const angle = -90 + ((percent / 100) * 180);
+
+    if (visibleItems.length === 0 || total === 0) {
+      return <div style={{ ...mutedStyle, margin: '0 16px 14px' }}>{emptyMessage}</div>;
+    }
+
+    return (
+      <div style={{ ...visualPanelStyle, margin: '0 16px 14px', padding: '18px', display: 'grid', gridTemplateColumns: 'minmax(220px, 340px) 1fr', gap: '22px', alignItems: 'center', overflowX: 'auto' }}>
+        {renderDrilldownLink(getItemDrilldownUrl(drilldownType, visibleItems[0]), (
+          <div title={`${label}: ${percent}% (${riskCount} of ${total})`} style={{ minWidth: '220px', cursor: 'pointer' }}>
+            <svg viewBox="0 0 220 130" style={{ width: '100%', height: 'auto', display: 'block' }}>
+              <path d="M30 110 A80 80 0 0 1 190 110" fill="none" stroke="#ebecf0" strokeWidth="28" strokeLinecap="round" />
+              <path d="M30 110 A80 80 0 0 1 190 110" fill="none" stroke="#de350b" strokeWidth="28" strokeLinecap="round" strokeDasharray={`${percent * 2.52} 252`} />
+              <line x1="110" y1="110" x2={110 + (68 * Math.cos((angle * Math.PI) / 180))} y2={110 + (68 * Math.sin((angle * Math.PI) / 180))} stroke="#172b4d" strokeWidth="5" strokeLinecap="round" />
+              <circle cx="110" cy="110" r="7" fill="#172b4d" />
+              <text x="110" y="82" textAnchor="middle" fill="#de350b" fontSize="24" fontWeight="800">{percent}%</text>
+              <text x="110" y="101" textAnchor="middle" fill="#42526e" fontSize="12">{riskCount} of {total}</text>
+            </svg>
+            <div style={{ ...mutedStyle, textAlign: 'center', marginTop: '4px' }}>{label}</div>
+          </div>
+        ), { display: 'block' })}
+        <div style={{ display: 'grid', gap: '9px', minWidth: '260px' }}>
+          {visibleItems.slice(0, 6).map((item, index) => renderDrilldownLink(getItemDrilldownUrl(drilldownType, item), (
+            <div key={item.name} style={{ display: 'grid', gridTemplateColumns: '14px 1fr auto', gap: '8px', alignItems: 'center', cursor: 'pointer' }}>
+              <span style={{ width: '12px', height: '12px', borderRadius: '50%', background: chartColors[index % chartColors.length] }} />
+              <span style={{ overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{item.name}</span>
+              <strong>{item.count}</strong>
+            </div>
+          ), { display: 'block' }))}
+        </div>
+      </div>
+    );
+  };
+
+  const renderGroupedComparisonBars = () => {
+    const statuses = (data.statusCounts || []).filter(item => item.count > 0).slice(0, 5);
+    const priorityBands = [
+      { name: 'Critical / High', priorities: ['Critical', 'Highest', 'High'], color: '#de350b' },
+      { name: 'Medium', priorities: ['Medium'], color: '#ff991f' },
+      { name: 'Low', priorities: ['Low', 'Lowest', 'Informational'], color: '#36b37e' },
+    ];
+    const maxCount = Math.max(...statuses.flatMap(status => priorityBands.map(band => (
+      issues.filter(issue => issue.status === status.name && band.priorities.includes(issue.priority)).length
+    ))), 1);
+
+    if (statuses.length === 0) {
+      return <div style={{ ...mutedStyle, margin: '0 16px 14px' }}>No status data found.</div>;
+    }
+
+    return (
+      <div style={{ ...visualPanelStyle, margin: '0 16px 14px', padding: '18px', overflowX: 'auto' }}>
+        <div style={{ minWidth: `${Math.max(620, statuses.length * 126)}px` }}>
+          <div style={{ display: 'flex', justifyContent: 'flex-end', gap: '16px', marginBottom: '12px', ...mutedStyle }}>
+            {priorityBands.map(band => <span key={band.name}><span style={{ display: 'inline-block', width: '10px', height: '10px', background: band.color, marginRight: '5px' }} />{band.name}</span>)}
+          </div>
+          <div style={{ display: 'grid', gridTemplateColumns: '42px 1fr', gap: '10px' }}>
+            <div style={{ height: '180px', display: 'flex', flexDirection: 'column', justifyContent: 'space-between', color: '#7a869a', fontSize: '11px', textAlign: 'right' }}>
+              {[maxCount, Math.round(maxCount * 0.5), 0].map(tick => <span key={tick}>{tick}</span>)}
+            </div>
+            <div style={{ position: 'relative', height: '180px', borderLeft: '1px solid #dfe1e6', borderBottom: '1px solid #dfe1e6' }}>
+              {[0, 50, 100].map(line => <div key={line} style={{ position: 'absolute', left: 0, right: 0, bottom: `${line}%`, borderTop: '1px solid #ebecf0' }} />)}
+              <div style={{ position: 'absolute', inset: '0 12px', display: 'grid', gridTemplateColumns: `repeat(${statuses.length}, minmax(90px, 1fr))`, gap: '18px', alignItems: 'end' }}>
+                {statuses.map(status => (
+                  <div key={status.name} style={{ display: 'flex', alignItems: 'end', gap: '5px', height: '100%' }}>
+                    {priorityBands.map(band => {
+                      const count = issues.filter(issue => issue.status === status.name && band.priorities.includes(issue.priority)).length;
+                      const height = Math.max(count > 0 ? 4 : 0, Math.round((count / maxCount) * 168));
+                      return renderDrilldownLink(getItemDrilldownUrl('status', status), (
+                        <div key={band.name} title={`${status.name} / ${band.name}: ${count}`} style={{ flex: 1, height: `${height}px`, background: band.color, borderRadius: '4px 4px 0 0', cursor: 'pointer' }} />
+                      ), { flex: 1, display: 'block' });
+                    })}
+                  </div>
+                ))}
+              </div>
+            </div>
+          </div>
+          <div style={{ display: 'grid', gridTemplateColumns: `42px repeat(${statuses.length}, minmax(90px, 1fr))`, gap: '18px', marginTop: '9px' }}>
+            <span />
+            {statuses.map(status => <div key={status.name} style={{ ...mutedStyle, textAlign: 'center', fontWeight: 700 }}>{status.name}</div>)}
+          </div>
+        </div>
+      </div>
+    );
+  };
+
+  const renderTimelineGantt = () => {
+    const sourceIssues = issues
+      .filter(issue => issue.dueDate || issue.createdAt)
+      .slice(0, 10);
+    const generated = new Date(`${config.generatedAt || new Date().toISOString().split('T')[0]}T00:00:00`);
+
+    if (sourceIssues.length === 0) {
+      return <div style={{ ...mutedStyle, margin: '0 16px 14px' }}>No dated work found for timeline.</div>;
+    }
+
+    const dayMs = 86400000;
+    const getDate = value => {
+      const date = value ? new Date(`${value}T00:00:00`) : null;
+      return date && !Number.isNaN(date.getTime()) ? date : null;
+    };
+    const rows = sourceIssues.map((issue, index) => {
+      const created = getDate(issue.createdAt) || new Date(generated.getTime() - (index * 2 * dayMs));
+      const due = getDate(issue.dueDate) || new Date(created.getTime() + ((index % 5) + 4) * dayMs);
+      const start = created <= due ? created : due;
+      const end = due >= created ? due : created;
+      return { issue, start, end };
+    });
+    const minTime = Math.min(...rows.map(row => row.start.getTime()));
+    const maxTime = Math.max(...rows.map(row => row.end.getTime()), minTime + (14 * dayMs));
+    const span = Math.max(dayMs, maxTime - minTime);
+
+    return (
+      <div style={{ ...visualPanelStyle, margin: '0 16px 14px', padding: '14px', overflowX: 'auto' }}>
+        <div style={{ minWidth: '760px' }}>
+          <div style={{ display: 'grid', gridTemplateColumns: '190px 1fr', gap: '12px', ...mutedStyle, fontWeight: 800, textTransform: 'uppercase', marginBottom: '8px' }}>
+            <span>Work item</span>
+            <span>Schedule</span>
+          </div>
+          {rows.map(({ issue, start, end }, index) => {
+            const left = Math.max(0, Math.round(((start.getTime() - minTime) / span) * 100));
+            const width = Math.max(8, Math.round(((end.getTime() - start.getTime()) / span) * 100));
+            const color = getIssueRiskColor(issue);
+
+            return renderDrilldownLink(getIssueUrl(issue), (
+              <div key={issue.key} style={{ display: 'grid', gridTemplateColumns: '190px 1fr', gap: '12px', alignItems: 'center', padding: '8px 0', borderTop: '1px solid #ebecf0', cursor: 'pointer' }}>
+                <div style={{ minWidth: 0 }}>
+                  <strong style={{ color: '#0052cc' }}>{issue.key}</strong>
+                  <div title={issue.summary} style={{ ...mutedStyle, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{issue.summary}</div>
+                </div>
+                <div style={{ position: 'relative', height: '28px', background: '#f4f5f7', borderRadius: '3px', overflow: 'hidden' }}>
+                  <div title={`${issue.key}: ${issue.createdAt || 'No start'} to ${issue.dueDate || 'No due date'}`} style={{ position: 'absolute', left: `${left}%`, width: `${Math.min(width, 100 - left)}%`, top: '5px', height: '18px', background: color, borderRadius: '3px', color: '#ffffff', fontSize: '10px', fontWeight: 800, display: 'flex', alignItems: 'center', paddingLeft: '6px', boxSizing: 'border-box', whiteSpace: 'nowrap' }}>
+                    {issue.status}
+                  </div>
+                </div>
+              </div>
+            ), { display: 'block' });
+          })}
+        </div>
+      </div>
+    );
+  };
+
+  const renderLaneCards = (field = 'status') => {
+    const groups = Array.from(new Set(issues.map(issue => issue[field] || 'Unassigned'))).slice(0, 4);
+
+    if (groups.length === 0) {
+      return <div style={{ ...mutedStyle, margin: '0 16px 14px' }}>No work found.</div>;
+    }
+
+    return (
+      <div style={{ margin: '0 16px 14px', display: 'grid', gridTemplateColumns: `repeat(${groups.length}, minmax(170px, 1fr))`, gap: '12px', overflowX: 'auto' }}>
+        {groups.map((group, groupIndex) => {
+          const groupIssues = issues.filter(issue => (issue[field] || 'Unassigned') === group).slice(0, 4);
+          return (
+            <div key={group} style={{ border: '1px solid #dfe1e6', borderTop: `3px solid ${chartColors[groupIndex % chartColors.length]}`, borderRadius: '3px', background: '#f7f8f9', minWidth: '170px', padding: '10px' }}>
+              <div style={{ display: 'flex', justifyContent: 'space-between', gap: '8px', marginBottom: '10px' }}>
+                <strong>{group}</strong>
+                <span style={badgeStyle}>{issues.filter(issue => (issue[field] || 'Unassigned') === group).length}</span>
+              </div>
+              <div style={{ display: 'grid', gap: '8px' }}>
+                {groupIssues.map(issue => renderDrilldownLink(getIssueUrl(issue), (
+                  <div key={issue.key} style={{ border: '1px solid #dfe1e6', borderRadius: '3px', background: '#ffffff', padding: '8px', cursor: 'pointer' }}>
+                    <div style={{ display: 'flex', justifyContent: 'space-between', gap: '8px', marginBottom: '5px' }}>
+                      <strong style={{ color: '#0052cc' }}>{issue.key}</strong>
+                      <span>{renderPriorityIcon(issue.priority)}</span>
+                    </div>
+                    <div title={issue.summary} style={{ fontSize: '12px', lineHeight: '16px', overflow: 'hidden', display: '-webkit-box', WebkitLineClamp: 2, WebkitBoxOrient: 'vertical' }}>{issue.summary}</div>
+                  </div>
+                ), { display: 'block' }))}
+              </div>
+            </div>
+          );
+        })}
+      </div>
+    );
+  };
+
+
   const renderPieChart = (items, emptyMessage) => {
     const visibleItems = items.filter((item) => item.count > 0);
     const total = visibleItems.reduce((sum, item) => sum + item.count, 0);
@@ -1441,14 +1696,23 @@ function DashboardGadget({ context, source = 'dashboard' }) {
         <div style={{ ...mutedStyle, marginBottom: '8px' }}>Today</div>
         <div style={{ display: 'grid', gap: '10px' }}>
           {recentIssues.length === 0 ? <div style={mutedStyle}>No recent activity.</div> : recentIssues.map((issue, index) => (
-            <div key={issue.key} style={{ display: 'grid', gridTemplateColumns: '22px minmax(0, 1fr)', gap: '8px', alignItems: 'start' }}>
+            <a
+              key={issue.key}
+              href={getIssueUrl(issue)}
+              onClick={(event) => {
+                event.preventDefault();
+                router.open(getIssueUrl(issue)).catch(() => window.open(getIssueUrl(issue), '_blank', 'noopener,noreferrer'));
+              }}
+              title={`Open ${issue.key}: ${issue.summary}`}
+              style={{ display: 'grid', gridTemplateColumns: '22px minmax(0, 1fr)', gap: '8px', alignItems: 'start', color: 'inherit', textDecoration: 'none', cursor: 'pointer' }}
+            >
               <div style={{ width: '18px', height: '18px', borderRadius: '50%', background: '#deebff', color: '#0052cc', fontWeight: 800, display: 'flex', alignItems: 'center', justifyContent: 'center', fontSize: '11px' }}>+</div>
               <div style={{ minWidth: 0 }}>
                 <div style={{ fontSize: '12px', color: '#172b4d' }}>Work item was updated {index + 3} minutes ago</div>
-                <div style={{ fontSize: '12px', color: '#0052cc', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{issue.summary}</div>
-                <div style={mutedStyle}>{issue.key} - {issue.status}</div>
+                <div style={{ fontSize: '12px', color: '#0052cc', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', textDecoration: 'underline' }}>{issue.summary}</div>
+                <div style={{ ...mutedStyle, color: '#0052cc' }}>{issue.key} - {issue.status}</div>
               </div>
-            </div>
+            </a>
           ))}
         </div>
       </div>
@@ -2315,7 +2579,9 @@ function DashboardGadget({ context, source = 'dashboard' }) {
       <div style={shellStyle}>
         {renderHeader(config.title || 'Demo Projects', config.filterName)}
         {renderVisualSummary()}
-        {visualType.includes('bars')
+        {visualType.includes('tiles') || visualType.includes('workload')
+          ? renderLaneCards('assignee')
+          : visualType.includes('bars')
           ? renderHorizontalBars(projectRows, 'No project work found.', 'project')
           : (config.projects || []).map((project) => (
             <div key={project.key} style={compactRowStyle}>
@@ -2337,7 +2603,13 @@ function DashboardGadget({ context, source = 'dashboard' }) {
       <div style={shellStyle}>
         {renderHeader(config.title, config.filterName)}
         {renderVisualSummary()}
-        {viewType === 'priority' || visualType.includes('donut')
+        {visualType.includes('gauge')
+          ? renderGaugeChart(rows || [], 'No matching work found.', viewType, viewType === 'priority' ? 'Priority risk' : 'Workflow risk')
+          : visualType.includes('grouped')
+            ? renderGroupedComparisonBars()
+            : visualType.includes('lane') || visualType.includes('stage')
+              ? renderLaneCards('status')
+              : viewType === 'priority' || visualType.includes('donut')
           ? renderPieChart(rows || [], 'No matching work found.')
           : renderStatusMatrix()}
       </div>
@@ -2349,7 +2621,9 @@ function DashboardGadget({ context, source = 'dashboard' }) {
       <div style={shellStyle}>
         {renderHeader(config.title, 'Overdue open work by project')}
         {renderVisualSummary()}
-        {renderHorizontalBars(data.overdueByProject || [], 'No overdue work found.', 'project')}
+        {visualType.includes('gauge')
+          ? renderGaugeChart(data.overdueByProject || [], 'No overdue work found.', 'project', 'Due date risk')
+          : renderHorizontalBars(data.overdueByProject || [], 'No overdue work found.', 'project')}
       </div>
     );
   }
@@ -2369,7 +2643,9 @@ function DashboardGadget({ context, source = 'dashboard' }) {
       <div style={shellStyle}>
         {renderHeader(config.title, 'Average days since each issue entered its current status')}
         {renderVisualSummary()}
-        {renderAverageTimeBars(data.averageTimeInStatus || [])}
+        {visualType.includes('gauge')
+          ? renderGaugeChart(data.averageTimeInStatus || [], 'No status timing data found.', 'status', 'Cycle time pressure')
+          : renderAverageTimeBars(data.averageTimeInStatus || [])}
       </div>
     );
   }
@@ -2379,7 +2655,9 @@ function DashboardGadget({ context, source = 'dashboard' }) {
       <div style={shellStyle}>
         {renderHeader(config.title, 'Generated lifecycle age bands')}
         {renderVisualSummary()}
-        {renderHorizontalBars(data.ticketAging || [], 'No ticket aging data found.', 'aging')}
+        {visualType.includes('gauge')
+          ? renderGaugeChart(data.ticketAging || [], 'No ticket aging data found.', 'aging', 'Aging risk')
+          : renderHorizontalBars(data.ticketAging || [], 'No ticket aging data found.', 'aging')}
       </div>
     );
   }
@@ -2493,7 +2771,9 @@ function DashboardGadget({ context, source = 'dashboard' }) {
       <div style={shellStyle}>
         {renderHeader(config.title, 'Release versions due in the next 30 days')}
         {renderVisualSummary()}
-        {(data.roadmap || []).length === 0
+        {visualType.includes('gantt') || visualType.includes('timeline')
+          ? renderTimelineGantt()
+          : (data.roadmap || []).length === 0
           ? <div style={mutedStyle}>No releases are due in the next 30 days.</div>
           : (data.roadmap || []).map((version) => (
             <div key={`${version.projectKey}-${version.name}`} style={timelineRowStyle}>
@@ -2513,7 +2793,9 @@ function DashboardGadget({ context, source = 'dashboard' }) {
     <div style={shellStyle}>
       {renderHeader(config.title || 'Open Work', config.filterName)}
       {renderVisualSummary()}
-      {renderIssueCards(issues, 'No matching work found.')}
+      {visualType.includes('lane') || visualType.includes('cards')
+        ? renderLaneCards(visualType.includes('owner') || visualType.includes('agent') ? 'assignee' : 'status')
+        : renderIssueCards(issues, 'No matching work found.')}
       {renderDataNotes()}
     </div>
   );
@@ -2539,6 +2821,10 @@ function App() {
     opsDashboardPrompt: '',
     softwareDashboardTypes: [],
     softwareDashboardPrompt: '',
+    businessDashboardTypes: [],
+    businessDashboardPrompt: '',
+    productDiscoveryDashboardTypes: [],
+    productDiscoveryDashboardPrompt: '',
     dateRange: '6 months',
     spaceType: '',
     softwareProjectStyle: 'team-managed',
@@ -2685,7 +2971,7 @@ function App() {
     throw new Error(`${step.label || step.type} failed: ${lastError?.message || 'Unknown error'}`);
   };
 
-  const handleSubmit = async () => {
+  const handleSubmit = async ({ volumeOnly = false } = {}) => {
     if (!form.industry) {
       setResult('Please select a Domain');
       return;
@@ -2694,6 +2980,11 @@ function App() {
     const selectedIndustry = getSelectedIndustry(form);
     const selectedVolumeProjects = (domainInventory?.projects || [])
       .filter(project => selectedVolumeProjectKeys.includes(project.key));
+    if (volumeOnly && selectedVolumeProjects.length === 0) {
+      setResult('Please select at least one existing project with the Volume checkbox.');
+      setIsSuccess(false);
+      return;
+    }
     const selectedVolumeJsmServiceTypes = selectedVolumeProjects
       .filter(project => project.kind === 'business')
       .map(project => project.jsmServiceType || 'ITSM');
@@ -2720,19 +3011,19 @@ function App() {
       }));
     const jsmServiceTypesForRun = [
       ...selectedVolumeJsmServiceTypes,
-      ...form.jsmServiceTypes,
+      ...(volumeOnly ? [] : form.jsmServiceTypes),
     ];
     const softwareProjectsForRun = [
       ...selectedVolumeSoftwareProjects,
-      ...form.softwareProjects,
+      ...(volumeOnly ? [] : form.softwareProjects),
     ];
     const businessProjectsForRun = [
       ...selectedVolumeBusinessProjects,
-      ...form.businessProjects,
+      ...(volumeOnly ? [] : form.businessProjects),
     ];
     const productDiscoveryProjectsForRun = [
       ...selectedVolumeProductDiscoveryProjects,
-      ...form.productDiscoveryProjects,
+      ...(volumeOnly ? [] : form.productDiscoveryProjects),
     ];
 
     if (form.industry === 'Other' && !selectedIndustry) {
@@ -2753,11 +3044,17 @@ function App() {
 
     const incompleteSoftwareProjectIndex = softwareProjectsForRun.findIndex(project => (
       !project.softwareTemplate
-      || !project.softwareProjectStyle
+      || (project.softwareTemplate !== 'bug-tracking' && !project.softwareProjectStyle)
     ));
 
     if (incompleteSoftwareProjectIndex >= 0) {
-      setResult(`Please complete Project Template and Management for Software Project ${incompleteSoftwareProjectIndex + 1}`);
+      setResult(`Please complete Project Template${softwareProjectsForRun[incompleteSoftwareProjectIndex]?.softwareTemplate === 'bug-tracking' ? '' : ' and Management'} for Software Project ${incompleteSoftwareProjectIndex + 1}`);
+      return;
+    }
+
+    if (productDiscoveryProjectsForRun.some(project => !project.projectKey)) {
+      setResult(PRODUCT_DISCOVERY_VOLUME_ONLY_MESSAGE);
+      setIsSuccess(false);
       return;
     }
 
@@ -2776,6 +3073,33 @@ function App() {
         availableSoftwareDashboardOptions,
         selectedSoftwareDashboardTypes
       ) || form.softwareDashboardPrompt;
+      const availableOpsDashboardOptions = getJsmDashboardOptions(jsmServiceTypesForRun);
+      const selectedOpsDashboardTypes = filterDashboardValues(
+        availableOpsDashboardOptions,
+        form.opsDashboardTypes
+      );
+      const selectedOpsDashboardPrompt = buildDashboardPromptFromValues(
+        availableOpsDashboardOptions,
+        selectedOpsDashboardTypes
+      ) || form.opsDashboardPrompt;
+      const availableBusinessDashboardOptions = getBusinessDashboardOptions(businessProjectsForRun);
+      const selectedBusinessDashboardTypes = filterDashboardValues(
+        availableBusinessDashboardOptions,
+        form.businessDashboardTypes
+      );
+      const selectedBusinessDashboardPrompt = buildDashboardPromptFromValues(
+        availableBusinessDashboardOptions,
+        selectedBusinessDashboardTypes
+      ) || form.businessDashboardPrompt;
+      const availableProductDiscoveryDashboardOptions = getProductDiscoveryDashboardOptions(productDiscoveryProjectsForRun);
+      const selectedProductDiscoveryDashboardTypes = filterDashboardValues(
+        availableProductDiscoveryDashboardOptions,
+        form.productDiscoveryDashboardTypes
+      );
+      const selectedProductDiscoveryDashboardPrompt = buildDashboardPromptFromValues(
+        availableProductDiscoveryDashboardOptions,
+        selectedProductDiscoveryDashboardTypes
+      ) || form.productDiscoveryDashboardPrompt;
 
       const preparation = await invoke('prepareDemoEnvironment', {
         industry: selectedIndustry,
@@ -2783,19 +3107,32 @@ function App() {
         isCustomIndustry: form.industry === 'Other',
         environmentName: selectedIndustry,
         reuseExistingDomainData: true,
+        addVolumeToExistingDomainData: selectedVolumeProjectKeys.length > 0,
         volumeProjectKeys: selectedVolumeProjectKeys,
-        opsDashboardTypes: form.opsDashboardTypes,
-        opsDashboardSelections: form.opsDashboardTypes
-          .map(value => opsDashboardOptions.find(option => option.value === value))
+        opsDashboardTypes: selectedOpsDashboardTypes,
+        opsDashboardSelections: selectedOpsDashboardTypes
+          .map(value => availableOpsDashboardOptions.find(option => option.value === value))
           .filter(Boolean)
           .map(option => ({ value: option.value, label: option.label, prompt: option.prompt })),
-        opsDashboardPrompt: form.opsDashboardPrompt,
+        opsDashboardPrompt: selectedOpsDashboardPrompt,
         softwareDashboardTypes: selectedSoftwareDashboardTypes,
         softwareDashboardSelections: selectedSoftwareDashboardTypes
           .map(value => availableSoftwareDashboardOptions.find(option => option.value === value))
           .filter(Boolean)
           .map(option => ({ value: option.value, label: option.label, prompt: option.prompt })),
         softwareDashboardPrompt: selectedSoftwareDashboardPrompt,
+        businessDashboardTypes: selectedBusinessDashboardTypes,
+        businessDashboardSelections: selectedBusinessDashboardTypes
+          .map(value => availableBusinessDashboardOptions.find(option => option.value === value))
+          .filter(Boolean)
+          .map(option => ({ value: option.value, label: option.label, prompt: option.prompt })),
+        businessDashboardPrompt: selectedBusinessDashboardPrompt,
+        productDiscoveryDashboardTypes: selectedProductDiscoveryDashboardTypes,
+        productDiscoveryDashboardSelections: selectedProductDiscoveryDashboardTypes
+          .map(value => availableProductDiscoveryDashboardOptions.find(option => option.value === value))
+          .filter(Boolean)
+          .map(option => ({ value: option.value, label: option.label, prompt: option.prompt })),
+        productDiscoveryDashboardPrompt: selectedProductDiscoveryDashboardPrompt,
         dateRange: form.dateRange,
         jsmProjectCount: jsmServiceTypesForRun.length,
         jsmServiceTypes: jsmServiceTypesForRun,
@@ -3115,11 +3452,26 @@ function App() {
 
   const selectedSoftwareProjectCount = form.softwareProjects.length;
   const selectedJsmProjectCount = form.jsmServiceTypes.length;
+  const jsmDashboardOptions = getJsmDashboardOptions(form.jsmServiceTypes);
   const softwareDashboardOptions = getSoftwareDashboardOptions(form.softwareProjects);
-  const toggleProjectKeySelection = (projectKey, selectedKeys, setter) => {
-    setter(selectedKeys.includes(projectKey)
-      ? selectedKeys.filter(key => key !== projectKey)
-      : [...selectedKeys, projectKey]);
+  const businessDashboardOptions = getBusinessDashboardOptions(form.businessProjects);
+  const productDiscoveryDashboardOptions = getProductDiscoveryDashboardOptions(form.productDiscoveryProjects);
+  const toggleVolumeProjectSelection = (projectKey) => {
+    setSelectedVolumeProjectKeys(keys => (
+      keys.includes(projectKey)
+        ? keys.filter(key => key !== projectKey)
+        : [...keys, projectKey]
+    ));
+    setSelectedDeleteProjectKeys(keys => keys.filter(key => key !== projectKey));
+  };
+
+  const toggleDeleteProjectSelection = (projectKey) => {
+    setSelectedDeleteProjectKeys(keys => (
+      keys.includes(projectKey)
+        ? keys.filter(key => key !== projectKey)
+        : [...keys, projectKey]
+    ));
+    setSelectedVolumeProjectKeys(keys => keys.filter(key => key !== projectKey));
   };
 
   const getProjectInventoryLabel = (project) => {
@@ -3133,12 +3485,19 @@ function App() {
     }
 
     if (project.kind === 'software') {
-      const template = project.softwareTemplate === 'kanban' ? 'Kanban' : project.softwareTemplate === 'scrum' ? 'Scrum' : 'Project';
+      const template = project.softwareTemplate === 'kanban'
+        ? 'Kanban'
+        : project.softwareTemplate === 'scrum'
+          ? 'Scrum'
+          : project.softwareTemplate === 'bug-tracking'
+            ? 'Bug Tracking'
+            : 'Project';
       return `Software Projects - ${template}`;
     }
 
     if (project.kind === 'business-project') {
-      return `Business Projects / Work Management - ${project.detailLabel || 'Work Management'}`;
+      const option = spaceTypeOptions.find(item => item.value === `business:${project.businessSpaceType}`);
+      return `${option?.group || project.categoryLabel || 'Business'} - ${project.detailLabel || option?.label || 'Task Tracking'}`;
     }
 
     if (project.kind === 'product-discovery') {
@@ -3154,8 +3513,10 @@ function App() {
 
   const selectedSpaceTypeOption = spaceTypeOptions.find(option => option.value === form.spaceType);
   const selectedSpaceTypeLabel = selectedSpaceTypeOption?.label || '';
+  const addSelectedSpaceButtonLabel = 'Add selected space';
   const isSelectedJsmSpace = form.spaceType.startsWith('jsm:');
   const isSelectedSoftwareSpace = form.spaceType.startsWith('software:');
+  const isSelectedBugTrackingSpace = form.spaceType === 'software:bug-tracking';
   const isSelectedBusinessSpace = form.spaceType.startsWith('business:');
   const isSelectedJpdSpace = form.spaceType === 'jpd:product-discovery';
 
@@ -3172,18 +3533,19 @@ function App() {
 
     if (isSelectedSoftwareSpace) {
       const softwareTemplate = form.spaceType.replace(/^software:/, '');
+      const isBugTrackingTemplate = softwareTemplate === 'bug-tracking';
       setForm({
         ...form,
         softwareProjects: [
           ...form.softwareProjects,
           {
             softwareTemplate,
-            softwareProjectStyle: form.softwareProjectStyle || 'team-managed',
+            softwareProjectStyle: isBugTrackingTemplate ? '' : form.softwareProjectStyle || 'team-managed',
             issuesPerProject: DEFAULT_DEMO_ISSUE_COUNT,
           },
         ],
       });
-      setSelectionFeedback(`${selectedSpaceTypeLabel} added below. It will create 60 software issues with releases, bugs, dependencies, timeline fields, sprints or Kanban flow, Compass/Goals links where configured, development activity, and dashboards.`);
+      setSelectionFeedback(`${selectedSpaceTypeLabel} added below. It will create 60 software issues with releases, bugs, dependencies, timeline fields, ${isBugTrackingTemplate ? 'bug triage/review flow' : 'sprints or Kanban flow'}, Compass/Goals links where configured, development activity, and dashboards.`);
       return;
     }
 
@@ -3204,17 +3566,7 @@ function App() {
     }
 
     if (isSelectedJpdSpace) {
-      setForm({
-        ...form,
-        productDiscoveryProjects: [
-          ...form.productDiscoveryProjects,
-          {
-            productDiscoveryType: 'product-discovery',
-            issuesPerProject: DEFAULT_DEMO_ISSUE_COUNT,
-          },
-        ],
-      });
-      setSelectionFeedback(`${selectedSpaceTypeLabel} added below. It will create 60 product discovery ideas with roadmap-style dates, opportunity/impact labels, comments, and relationship links where Jira allows them.`);
+      setSelectionFeedback(PRODUCT_DISCOVERY_VOLUME_ONLY_MESSAGE);
     }
   };
 
@@ -3239,7 +3591,9 @@ function App() {
       });
       setResult(response.summary || 'Delete request completed.');
       setIsSuccess(Boolean(response.success));
+      const deletedKeys = new Set(response.deleted || selectedDeleteProjectKeys);
       setSelectedDeleteProjectKeys([]);
+      setSelectedVolumeProjectKeys(keys => keys.filter(key => !deletedKeys.has(key)));
       await loadDomainInventory(form);
     } catch (err) {
       setResult(`Delete request failed: ${err.message}`);
@@ -3262,16 +3616,23 @@ function App() {
   };
 
   const updateJsmServiceType = (index, value) => {
+    const nextJsmServiceTypes = form.jsmServiceTypes.map((serviceType, serviceIndex) => (
+      serviceIndex === index ? value : serviceType
+    ));
+    const availableOptions = getJsmDashboardOptions(nextJsmServiceTypes);
+    const selectedValues = filterDashboardValues(availableOptions, form.opsDashboardTypes);
     setForm({
       ...form,
-      jsmServiceTypes: form.jsmServiceTypes.map((serviceType, serviceIndex) => (
-        serviceIndex === index ? value : serviceType
-      )),
+      jsmServiceTypes: nextJsmServiceTypes,
+      opsDashboardTypes: selectedValues,
+      opsDashboardPrompt: buildDashboardPromptFromValues(availableOptions, selectedValues),
     });
   };
 
   const removeJsmProject = (index) => {
     const nextJsmServiceTypes = form.jsmServiceTypes.filter((_, serviceIndex) => serviceIndex !== index);
+    const availableOptions = getJsmDashboardOptions(nextJsmServiceTypes);
+    const selectedValues = filterDashboardValues(availableOptions, form.opsDashboardTypes);
 
     setForm({
       ...form,
@@ -3279,7 +3640,10 @@ function App() {
       ...(nextJsmServiceTypes.length === 0 ? {
         opsDashboardTypes: [],
         opsDashboardPrompt: '',
-      } : {}),
+      } : {
+        opsDashboardTypes: selectedValues,
+        opsDashboardPrompt: buildDashboardPromptFromValues(availableOptions, selectedValues),
+      }),
     });
 
     if (nextJsmServiceTypes.length === 0 && openDashboardPicker === 'ops') {
@@ -3288,9 +3652,20 @@ function App() {
   };
 
   const updateSoftwareProject = (index, field, value) => {
-    const updatedProjects = form.softwareProjects.map((project, projectIndex) => (
-      projectIndex === index ? { ...project, [field]: value } : project
-    ));
+    const updatedProjects = form.softwareProjects.map((project, projectIndex) => {
+      if (projectIndex !== index) {
+        return project;
+      }
+
+      const nextProject = { ...project, [field]: value };
+      if (field === 'softwareTemplate' && value === 'bug-tracking') {
+        return { ...nextProject, softwareProjectStyle: '' };
+      }
+      if (field === 'softwareTemplate' && value && !nextProject.softwareProjectStyle) {
+        return { ...nextProject, softwareProjectStyle: 'team-managed' };
+      }
+      return nextProject;
+    });
     const availableOptions = getSoftwareDashboardOptions(updatedProjects);
     const selectedValues = filterDashboardValues(availableOptions, form.softwareDashboardTypes);
 
@@ -3333,16 +3708,26 @@ function App() {
   };
 
   const removeBusinessProject = (index) => {
+    const updatedProjects = form.businessProjects.filter((_, projectIndex) => projectIndex !== index);
+    const availableOptions = getBusinessDashboardOptions(updatedProjects);
+    const selectedValues = filterDashboardValues(availableOptions, form.businessDashboardTypes);
     setForm({
       ...form,
-      businessProjects: form.businessProjects.filter((_, projectIndex) => projectIndex !== index),
+      businessProjects: updatedProjects,
+      businessDashboardTypes: selectedValues,
+      businessDashboardPrompt: buildDashboardPromptFromValues(availableOptions, selectedValues),
     });
   };
 
   const removeProductDiscoveryProject = (index) => {
+    const updatedProjects = form.productDiscoveryProjects.filter((_, projectIndex) => projectIndex !== index);
+    const availableOptions = getProductDiscoveryDashboardOptions(updatedProjects);
+    const selectedValues = filterDashboardValues(availableOptions, form.productDiscoveryDashboardTypes);
     setForm({
       ...form,
-      productDiscoveryProjects: form.productDiscoveryProjects.filter((_, projectIndex) => projectIndex !== index),
+      productDiscoveryProjects: updatedProjects,
+      productDiscoveryDashboardTypes: selectedValues,
+      productDiscoveryDashboardPrompt: buildDashboardPromptFromValues(availableOptions, selectedValues),
     });
   };
 
@@ -3520,20 +3905,48 @@ function App() {
                   <div style={{ color: '#42526e', fontSize: '13px' }}>
                     Select individual projects to add a new demo volume batch or delete old demo projects. JSM volume means 60 incidents, 60 problems, 60 changes, and 60 service requests per selected JSM project; Software volume means 60 issues per selected software project.
                   </div>
-                  <button
-                    type="button"
-                    onClick={deleteSelectedDomainProjects}
-                    disabled={loading || selectedDeleteProjectKeys.length === 0}
-                    style={{
-                      ...removeButtonStyle,
-                      minWidth: '180px',
-                      backgroundColor: selectedDeleteProjectKeys.length ? '#ffebe6' : '#f4f5f7',
-                      color: selectedDeleteProjectKeys.length ? '#bf2600' : '#6b778c',
-                      borderColor: selectedDeleteProjectKeys.length ? '#ff8f73' : '#dfe1e6',
-                    }}
-                  >
-                    Delete selected ({selectedDeleteProjectKeys.length})
-                  </button>
+                  <div style={{ display: 'flex', gap: '10px', flexWrap: 'wrap' }}>
+                    <button
+                      type="button"
+                      onClick={() => handleSubmit({ volumeOnly: true })}
+                      disabled={loading || selectedVolumeProjectKeys.length === 0}
+                      style={{
+                        ...buttonStyle,
+                        minWidth: '190px',
+                        width: 'auto',
+                        padding: '11px 18px',
+                        fontSize: '14px',
+                        backgroundColor: selectedVolumeProjectKeys.length ? '#0052cc' : '#f4f5f7',
+                        color: selectedVolumeProjectKeys.length ? '#ffffff' : '#6b778c',
+                        border: `1px solid ${selectedVolumeProjectKeys.length ? '#0052cc' : '#dfe1e6'}`,
+                        boxShadow: selectedVolumeProjectKeys.length ? '0 2px 5px rgba(9, 30, 66, 0.25)' : 'none',
+                        fontWeight: 700,
+                        opacity: loading || selectedVolumeProjectKeys.length === 0 ? 0.7 : 1,
+                      }}
+                    >
+                      Add volume selected ({selectedVolumeProjectKeys.length})
+                    </button>
+                    <button
+                      type="button"
+                      onClick={deleteSelectedDomainProjects}
+                      disabled={loading || selectedDeleteProjectKeys.length === 0}
+                      style={{
+                        ...buttonStyle,
+                        minWidth: '180px',
+                        width: 'auto',
+                        padding: '11px 18px',
+                        fontSize: '14px',
+                        backgroundColor: selectedDeleteProjectKeys.length ? '#de350b' : '#f4f5f7',
+                        color: selectedDeleteProjectKeys.length ? '#ffffff' : '#6b778c',
+                        border: `1px solid ${selectedDeleteProjectKeys.length ? '#de350b' : '#dfe1e6'}`,
+                        boxShadow: selectedDeleteProjectKeys.length ? '0 2px 5px rgba(9, 30, 66, 0.25)' : 'none',
+                        fontWeight: 700,
+                        opacity: loading || selectedDeleteProjectKeys.length === 0 ? 0.7 : 1,
+                      }}
+                    >
+                      Delete selected ({selectedDeleteProjectKeys.length})
+                    </button>
+                  </div>
                 </div>
                 <div style={{ display: 'grid', gridTemplateColumns: '88px 72px 90px minmax(0, 1fr) 170px 90px', gap: '10px', alignItems: 'center', padding: '8px 10px', color: '#42526e', fontSize: '12px', fontWeight: 700, textTransform: 'uppercase' }}>
                   <span>Add</span>
@@ -3553,7 +3966,7 @@ function App() {
                         type="checkbox"
                         disabled={!canAddVolume}
                         checked={selectedVolumeProjectKeys.includes(project.key)}
-                        onChange={() => toggleProjectKeySelection(project.key, selectedVolumeProjectKeys, setSelectedVolumeProjectKeys)}
+                        onChange={() => toggleVolumeProjectSelection(project.key)}
                       />
                       <span>{canAddVolume ? 'Volume' : 'N/A'}</span>
                     </label>
@@ -3561,7 +3974,7 @@ function App() {
                       <input
                         type="checkbox"
                         checked={selectedDeleteProjectKeys.includes(project.key)}
-                        onChange={() => toggleProjectKeySelection(project.key, selectedDeleteProjectKeys, setSelectedDeleteProjectKeys)}
+                        onChange={() => toggleDeleteProjectSelection(project.key)}
                       />
                       <span>Delete</span>
                     </label>
@@ -3588,7 +4001,7 @@ function App() {
             <div style={{ color: '#42526e', fontSize: '13px', marginBottom: '12px' }}>
               Add {selectedSpaceTypeLabel} for {getSelectedIndustry(form)}. You can switch the dropdown and add multiple space types before creating the demo.
             </div>
-            {isSelectedSoftwareSpace && (
+            {isSelectedSoftwareSpace && !isSelectedBugTrackingSpace && (
               <div style={{ ...fieldStyle, maxWidth: '260px' }}>
                 <label style={labelStyle}>Management</label>
                 <select
@@ -3605,9 +4018,18 @@ function App() {
             <button
               type="button"
               onClick={addSelectedSpace}
-              style={{ ...buttonStyle, width: '260px', padding: '10px 18px', fontSize: '14px', whiteSpace: 'nowrap' }}
+              style={{
+                ...buttonStyle,
+                width: 'auto',
+                minWidth: '180px',
+                maxWidth: '100%',
+                padding: '10px 18px',
+                fontSize: '14px',
+                whiteSpace: 'normal',
+                lineHeight: '18px',
+              }}
             >
-              Add new {selectedSpaceTypeLabel}
+              {addSelectedSpaceButtonLabel}
             </button>
             {selectionFeedback && (
               <div style={{ color: '#42526e', fontSize: '13px', marginTop: '10px', padding: '10px', border: '1px solid #dfe1e6', borderRadius: '4px', backgroundColor: '#fff' }}>
@@ -3665,7 +4087,7 @@ function App() {
                     style={selectStyle}
                   >
                     {jsmServiceTypeOptions.map(option => (
-                      <option key={option} value={option}>{option}</option>
+                      <option key={option} value={option}>{jsmServiceTypeLabels[option] || option}</option>
                     ))}
                   </select>
                 </div>
@@ -3684,7 +4106,7 @@ function App() {
                 <label style={labelStyle}>Dashboard - Ops / Service Management</label>
                 {renderDashboardMultiDropdown({
                   id: 'ops',
-                  options: opsDashboardOptions,
+                  options: jsmDashboardOptions,
                   selectedValues: form.opsDashboardTypes,
                   fieldName: 'opsDashboardTypes',
                   promptFieldName: 'opsDashboardPrompt',
@@ -3698,9 +4120,9 @@ function App() {
 
         {form.businessProjects.length > 0 && (
         <div style={sectionStyle}>
-          <div style={sectionTitleStyle}>Business Projects / Work Management</div>
+          <div style={sectionTitleStyle}>Business / Category Spaces</div>
           <div style={{ color: '#42526e', fontSize: '13px', marginBottom: '12px' }}>
-            Each selected Work Management space creates 60 domain-specific work items with due dates, generated custom dates, comments, relationship links, and tracking labels.
+            Each selected category space creates 60 domain-specific work items with due dates, generated custom dates, comments, relationship links, and tracking labels.
           </div>
           {form.businessProjects.map((project, index) => (
             <div key={`business-project-${index}`} style={projectCardStyle}>
@@ -3709,7 +4131,10 @@ function App() {
                   Business Space {index + 1}
                 </div>
                 <div style={{ color: '#172b4d', fontSize: '14px', paddingBottom: '10px', fontWeight: 600 }}>
-                  {spaceTypeOptions.find(option => option.value === `business:${project.businessSpaceType}`)?.label || 'Task Tracking'}
+                  {(() => {
+                    const option = spaceTypeOptions.find(item => item.value === `business:${project.businessSpaceType}`);
+                    return `${option?.group || 'Business'} - ${option?.label || 'Task Tracking'}`;
+                  })()}
                 </div>
                 <div style={{ color: '#42526e', fontSize: '13px', paddingBottom: '10px' }}>
                   60 work items with schedule data, owner-ready fields, dependencies, and comments
@@ -3720,6 +4145,21 @@ function App() {
               </div>
             </div>
           ))}
+          {businessDashboardOptions.length > 0 && (
+            <div style={{ ...optionalSectionStyle, marginTop: '16px', marginBottom: 0 }}>
+              <div style={{ ...fieldStyle, marginBottom: 0 }}>
+                <label style={labelStyle}>Dashboard - Business / Category</label>
+                {renderDashboardMultiDropdown({
+                  id: 'business',
+                  options: businessDashboardOptions,
+                  selectedValues: form.businessDashboardTypes,
+                  fieldName: 'businessDashboardTypes',
+                  promptFieldName: 'businessDashboardPrompt',
+                  emptyLabel: 'Choose matching category dashboards',
+                })}
+              </div>
+            </div>
+          )}
         </div>
         )}
 
@@ -3747,6 +4187,21 @@ function App() {
               </div>
             </div>
           ))}
+          {productDiscoveryDashboardOptions.length > 0 && (
+            <div style={{ ...optionalSectionStyle, marginTop: '16px', marginBottom: 0 }}>
+              <div style={{ ...fieldStyle, marginBottom: 0 }}>
+                <label style={labelStyle}>Dashboard - Product Discovery</label>
+                {renderDashboardMultiDropdown({
+                  id: 'product-discovery',
+                  options: productDiscoveryDashboardOptions,
+                  selectedValues: form.productDiscoveryDashboardTypes,
+                  fieldName: 'productDiscoveryDashboardTypes',
+                  promptFieldName: 'productDiscoveryDashboardPrompt',
+                  emptyLabel: 'Choose product discovery dashboard',
+                })}
+              </div>
+            </div>
+          )}
         </div>
         )}
 
@@ -3763,7 +4218,7 @@ function App() {
           </div>
           {form.softwareProjects.map((project, index) => (
             <div key={`software-project-${index}`} style={projectCardStyle}>
-              <div style={{ ...softwareProjectRowStyle, gridTemplateColumns: '150px minmax(150px, 1fr) minmax(170px, 1fr) minmax(0, 1fr) 82px' }}>
+              <div style={{ ...softwareProjectRowStyle, gridTemplateColumns: project.softwareTemplate === 'bug-tracking' ? '150px minmax(150px, 1fr) minmax(0, 1fr) 82px' : '150px minmax(150px, 1fr) minmax(170px, 1fr) minmax(0, 1fr) 82px' }}>
                 <div style={{ fontWeight: 600, color: '#172b4d', paddingBottom: '10px', whiteSpace: 'nowrap' }}>
                   Software Project {index + 1}
                 </div>
@@ -3777,8 +4232,10 @@ function App() {
                     <option value="">Select template</option>
                     <option value="scrum">Scrum</option>
                     <option value="kanban">Kanban</option>
+                    <option value="bug-tracking">Bug Tracking</option>
                   </select>
                 </div>
+                {project.softwareTemplate !== 'bug-tracking' && (
                 <div>
                   <label style={labelStyle}>Management</label>
                   <select
@@ -3791,8 +4248,11 @@ function App() {
                     <option value="company-managed">Company-managed</option>
                   </select>
                 </div>
+                )}
                 <div style={{ color: '#42526e', fontSize: '13px', paddingBottom: '10px' }}>
-                  60 default issues with release versions, bugs, dependencies, timeline, and development signals
+                  {project.softwareTemplate === 'bug-tracking'
+                    ? '60 bug tracking issues with triage, review, dependencies, timeline, and development signals'
+                    : '60 default issues with release versions, bugs, dependencies, timeline, and development signals'}
                 </div>
                 <button type="button" onClick={() => removeSoftwareProject(index)} style={removeButtonStyle}>
                   Remove

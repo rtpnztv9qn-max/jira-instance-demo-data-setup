@@ -247,7 +247,7 @@ function getSoftwareMethodologyLabels(project, issueIndex, issueType) {
   const template = normaliseSoftwareTemplate(project?.softwareTemplate);
   const phase = getWaterfallPhase(issueIndex);
   const baseLabels = [
-    template === 'scrum' ? 'scrum' : 'kanban',
+    template === 'scrum' ? 'scrum' : template === 'kanban' ? 'kanban' : 'bug-tracking',
     `phase-${phase}`,
   ];
 
@@ -261,7 +261,9 @@ function getSoftwareMethodologyDescription(project, issueIndex) {
   const phase = getWaterfallPhase(issueIndex);
   const agileMethod = template === 'scrum'
     ? 'Scrum delivery: backlog refinement, sprint planning, sprint execution, review, and retrospective.'
-    : 'Kanban delivery: continuous intake, WIP control, flow monitoring, cycle time, and throughput tracking.';
+    : template === 'kanban'
+      ? 'Kanban delivery: continuous intake, WIP control, flow monitoring, cycle time, and throughput tracking.'
+      : 'Bug tracking delivery: defect intake, triage, assignment, fix validation, review, and release verification.';
 
   return [
     agileMethod,
@@ -280,7 +282,8 @@ function getSoftwareProjectVariantSeed(project, fallbackIndex = 0) {
   const hash = Array.from(String(source || fallbackIndex)).reduce((total, char, index) => (
     total + (char.charCodeAt(0) * (index + 3))
   ), 0);
-  const templateOffset = normaliseSoftwareTemplate(project?.softwareTemplate) === 'kanban' ? 11 : 3;
+  const template = normaliseSoftwareTemplate(project?.softwareTemplate);
+  const templateOffset = template === 'kanban' ? 11 : template === 'bug-tracking' ? 23 : 3;
   const styleOffset = normaliseProjectManagementStyle(project?.softwareProjectStyle) === 'company-managed' ? 17 : 5;
   return hash + templateOffset + styleOffset;
 }
@@ -306,7 +309,7 @@ function getSoftwareReleasePlan(project, releaseIndex) {
     releaseDate,
     released: stage === 'past',
     stage,
-    methodology: template === 'scrum' ? 'Scrum release train' : 'Kanban flow release',
+    methodology: template === 'scrum' ? 'Scrum release train' : template === 'kanban' ? 'Kanban flow release' : 'Bug fix release train',
   };
 }
 
@@ -1868,7 +1871,177 @@ async function createGitHubDeployment(config, branchName, environment, issue, pu
     id: deployment.id,
     environment,
     status,
+    url: pullRequestUrl || `https://github.com/${config.owner}/${config.repo}/deployments`,
   };
+}
+
+function getGitHubRepositoryId(config) {
+  return `${config.owner}/${config.repo}`;
+}
+
+function getGitHubAuthor() {
+  return {
+    name: 'Cprime Demo Agent',
+    email: 'demo-agent@cprime.local',
+    username: 'cprime-demo-agent',
+    url: 'https://github.com',
+  };
+}
+
+function buildJiraDevInfoRepository(config, project, defaultBranch, records) {
+  const repositoryId = getGitHubRepositoryId(config);
+  const repositoryUrl = `https://github.com/${config.owner}/${config.repo}`;
+  const author = getGitHubAuthor();
+  const now = new Date().toISOString();
+  const updateSequenceId = Date.now();
+
+  return {
+    id: repositoryId,
+    name: repositoryId,
+    url: repositoryUrl,
+    description: `GitHub delivery activity generated for ${project.key}.`,
+    updateSequenceId,
+    commits: records.map((record, index) => {
+      const sequence = updateSequenceId + index + 1;
+      return {
+        id: record.commitSha,
+        issueKeys: [record.issueKey],
+        associations: [{ associationType: 'issueIdOrKeys', values: [record.issueKey] }],
+        updateSequenceId: sequence,
+        hash: record.commitSha,
+        message: record.commitMessage,
+        author,
+        fileCount: 1,
+        url: record.commitUrl,
+        files: [{
+          path: record.filePath,
+          url: record.fileUrl || record.commitUrl,
+          changeType: 'MODIFIED',
+          linesAdded: 12,
+          linesRemoved: 0,
+        }],
+        authorTimestamp: now,
+        displayId: String(record.commitSha || '').slice(0, 7),
+      };
+    }),
+    branches: records.map((record, index) => {
+      const sequence = updateSequenceId + records.length + index + 1;
+      return {
+        id: `${repositoryId}:${record.branchName}`,
+        issueKeys: [record.issueKey],
+        associations: [{ associationType: 'issueIdOrKeys', values: [record.issueKey] }],
+        updateSequenceId: sequence,
+        name: record.branchName,
+        lastCommit: {
+          id: record.commitSha,
+          issueKeys: [record.issueKey],
+          updateSequenceId: sequence,
+          hash: record.commitSha,
+          message: record.commitMessage,
+          author,
+          fileCount: 1,
+          url: record.commitUrl,
+          authorTimestamp: now,
+          displayId: String(record.commitSha || '').slice(0, 7),
+        },
+        createPullRequestUrl: `${repositoryUrl}/compare/${encodeURIComponent(defaultBranch)}...${encodeURIComponent(record.branchName)}?quick_pull=1`,
+        url: record.branchUrl,
+      };
+    }),
+    pullRequests: records.map((record, index) => {
+      const sequence = updateSequenceId + (records.length * 2) + index + 1;
+      return {
+        id: `${repositoryId}:pull:${record.pullRequestNumber}`,
+        issueKeys: [record.issueKey],
+        associations: [{ associationType: 'issueIdOrKeys', values: [record.issueKey] }],
+        updateSequenceId: sequence,
+        status: 'OPEN',
+        title: record.pullRequestTitle,
+        author,
+        commentCount: 0,
+        sourceBranch: record.branchName,
+        sourceBranchUrl: record.branchUrl,
+        lastUpdate: now,
+        destinationBranch: defaultBranch,
+        destinationBranchUrl: `${repositoryUrl}/tree/${encodeURIComponent(defaultBranch)}`,
+        reviewers: [],
+        url: record.pullRequestUrl,
+        displayId: `PR #${record.pullRequestNumber}`,
+      };
+    }),
+  };
+}
+
+async function submitJiraDevelopmentInformation(config, project, defaultBranch, records) {
+  if (!records.length) {
+    return null;
+  }
+
+  return jiraPost('/rest/devinfo/0.10/bulk', {
+    repositories: [buildJiraDevInfoRepository(config, project, defaultBranch, records)],
+    preventTransitions: true,
+    operationType: 'NORMAL',
+    properties: {
+      source: 'cprime-demo-agent',
+      projectKey: project.key,
+      repository: getGitHubRepositoryId(config),
+    },
+    providerMetadata: {
+      product: 'Cprime Demo GitHub Activity',
+    },
+  });
+}
+
+function mapGitHubDeploymentStateToJira(status) {
+  const normalized = String(status || '').toLowerCase();
+  if (normalized === 'success' || normalized === 'successful') return 'successful';
+  if (normalized === 'failure' || normalized === 'failed' || normalized === 'error') return 'failed';
+  if (normalized === 'cancelled' || normalized === 'canceled') return 'cancelled';
+  if (normalized === 'pending' || normalized === 'queued') return 'pending';
+  return 'successful';
+}
+
+async function submitJiraDeploymentInformation(config, project, records) {
+  if (!records.length) {
+    return null;
+  }
+
+  const repositoryUrl = `https://github.com/${config.owner}/${config.repo}`;
+  const updateSequenceNumber = Date.now();
+  return jiraPost('/rest/deployments/0.1/bulk', {
+    properties: {
+      source: 'cprime-demo-agent',
+      projectKey: project.key,
+      repository: getGitHubRepositoryId(config),
+    },
+    deployments: records.map((record, index) => ({
+      deploymentSequenceNumber: Number(record.deploymentId || updateSequenceNumber + index),
+      updateSequenceNumber: updateSequenceNumber + index,
+      issueKeys: [record.issueKey],
+      associations: [{ associationType: 'issueIdOrKeys', values: [record.issueKey] }],
+      displayName: `${record.issueKey} demo deployment`,
+      url: record.deploymentUrl || record.pullRequestUrl || repositoryUrl,
+      description: `Demo deployment generated from GitHub activity for ${record.issueKey}.`,
+      lastUpdated: new Date().toISOString(),
+      label: `${record.projectKey}-${record.issueKey}`,
+      duration: 60,
+      state: mapGitHubDeploymentStateToJira(record.deploymentStatus),
+      pipeline: {
+        id: `${project.key}-github-demo-pipeline`,
+        displayName: `${project.key} GitHub demo pipeline`,
+        url: repositoryUrl,
+      },
+      environment: {
+        id: record.deploymentEnvironment,
+        displayName: record.deploymentEnvironment,
+        type: 'development',
+      },
+      schemaVersion: '1.0',
+    })),
+    providerMetadata: {
+      product: 'Cprime Demo GitHub Deployments',
+    },
+  });
 }
 
 function buildTrustedJiraRoute(path) {
@@ -1988,8 +2161,17 @@ async function getVisibleProjectTypeKeys(diagnostics = []) {
   return Array.from(keys);
 }
 
-async function createJSMProject(name, leadAccountId, keyPrefix, diagnostics = []) {
-  // Keep the Ops project as a real IT Service Management project. We do not
+async function createJSMProject(name, leadAccountId, keyPrefix, diagnostics = [], serviceType = 'ITSM') {
+  const jsmServiceType = normaliseJsmServiceType(serviceType);
+  const serviceTypeLabel = getJsmServiceTypeLabel(jsmServiceType);
+  const templateKeys = await getProjectTemplateKeysForSelection({
+    projectTypeKey: 'service_desk',
+    staticKeys: getJsmTemplateKeys(jsmServiceType),
+    labels: getJsmTemplateSearchLabels(jsmServiceType),
+    diagnostics,
+  });
+
+  // Keep the Ops project as a real Jira Service Management project. We do not
   // fall back to Jira Work Management here because the user expects JSM queues,
   // request types, and Forms. If these templates are unavailable, failing loudly
   // is better than creating the wrong project type.
@@ -1998,25 +2180,48 @@ async function createJSMProject(name, leadAccountId, keyPrefix, diagnostics = []
 
   if (!visibleProjectTypeKeys.includes('service_desk')) {
     throw new Error(
-      'Jira Service Management is not active for REST project creation on this site. The IT service management template currently appears as TRY in Jira, so start/activate Jira Service Management first, then rerun the demo. The app will not create a Business/JWM fallback for Ops.'
+      `Jira Service Management is not active for REST project creation on this site. The ${serviceTypeLabel} template currently appears unavailable in Jira, so start/activate Jira Service Management first, then rerun the demo. The app will not create a Business/JWM fallback for this JSM selection.`
     );
   }
 
-  const project = await createProjectWithRetries({
-    name,
-    leadAccountId,
-    keyPrefix,
-    projectTypeKey: 'service_desk',
-    maxAttempts: 3,
-    templateKeys: getJsmItsmTemplateKeys(),
-    allowTemplateOmission: false,
-    diagnostics,
-  });
+  let project;
+
+  try {
+    project = await createProjectWithRetries({
+      name,
+      leadAccountId,
+      keyPrefix,
+      projectTypeKey: 'service_desk',
+      maxAttempts: 6,
+      templateKeys,
+      allowTemplateOmission: false,
+      diagnostics,
+      serviceTypeLabel,
+    });
+  } catch (err) {
+    const message = String(err?.message || '');
+    const canUseCompatibilityProject = /invalid project type|project template specified does not exist|template.*does not exist/i.test(message);
+    if (!canUseCompatibilityProject) {
+      throw err;
+    }
+
+    diagnostics.push(`${serviceTypeLabel}: Jira REST rejected service_desk project creation, so the app is creating a Jira Work Management compatibility space and will still generate ${serviceTypeLabel} work, dashboard, and reports. Original error: ${message}`);
+    const fallbackProject = await createWorkManagementProject(name, leadAccountId, keyPrefix, 'task-tracking', diagnostics);
+    return {
+      ...fallbackProject,
+      serviceDeskAvailable: false,
+      projectTypeKey: fallbackProject.projectTypeKey || 'business',
+      jsmServiceType,
+      compatibilityMode: 'service-management-on-work-management',
+      compatibilityReason: message,
+    };
+  }
 
   return {
     ...project,
     serviceDeskAvailable: true,
     projectTypeKey: 'service_desk',
+    jsmServiceType,
   };
 }
 
@@ -2129,7 +2334,8 @@ function classifyDomainProject(project, metadata = null) {
   }
 
   if (project?.projectTypeKey === 'software') {
-    const softwareTemplate = isKanban ? 'kanban' : isScrum ? 'scrum' : '';
+    const isBugTracking = lowerName.includes('bug') || lowerName.includes('defect');
+    const softwareTemplate = isKanban ? 'kanban' : isScrum ? 'scrum' : isBugTracking ? 'bug-tracking' : '';
     return {
       kind: 'software',
       softwareTemplate,
@@ -2140,13 +2346,27 @@ function classifyDomainProject(project, metadata = null) {
   }
 
   if (project?.projectTypeKey === 'business') {
-    const businessSpaceType = lowerName.includes('budget')
-      ? 'budget-planning'
-      : lowerName.includes('procurement') || lowerName.includes('purchase')
-        ? 'procurement-management'
-        : lowerName.includes('recruit')
-          ? 'recruitment-tracking'
-          : 'task-tracking';
+    const businessSpaceType = lowerName.includes('go-to-market') || lowerName.includes('go to market') || lowerName.includes('launch')
+      ? 'go-to-market'
+      : lowerName.includes('project management')
+        ? 'project-management'
+        : lowerName.includes('finance')
+          ? 'finance'
+          : lowerName.includes('budget')
+            ? 'budget-planning'
+            : lowerName.includes('marketing')
+              ? 'marketing'
+              : lowerName.includes('design')
+                ? 'design'
+                : lowerName.includes('legal')
+                  ? 'legal'
+                  : lowerName.includes('sales')
+                    ? 'sales'
+                    : lowerName.includes('procurement') || lowerName.includes('purchase')
+                      ? 'procurement-management'
+                      : lowerName.includes('recruit')
+                        ? 'recruitment-tracking'
+                        : 'task-tracking';
     return {
       kind: 'business-project',
       categoryLabel: 'Business',
@@ -2242,8 +2462,18 @@ function projectMatchesRequestedSpaceType(project, spaceType) {
   return true;
 }
 
+function isNativeProductDiscoveryProject(project) {
+  const projectTypeKey = String(project?.projectTypeKey || '').toLowerCase();
+  return projectTypeKey === 'product_discovery' || projectTypeKey === 'product-discovery';
+}
+
 async function findReusableDomainProject(config, criteria = {}) {
   if (config.reuseExistingDomainData === false) {
+    return null;
+  }
+
+  const selectedVolumeKeys = new Set(config.volumeProjectKeys || []);
+  if (selectedVolumeKeys.size === 0) {
     return null;
   }
 
@@ -2273,29 +2503,110 @@ async function findReusableDomainProject(config, criteria = {}) {
     }
 
     if (criteria.kind === 'product-discovery') {
-      return project.kind === 'product-discovery';
+      return project.kind === 'product-discovery' && isNativeProductDiscoveryProject(project);
     }
 
     return true;
   });
-  const selectedVolumeKeys = new Set(config.volumeProjectKeys || []);
-  return matches.find(project => selectedVolumeKeys.has(project.key)) || matches[0] || null;
+  return matches.find(project => selectedVolumeKeys.has(project.key)) || null;
+}
+
+function getJsmServiceTypeLabel(value) {
+  const serviceType = normaliseJsmServiceType(value);
+  const labels = {
+    ITSM: 'IT Service Management',
+    'ITSM-ESS': 'IT Service Management Essentials',
+    GSM: 'General Service Management',
+    HRSM: 'HR Service Management',
+    CSM: 'Customer Service Management',
+    FSM: 'Facilities Service Management',
+    LSM: 'Legal Service Management',
+  };
+  return labels[serviceType] || labels.ITSM;
+}
+
+function getJsmTemplateSearchLabels(value) {
+  const serviceType = normaliseJsmServiceType(value);
+  const labels = {
+    ITSM: ['IT Service Management', 'IT service management'],
+    'ITSM-ESS': ['IT Service Management Essentials', 'IT service management essentials', 'ITSM Essentials'],
+    GSM: ['General Service Management', 'General service management'],
+    HRSM: ['HR Service Management', 'HR service management'],
+    CSM: ['Customer Service Management', 'Customer service management'],
+    FSM: ['Facilities Service Management', 'Facility Service Management', 'Facilities service management', 'Facility service management'],
+    LSM: ['Legal Service Management', 'Legal service management'],
+  };
+  return labels[serviceType] || labels.ITSM;
+}
+
+function getJsmTemplateKeys(serviceType = 'ITSM') {
+  const normalized = normaliseJsmServiceType(serviceType);
+  const templateMap = {
+    ITSM: [
+      'com.atlassian.servicedesk:simplified-it-service-management',
+      'com.atlassian.servicedesk:Team-managed-it-service-management',
+      'com.atlassian.servicedesk:simplified-it-service-desk',
+      'com.atlassian.servicedesk:simplified-it-service-management-basic',
+      'com.atlassian.servicedesk:itil-v2-service-desk-project',
+      'com.atlassian.servicedesk:simplified-general-service-desk-it',
+      'com.atlassian.servicedesk:next-gen-it-service-desk',
+    ],
+    'ITSM-ESS': [
+      'com.atlassian.servicedesk:simplified-it-service-management-essentials',
+      'com.atlassian.servicedesk:simplified-it-service-management-basic',
+      'com.atlassian.servicedesk:it-service-management-essentials',
+      'com.atlassian.servicedesk:it-service-management-basic',
+      'com.atlassian.servicedesk:team-managed-it-service-management',
+      'com.atlassian.servicedesk:next-gen-it-service-desk',
+    ],
+    GSM: [
+      'com.atlassian.servicedesk:simplified-internal-service-desk',
+      'com.atlassian.servicedesk:internal-service-desk',
+      'com.atlassian.servicedesk:simplified-general-service-desk',
+      'com.atlassian.servicedesk:simplified-general-service-management',
+      'com.atlassian.servicedesk:simplified-internal-service-desk',
+      'com.atlassian.servicedesk:general-service-management',
+      'com.atlassian.servicedesk:general-service-desk',
+    ],
+    HRSM: [
+      'com.atlassian.servicedesk:simplified-internal-service-desk',
+      'com.atlassian.servicedesk:simplified-hr-service-management',
+      'com.atlassian.servicedesk:simplified-hr-service-desk',
+      'com.atlassian.servicedesk:hr-service-management',
+      'com.atlassian.servicedesk:hr-service-desk',
+    ],
+    CSM: [
+      'com.atlassian.servicedesk:simplified-external-service-desk',
+      'com.atlassian.servicedesk:simplified-customer-service-management',
+      'com.atlassian.servicedesk:simplified-customer-service-desk',
+      'com.atlassian.servicedesk:customer-service-management',
+      'com.atlassian.servicedesk:customer-service-desk',
+    ],
+    FSM: [
+      'com.atlassian.servicedesk:simplified-internal-service-desk',
+      'com.atlassian.servicedesk:simplified-facility-service-management',
+      'com.atlassian.servicedesk:simplified-facility-service-desk',
+      'com.atlassian.servicedesk:simplified-facilities-service-management',
+      'com.atlassian.servicedesk:simplified-facilities-service-desk',
+      'com.atlassian.servicedesk:facility-service-management',
+      'com.atlassian.servicedesk:facility-service-desk',
+      'com.atlassian.servicedesk:facilities-service-management',
+      'com.atlassian.servicedesk:facilities-service-desk',
+    ],
+    LSM: [
+      'com.atlassian.servicedesk:simplified-internal-service-desk',
+      'com.atlassian.servicedesk:simplified-legal-service-management',
+      'com.atlassian.servicedesk:simplified-legal-service-desk',
+      'com.atlassian.servicedesk:legal-service-management',
+      'com.atlassian.servicedesk:legal-service-desk',
+    ],
+  };
+
+  return templateMap[normalized] || templateMap.ITSM;
 }
 
 function getJsmItsmTemplateKeys() {
-  // This first key is the Jira Cloud "IT service management" template shown in
-  // Jira's project template picker. The remaining entries are ITSM/service-desk
-  // variants only, so a requested JSM project never silently becomes a generic
-  // Jira business/software project.
-  return [
-    'com.atlassian.servicedesk:simplified-it-service-management',
-    'com.atlassian.servicedesk:Team-managed-it-service-management',
-    'com.atlassian.servicedesk:simplified-it-service-desk',
-    'com.atlassian.servicedesk:simplified-it-service-management-basic',
-    'com.atlassian.servicedesk:itil-v2-service-desk-project',
-    'com.atlassian.servicedesk:simplified-general-service-desk-it',
-    'com.atlassian.servicedesk:next-gen-it-service-desk',
-  ];
+  return getJsmTemplateKeys('ITSM');
 }
 
 async function getServiceDeskId(projectKey) {
@@ -2340,7 +2651,12 @@ async function getServiceDeskIdWithRetry(projectKey, {
   label = 'Service desk lookup',
 } = {}) {
   for (let attempt = 1; attempt <= attempts; attempt += 1) {
-    const serviceDeskId = await getServiceDeskId(projectKey);
+    let serviceDeskId = null;
+    try {
+      serviceDeskId = await getServiceDeskId(projectKey);
+    } catch (err) {
+      diagnostics.push(`${label} ${projectKey}: service desk lookup failed on attempt ${attempt}: ${err.message}`);
+    }
 
     if (serviceDeskId) {
       if (attempt > 1) {
@@ -3112,6 +3428,10 @@ function chooseRequestTypeForItsmWork(project, workType) {
 
 async function createJsmRequestWorkItem(project, workItem, options) {
   const diagnostics = options.diagnostics || [];
+  if (project.serviceDeskAvailable === false) {
+    throw new Error(`Service desk id was not available for ${project.key}.`);
+  }
+
   const serviceDeskId = project.serviceDeskId || await getServiceDeskIdWithRetry(project.key, {
     attempts: 3,
     delayMs: 1000,
@@ -3210,8 +3530,21 @@ async function createJiraItsmIssueFallback(project, workItem, options = {}) {
   };
 }
 
+const SOFTWARE_TEMPLATE_TYPES = ['scrum', 'kanban', 'bug-tracking'];
+
 function normaliseSoftwareTemplate(value) {
-  return String(value || '').toLowerCase() === 'kanban' ? 'kanban' : 'scrum';
+  const raw = String(value || 'scrum').trim().toLowerCase();
+  return SOFTWARE_TEMPLATE_TYPES.includes(raw) ? raw : 'scrum';
+}
+
+function getSoftwareTemplateLabel(value) {
+  const template = normaliseSoftwareTemplate(value);
+  const labels = {
+    scrum: 'Scrum',
+    kanban: 'Kanban',
+    'bug-tracking': 'Bug Tracking',
+  };
+  return labels[template] || labels.scrum;
 }
 
 function normaliseProjectManagementStyle(value) {
@@ -3222,9 +3555,34 @@ function getProjectManagementStyleLabel(value) {
   return normaliseProjectManagementStyle(value) === 'company-managed' ? 'Company-managed' : 'Team-managed';
 }
 
+function getSoftwareProjectMethodLabel(projectOrTemplate, projectManagementStyle = 'team-managed') {
+  const softwareTemplate = typeof projectOrTemplate === 'object'
+    ? projectOrTemplate?.softwareTemplate
+    : projectOrTemplate;
+  const softwareProjectStyle = typeof projectOrTemplate === 'object'
+    ? projectOrTemplate?.softwareProjectStyle
+    : projectManagementStyle;
+  const template = normaliseSoftwareTemplate(softwareTemplate);
+  return template === 'bug-tracking'
+    ? getSoftwareTemplateLabel(template)
+    : `${getProjectManagementStyleLabel(softwareProjectStyle)} ${getSoftwareTemplateLabel(template)}`;
+}
+
 function getSoftwareTemplateKeys(softwareTemplate, projectManagementStyle = 'team-managed') {
   const template = normaliseSoftwareTemplate(softwareTemplate);
   const style = normaliseProjectManagementStyle(projectManagementStyle);
+
+  if (template === 'bug-tracking') {
+    return [
+      'com.pyxis.greenhopper.jira:gh-simplified-agility-bug-tracking',
+      'com.pyxis.greenhopper.jira:gh-bug-tracking-template',
+      'com.pyxis.greenhopper.jira:gh-simplified-bug-tracking-classic',
+      'com.atlassian.jira-core-project-templates:jira-core-bug-tracking',
+      'com.pyxis.greenhopper.jira:gh-simplified-basic',
+      'com.pyxis.greenhopper.jira:gh-simplified-agility-kanban',
+      'com.pyxis.greenhopper.jira:gh-simplified-kanban-classic',
+    ];
+  }
 
   if (template === 'kanban' && style === 'company-managed') {
     return [
@@ -3255,94 +3613,497 @@ function getSoftwareTemplateKeys(softwareTemplate, projectManagementStyle = 'tea
   ];
 }
 
-async function createSoftwareProject(name, leadAccountId, keyPrefix, softwareTemplate, projectManagementStyle) {
+function getSoftwareTemplateSearchLabels(softwareTemplate) {
+  const template = normaliseSoftwareTemplate(softwareTemplate);
+  const labels = {
+    scrum: ['Scrum', 'Software Project - Scrum'],
+    kanban: ['Kanban', 'Software Project - Kanban'],
+    'bug-tracking': ['Bug Tracking', 'Bug tracking', 'Software Project - Bug Tracking'],
+  };
+  return labels[template] || labels.scrum;
+}
+
+async function createSoftwareProject(name, leadAccountId, keyPrefix, softwareTemplate, projectManagementStyle, diagnostics = []) {
+  const template = normaliseSoftwareTemplate(softwareTemplate);
+  const templateKeys = await getProjectTemplateKeysForSelection({
+    projectTypeKey: 'software',
+    staticKeys: getSoftwareTemplateKeys(template, projectManagementStyle),
+    labels: getSoftwareTemplateSearchLabels(template),
+    diagnostics,
+  });
+  if (template === 'bug-tracking') {
+    diagnostics.push('Bug Tracking: Jira Cloud does not always expose a dedicated bug-tracking projectTemplateKey through REST. If needed, the app creates a software project from a Jira-supported software base template, then generates bug-tracking issues, statuses, dashboard, and verification data.');
+  }
   return await createProjectWithRetries({
     name,
     leadAccountId,
     keyPrefix,
     projectTypeKey: 'software',
     maxAttempts: 12,
-    templateKeys: getSoftwareTemplateKeys(softwareTemplate, projectManagementStyle),
-    allowTemplateOmission: false,
+    templateKeys,
+    allowTemplateOmission: template === 'bug-tracking',
+    diagnostics,
+    serviceTypeLabel: `Software Project - ${getSoftwareTemplateLabel(template)}`,
   });
 }
 
 function getBusinessProjectTemplateKeys(businessSpaceType) {
   const normalized = normaliseBusinessSpaceType(businessSpaceType);
   const templateMap = {
+    'project-management': [
+      'com.atlassian.jira-core-project-templates:jira-core-simplified-project-management',
+      'com.atlassian.jira-core-project-templates:jira-core-project-management',
+    ],
+    'go-to-market': [
+      'com.atlassian.jira-core-project-templates:jira-core-simplified-go-to-market',
+      'com.atlassian.jira-core-project-templates:jira-core-go-to-market',
+      'com.atlassian.jira-core-project-templates:jira-core-go-to-market-project',
+    ],
     'task-tracking': [
+      'com.atlassian.jira-core-project-templates:jira-core-simplified-task-tracking',
+      'com.atlassian.jira-core-project-templates:jira-core-task-tracking',
       'com.atlassian.jira-core-project-templates:jira-core-task-management',
+    ],
+    'process-control': [
+      'com.atlassian.jira-core-project-templates:jira-core-simplified-process-control',
+      'com.atlassian.jira-core-project-templates:jira-core-process-management',
+      'com.atlassian.jira-core-project-templates:jira-core-process-control',
+    ],
+    finance: [
+      'com.atlassian.jira-core-project-templates:jira-core-simplified-project-management',
+      'com.atlassian.jira-core-project-templates:jira-core-project-management',
+      'com.atlassian.jira-core-project-templates:jira-core-budget-planning',
+      'com.atlassian.jira-core-project-templates:jira-core-simplified-budget-planning',
+      'com.atlassian.jira-core-project-templates:jira-core-finance',
+      'com.atlassian.jira-core-project-templates:jira-core-simplified-finance',
     ],
     'budget-planning': [
+      'com.atlassian.jira-core-project-templates:jira-core-budget-planning',
+      'com.atlassian.jira-core-project-templates:jira-core-simplified-budget-planning',
+      'com.atlassian.jira-core-project-templates:jira-core-simplified-project-management',
       'com.atlassian.jira-core-project-templates:jira-core-project-management',
-      'com.atlassian.jira-core-project-templates:jira-core-task-management',
+    ],
+    marketing: [
+      'com.atlassian.jira-core-project-templates:jira-core-simplified-content-management',
+      'com.atlassian.jira-core-project-templates:jira-core-marketing',
+      'com.atlassian.jira-core-project-templates:jira-core-simplified-marketing',
+      'com.atlassian.jira-core-project-templates:jira-core-campaign-management',
+      'com.atlassian.jira-core-project-templates:jira-core-simplified-campaign-management',
+      'com.atlassian.jira-core-project-templates:jira-core-marketing-campaign',
+    ],
+    design: [
+      'com.atlassian.jira-core-project-templates:jira-core-simplified-content-management',
+      'com.atlassian.jira-core-project-templates:jira-core-simplified-task-tracking',
+      'com.atlassian.jira-core-project-templates:jira-core-ux-design',
+      'com.atlassian.jira-core-project-templates:jira-core-simplified-ux-design',
+      'com.atlassian.jira-core-project-templates:jira-core-design',
+      'com.atlassian.jira-core-project-templates:jira-core-simplified-design',
+      'com.atlassian.jira-core-project-templates:jira-core-design-project',
+      'com.atlassian.jira-core-project-templates:jira-core-simplified-design-project',
+    ],
+    legal: [
+      'com.atlassian.jira-core-project-templates:jira-core-simplified-document-approval',
+      'com.atlassian.jira-core-project-templates:jira-core-legal',
+      'com.atlassian.jira-core-project-templates:jira-core-simplified-legal',
+      'com.atlassian.jira-core-project-templates:jira-core-document-management',
+      'com.atlassian.jira-core-project-templates:jira-core-simplified-document-management',
+      'com.atlassian.jira-core-project-templates:jira-core-legal-matter-management',
+    ],
+    sales: [
+      'com.atlassian.jira-core-project-templates:jira-core-simplified-lead-tracking',
+      'com.atlassian.jira-core-project-templates:jira-core-sales-pipeline',
+      'com.atlassian.jira-core-project-templates:jira-core-simplified-sales-pipeline',
+      'com.atlassian.jira-core-project-templates:jira-core-sales',
+      'com.atlassian.jira-core-project-templates:jira-core-simplified-sales',
     ],
     'procurement-management': [
+      'com.atlassian.jira-core-project-templates:jira-core-simplified-procurement',
+      'com.atlassian.jira-core-project-templates:jira-core-procurement',
+      'com.atlassian.jira-core-project-templates:jira-core-procurement-management',
       'com.atlassian.jira-core-project-templates:jira-core-process-management',
-      'com.atlassian.jira-core-project-templates:jira-core-task-management',
+      'com.atlassian.jira-core-project-templates:jira-core-simplified-process-control',
     ],
     'recruitment-tracking': [
-      'com.atlassian.jira-core-project-templates:jira-core-task-management',
+      'com.atlassian.jira-core-project-templates:jira-core-simplified-recruitment',
+      'com.atlassian.jira-core-project-templates:jira-core-recruitment',
+      'com.atlassian.jira-core-project-templates:jira-core-recruitment-tracking',
+      'com.atlassian.jira-core-project-templates:jira-core-hr-recruitment',
     ],
   };
 
   return templateMap[normalized] || templateMap['task-tracking'];
 }
 
-async function createWorkManagementProject(name, leadAccountId, keyPrefix, businessSpaceType) {
-  return await createProjectWithRetries({
-    name,
-    leadAccountId,
-    keyPrefix,
-    projectTypeKey: 'business',
-    maxAttempts: 12,
-    templateKeys: getBusinessProjectTemplateKeys(businessSpaceType),
-    allowTemplateOmission: true,
-  });
+function getBusinessTemplateSearchLabels(businessSpaceType) {
+  const label = getBusinessSpaceTypeLabel(businessSpaceType);
+  const normalized = normaliseBusinessSpaceType(businessSpaceType);
+  const aliases = {
+    'project-management': ['Project Management', 'Project management'],
+    'go-to-market': ['Go-to-market', 'Go to market', 'Go-to-market plan'],
+    'task-tracking': ['Task Tracking', 'Task tracking', 'Task management'],
+    'process-control': ['Process Control', 'Process control'],
+    finance: ['Finance', 'Budget Planning', 'Budget planning'],
+    'budget-planning': ['Budget Planning', 'Budget planning'],
+    marketing: ['Marketing', 'Campaign management', 'Content management'],
+    design: ['UX Design', 'UX design', 'Design'],
+    legal: ['Legal', 'Document management', 'Document approval'],
+    sales: ['Sales pipeline', 'Sales Pipeline', 'Sales', 'Lead tracking'],
+    'recruitment-tracking': ['Recruitment Management', 'Recruitment', 'Recruitment Tracking'],
+    'procurement-management': ['Procurement Management', 'Procurement'],
+  };
+  return aliases[normalized] || [label];
 }
 
-async function createProductDiscoveryProject(name, leadAccountId, keyPrefix) {
+function getProjectTemplateSelectionLabel(projectTypeKey, templateKeys, fallbackLabel = 'selected template') {
+  const key = Array.isArray(templateKeys) && templateKeys.length > 0 ? templateKeys[0] : '';
+  if (projectTypeKey === 'service_desk') {
+    return fallbackLabel;
+  }
+  if (projectTypeKey === 'software') {
+    if (key.includes('bug')) return 'Software Project - Bug Tracking';
+    return key.includes('kanban') ? 'Software Project - Kanban' : 'Software Project - Scrum';
+  }
+  if (projectTypeKey === 'business') {
+    if (key.includes('project-management')) return 'Project Management';
+    if (key.includes('go-to-market')) return 'Go-to-market';
+    if (key.includes('finance')) return 'Finance';
+    if (key.includes('budget')) return 'Budget Planning';
+    if (key.includes('marketing')) return 'Marketing';
+    if (key.includes('design')) return 'Design';
+    if (key.includes('legal')) return 'Legal';
+    if (key.includes('sales')) return 'Sales';
+    if (key.includes('procurement')) return 'Procurement Management';
+    if (key.includes('recruitment')) return 'Recruitment Management';
+    return 'Task Tracking';
+  }
+  if (projectTypeKey === 'product_discovery') {
+    return 'Jira Product Discovery';
+  }
+  return fallbackLabel;
+}
+
+async function createWorkManagementProject(name, leadAccountId, keyPrefix, businessSpaceType, diagnostics = []) {
+  const selectedLabel = getBusinessSpaceTypeLabel(businessSpaceType);
+  const templateKeys = await getProjectTemplateKeysForSelection({
+    projectTypeKey: 'business',
+    staticKeys: getBusinessProjectTemplateKeys(businessSpaceType),
+    labels: getBusinessTemplateSearchLabels(businessSpaceType),
+    diagnostics,
+  });
   try {
     return await createProjectWithRetries({
       name,
       leadAccountId,
       keyPrefix,
-      projectTypeKey: 'product_discovery',
+      projectTypeKey: 'business',
       maxAttempts: 12,
-      templateKeys: [
-        'com.atlassian.jira-product-discovery:project-template',
-        'com.atlassian.jira-product-discovery:default',
-      ],
-      allowTemplateOmission: true,
+      templateKeys,
+      allowTemplateOmission: false,
+      diagnostics,
+      serviceTypeLabel: selectedLabel,
     });
   } catch (err) {
     const message = String(err?.message || '');
-    if (!/invalid project type|projectType|product_discovery/i.test(message)) {
+    const templateUnavailable = /project template specified does not exist|template.*does not exist/i.test(message);
+    if (!templateUnavailable) {
       throw err;
     }
 
-    const fallback = await createProjectWithRetries({
-      name: `${name} Discovery Workspace`,
+    diagnostics.push(`Work Management ${selectedLabel}: Jira REST did not expose an installable "${selectedLabel}" projectTemplateKey on this site, so the app is creating a Work Management compatibility space and will still generate "${selectedLabel}" work items, dashboard, reports, and lifecycle fields. Original error: ${message}`);
+    const fallbackProject = await createProjectWithRetries({
+      name,
       leadAccountId,
       keyPrefix,
       projectTypeKey: 'business',
       maxAttempts: 12,
-      templateKeys: [
-        'com.atlassian.jira-core-project-templates:jira-core-task-management',
-        'com.atlassian.jira-core-project-templates:jira-core-project-management',
-      ],
+      templateKeys: [],
       allowTemplateOmission: true,
+      diagnostics,
+      serviceTypeLabel: `${selectedLabel} compatibility`,
     });
-
     return {
-      ...fallback,
-      productDiscoveryFallback: true,
-      productDiscoveryFallbackReason: message,
+      ...fallbackProject,
+      businessSpaceType: normaliseBusinessSpaceType(businessSpaceType),
+      compatibilityMode: 'work-management-template-unavailable',
+      compatibilityReason: message,
     };
   }
 }
 
-async function createProjectWithRetries({ name, leadAccountId, keyPrefix, projectTypeKey, templateKeys, maxAttempts = 26, allowTemplateOmission = true, diagnostics = [] }) {
+async function createProductDiscoveryProject(name, leadAccountId, keyPrefix, diagnostics = []) {
+  const templateKeys = await getLiveProductDiscoveryTemplateKeys(diagnostics);
+  if (templateKeys.length === 0) {
+    throw new Error('Jira Product Discovery is selected, but this Jira site does not expose a native Product Discovery project template through Jira REST. The app will not create a type-only Product Discovery shell because Jira Polaris pages can fail with "Something went wrong" when the space is not fully initialized. Create the Product Discovery space from Jira UI first and select it for volume, or enable a Jira Product Discovery template that is exposed to REST.');
+  }
+
+  return createProjectWithRetries({
+    name,
+    leadAccountId,
+    keyPrefix,
+    projectTypeKey: 'product_discovery',
+    maxAttempts: 12,
+    templateKeys,
+    allowTemplateOmission: false,
+    diagnostics,
+    serviceTypeLabel: 'Jira Product Discovery',
+  });
+}
+
+async function refreshProjectAfterCreate(project, diagnostics = []) {
+  if (!project?.key) {
+    return project;
+  }
+
+  try {
+    const refreshedProject = await getProjectByKeyIfExists(project.key);
+    return refreshedProject || project;
+  } catch (err) {
+    diagnostics.push(`Project ${project.key}: created but refresh skipped before validation: ${err.message}`);
+    return project;
+  }
+}
+
+async function validateProductDiscoveryReadiness(config, diagnostics = []) {
+  if (config.productDiscoveryProjectCount === 0) {
+    return { ok: true };
+  }
+
+  const projectsToCreate = [];
+  for (let index = 0; index < config.productDiscoveryProjectCount; index += 1) {
+    const projectConfig = getProductDiscoveryProjectConfig(config, index);
+    if (!projectConfig.projectKey) {
+      projectsToCreate.push(projectConfig);
+      continue;
+    }
+
+    const existingProject = await getProjectByKeyIfExists(projectConfig.projectKey);
+    if (!existingProject) {
+      return {
+        ok: false,
+        message: `Configured Product Discovery project key ${projectConfig.projectKey} was not found. Select an existing native Jira Product Discovery space or remove the key so the app can create one.`,
+      };
+    }
+
+    if (!isNativeProductDiscoveryProject(existingProject)) {
+      return {
+        ok: false,
+        message: `Configured Product Discovery project key ${existingProject.key} points to a ${existingProject.projectTypeKey || 'non-product-discovery'} project. The app will not treat a Work Management or Software project as Jira Product Discovery.`,
+      };
+    }
+
+  }
+
+  if (projectsToCreate.length > 0) {
+    const templateKeys = await getLiveProductDiscoveryTemplateKeys(diagnostics);
+    if (templateKeys.length === 0) {
+      return {
+        ok: false,
+        message: 'Jira Product Discovery is selected, but this Jira site does not expose a native Product Discovery project template through Jira REST. The app will not create a type-only Product Discovery shell because Jira Polaris pages can fail with "Something went wrong" when the space is not fully initialized. Create the Product Discovery space from Jira UI first and select it for volume, or enable a Jira Product Discovery template that is exposed to REST.',
+      };
+    }
+  }
+
+  return { ok: true };
+}
+
+const liveProjectTemplateCache = new Map();
+
+function normaliseTemplateLookupText(value) {
+  return String(value || '').toLowerCase().replace(/[^a-z0-9]+/g, ' ').trim();
+}
+
+function hasTemplateLabelMatch(template, labels) {
+  const haystack = normaliseTemplateLookupText([
+    template.name,
+    template.description,
+    template.category,
+    template.group,
+    template.key,
+  ].filter(Boolean).join(' '));
+
+  return (labels || []).some(label => {
+    const needle = normaliseTemplateLookupText(label);
+    if (!needle) return false;
+    if (haystack.includes(needle)) return true;
+    const words = needle.split(/\s+/).filter(word => word.length > 2);
+    return words.length > 0 && words.every(word => haystack.includes(word));
+  });
+}
+
+function getTemplateLabelMatchScore(template, labels) {
+  const name = normaliseTemplateLookupText(template.name);
+  const category = normaliseTemplateLookupText(template.category);
+  const group = normaliseTemplateLookupText(template.group);
+  const key = normaliseTemplateLookupText(template.key);
+  const description = normaliseTemplateLookupText(template.description);
+  let bestScore = 0;
+
+  for (const label of labels || []) {
+    const needle = normaliseTemplateLookupText(label);
+    if (!needle) continue;
+    const words = needle.split(/\s+/).filter(Boolean);
+    let score = 0;
+
+    if (name === needle) score += 100;
+    if (name.includes(needle)) score += 80;
+    if (key.includes(needle.replace(/\s+/g, ' '))) score += 40;
+    if (category === needle || group === needle) score += 30;
+    if (description.includes(needle)) score += 10;
+    if (words.length > 0 && words.every(word => name.includes(word))) score += 45;
+    if (words.length > 0 && words.every(word => key.includes(word))) score += 25;
+
+    bestScore = Math.max(bestScore, score);
+  }
+
+  return bestScore;
+}
+
+function templateKeyMatchesProjectType(key, projectTypeKey) {
+  const normalizedKey = String(key || '').toLowerCase();
+  if (!normalizedKey.includes(':')) {
+    return false;
+  }
+  if (projectTypeKey === 'service_desk') {
+    return normalizedKey.includes('servicedesk') || normalizedKey.includes('service-desk') || normalizedKey.includes('service-management');
+  }
+  if (projectTypeKey === 'software') {
+    return normalizedKey.includes('greenhopper') || normalizedKey.includes('software') || normalizedKey.includes('bug-tracking');
+  }
+  if (projectTypeKey === 'business') {
+    return normalizedKey.includes('jira-core-project-templates')
+      || normalizedKey.includes('jira-work-management')
+      || normalizedKey.includes('work-management')
+      || normalizedKey.includes('work_management')
+      || normalizedKey.includes('business')
+      || normalizedKey.includes('jira-templates')
+      || normalizedKey.includes('go-to-market')
+      || normalizedKey.includes('project-management')
+      || normalizedKey.includes('task-tracking')
+      || normalizedKey.includes('process-control')
+      || normalizedKey.includes('budget-planning')
+      || normalizedKey.includes('procurement')
+      || normalizedKey.includes('recruitment')
+      || normalizedKey.includes('marketing')
+      || normalizedKey.includes('design')
+      || normalizedKey.includes('legal')
+      || normalizedKey.includes('sales')
+      || normalizedKey.includes('finance');
+  }
+  if (projectTypeKey === 'product_discovery') {
+    return normalizedKey.includes('product-discovery') || normalizedKey.includes('product_discovery');
+  }
+  return true;
+}
+
+function extractProjectTemplatesFromResponse(node, templates = [], seen = new Set()) {
+  if (!node || typeof node !== 'object' || seen.has(node)) {
+    return templates;
+  }
+  seen.add(node);
+
+  if (Array.isArray(node)) {
+    node.forEach(item => extractProjectTemplatesFromResponse(item, templates, seen));
+    return templates;
+  }
+
+  const key = node.projectTemplateKey || node.templateKey || node.completeModuleKey || node.moduleKey || node.key;
+  const name = node.name || node.displayName || node.title || node.label;
+  if (typeof key === 'string' && templateKeyMatchesProjectType(key, 'any')) {
+    templates.push({
+      key,
+      name: typeof name === 'string' ? name : '',
+      description: typeof node.description === 'string' ? node.description : '',
+      category: typeof node.category === 'string' ? node.category : node.category?.name || '',
+      group: typeof node.group === 'string' ? node.group : node.group?.name || '',
+      projectTypeKey: node.projectTypeKey || node.projectType?.key || node.projectType || '',
+    });
+  }
+
+  Object.values(node).forEach(value => {
+    if (value && typeof value === 'object') {
+      extractProjectTemplatesFromResponse(value, templates, seen);
+    }
+  });
+
+  return templates;
+}
+
+async function getLiveProjectTemplates(diagnostics = []) {
+  const cacheKey = 'all-project-templates';
+  if (liveProjectTemplateCache.has(cacheKey)) {
+    return liveProjectTemplateCache.get(cacheKey);
+  }
+
+  try {
+    const response = await jiraGet('/rest/project-templates/1.0/templates');
+    const templates = extractProjectTemplatesFromResponse(response)
+      .filter(template => template.key && templateKeyMatchesProjectType(template.key, 'any'));
+    liveProjectTemplateCache.set(cacheKey, templates);
+    if (templates.length > 0) {
+      diagnostics.push(`Jira template lookup: found ${templates.length} live template key(s).`);
+    }
+    return templates;
+  } catch (err) {
+    diagnostics.push(`Jira template lookup skipped: ${err.message}`);
+    liveProjectTemplateCache.set(cacheKey, []);
+    return [];
+  }
+}
+
+function uniqueTemplateKeys(keys) {
+  return Array.from(new Set((keys || []).map(key => String(key || '').trim()).filter(Boolean)));
+}
+
+async function getProjectTemplateKeysForSelection({ projectTypeKey, staticKeys, labels, diagnostics = [] }) {
+  const liveTemplates = await getLiveProjectTemplates(diagnostics);
+  const liveKeys = liveTemplates
+    .filter(template => {
+      const type = String(template.projectTypeKey || '').toLowerCase();
+      const labelMatches = hasTemplateLabelMatch(template, labels);
+      const typeMatches = !type
+        || type === projectTypeKey
+        || (projectTypeKey === 'business' && ['business', 'core'].includes(type))
+        || (projectTypeKey === 'product_discovery' && type === 'product-discovery');
+      return typeMatches
+        && (templateKeyMatchesProjectType(template.key, projectTypeKey) || (projectTypeKey === 'business' && labelMatches))
+        && labelMatches;
+    })
+    .sort((left, right) => getTemplateLabelMatchScore(right, labels) - getTemplateLabelMatchScore(left, labels))
+    .map(template => template.key);
+
+  const keys = uniqueTemplateKeys([...liveKeys, ...(staticKeys || [])]);
+  if (liveKeys.length > 0) {
+    diagnostics.push(`Jira template lookup: using live key(s) for ${labels?.[0] || projectTypeKey}: ${uniqueTemplateKeys(liveKeys).join(', ')}.`);
+  } else {
+    diagnostics.push(`Jira template lookup: no live ${projectTypeKey} template matched ${labels?.join(', ') || 'selected labels'}; trying static key(s): ${uniqueTemplateKeys(staticKeys || []).join(', ') || 'none'}.`);
+  }
+  return keys;
+}
+
+async function getLiveProductDiscoveryTemplateKeys(diagnostics = []) {
+  const liveTemplates = await getLiveProjectTemplates(diagnostics);
+  const labels = ['Jira Product Discovery', 'Product Discovery', 'Product management'];
+  const liveKeys = liveTemplates
+    .filter(template => {
+      const type = String(template.projectTypeKey || '').toLowerCase();
+      const typeMatches = !type || type === 'product_discovery' || type === 'product-discovery';
+      return typeMatches
+        && templateKeyMatchesProjectType(template.key, 'product_discovery')
+        && hasTemplateLabelMatch(template, labels);
+    })
+    .sort((left, right) => getTemplateLabelMatchScore(right, labels) - getTemplateLabelMatchScore(left, labels))
+    .map(template => template.key);
+
+  const keys = uniqueTemplateKeys(liveKeys);
+  if (keys.length > 0) {
+    diagnostics.push(`Jira template lookup: using live key(s) for Jira Product Discovery: ${keys.join(', ')}.`);
+  } else {
+    diagnostics.push('Jira template lookup: no live Jira Product Discovery template is exposed on this site.');
+  }
+  return keys;
+}
+
+async function createProjectWithRetries({ name, leadAccountId, keyPrefix, projectTypeKey, templateKeys, maxAttempts = 26, allowTemplateOmission = true, diagnostics = [], serviceTypeLabel = null }) {
   const errors = [];
   // Atlassian's current Cloud examples still document project creation through
   // /rest/api/2/project, while /rest/api/3/project is also available on many
@@ -3352,18 +4113,18 @@ async function createProjectWithRetries({ name, leadAccountId, keyPrefix, projec
   const createProjectRequests = projectTypeKey === 'service_desk'
     ? [
         { path: '/rest/api/2/project', actor: 'user' },
+        { path: '/rest/api/3/project', actor: 'user' },
       ]
     : [{ path: '/rest/api/3/project', actor: 'user' }];
 
   for (let attempt = 0; attempt < maxAttempts; attempt++) {
     const candidateKey = generateKey(keyPrefix, attempt);
-    // JSM Ops must use the IT service management template specifically. Keep
-    // this path intentionally narrow so the Forge resolver does not spend its
-    // 25-second budget trying every service-desk variant when Jira rejects the
-    // product type. We only retry with a new project key when Jira reports a
-    // key collision.
+    const candidateName = attempt === 0 ? name : `${name} ${attempt + 1}`;
+    // JSM spaces must stay inside the selected service-management template
+    // family. We can try alternate keys from that same family, but never omit
+    // the template or fall back to business/software project types.
     const templateAttempts = projectTypeKey === 'service_desk'
-      ? templateKeys.slice(0, 1)
+      ? [...templateKeys]
       : allowTemplateOmission ? [...templateKeys, null] : [...templateKeys];
     let keyCollisionForAttempt = false;
 
@@ -3373,7 +4134,7 @@ async function createProjectWithRetries({ name, leadAccountId, keyPrefix, projec
       let sawKeyCollision = false;
       let sawProjectTypeError = false;
       const baseBody = {
-        name,
+        name: candidateName,
         key: candidateKey,
         leadAccountId,
         assigneeType: projectTypeKey === 'service_desk' ? 'PROJECT_LEAD' : 'UNASSIGNED',
@@ -3404,7 +4165,11 @@ async function createProjectWithRetries({ name, leadAccountId, keyPrefix, projec
             lastError = err;
             const lowerMessage = String(err.message || '').toLowerCase();
             sawTemplateError = sawTemplateError || err.message.includes('project template specified does not exist');
-            sawKeyCollision = sawKeyCollision || err.message.includes('"projectKey"') || lowerMessage.includes('uses this project key');
+            sawKeyCollision = sawKeyCollision
+              || err.message.includes('"projectKey"')
+              || lowerMessage.includes('uses this project key')
+              || lowerMessage.includes('project with that name already exists')
+              || lowerMessage.includes('"projectname"');
             sawProjectTypeError = sawProjectTypeError || lowerMessage.includes('invalid project type') || lowerMessage.includes('"projecttype"');
             errors.push(err.message);
             console.warn('Project create attempt failed', JSON.stringify({
@@ -3414,6 +4179,7 @@ async function createProjectWithRetries({ name, leadAccountId, keyPrefix, projec
               projectTypeKey: body.projectTypeKey || null,
               projectTemplateKey: templateKey || null,
               candidateKey,
+              candidateName,
               message: err.message,
             }));
           }
@@ -3443,19 +4209,21 @@ async function createProjectWithRetries({ name, leadAccountId, keyPrefix, projec
     }
   }
 
+  const selectedTemplateLabel = serviceTypeLabel || getProjectTemplateSelectionLabel(projectTypeKey, templateKeys);
   const lastError = errors[errors.length - 1] || `Unable to create ${projectTypeKey} project.`;
   const recentErrors = errors.slice(-8);
 
+  const diagnosticPrefix = projectTypeKey === 'service_desk' ? 'JSM Project' : `${selectedTemplateLabel} project`;
+  diagnostics.push(
+    `${diagnosticPrefix} create attempts failed for template key(s): ${uniqueTemplateKeys(templateKeys).join(', ') || 'UNKNOWN'}. Recent REST errors:`,
+    ...recentErrors.map(error => `  ${error}`)
+  );
+
   if (projectTypeKey === 'service_desk') {
-    diagnostics.push(
-      `JSM Project create attempts failed for IT service management template ${templateKeys[0] || 'UNKNOWN'}. Recent REST errors:`,
-      ...recentErrors.map(error => `  ${error}`)
-    );
+    throw new Error(`Unable to create a ${selectedTemplateLabel} project after trying the supported Jira project create endpoints with the selected service-management template. Last error: ${lastError}`);
   }
 
-  throw new Error(projectTypeKey === 'service_desk'
-    ? `Unable to create an IT Service Management project after trying the supported Jira project create endpoints with the IT service management template. Last error: ${lastError}`
-    : lastError);
+  throw new Error(`Unable to create the selected "${selectedTemplateLabel}" Jira template. The app did not fall back to another template. Last error: ${lastError}`);
 }
 
 async function createVersion(projectId, name, releaseDate, released) {
@@ -3479,6 +4247,67 @@ async function createProjectComponent(projectKey, name, description) {
     name,
     description,
   });
+}
+
+async function getProjectComponents(projectKey) {
+  try {
+    const components = await jiraGet(`/rest/api/3/project/${encodeURIComponent(projectKey)}/components`);
+    return Array.isArray(components) ? components : [];
+  } catch {
+    return [];
+  }
+}
+
+function findProjectComponentByName(components, name) {
+  const normalizedName = String(name || '').trim().toLowerCase();
+  return (components || []).find(component => String(component?.name || '').trim().toLowerCase() === normalizedName) || null;
+}
+
+function addProjectComponentRecord(project, component, fallbackName, extra = {}) {
+  project.components = project.components || [];
+  const componentName = component?.name || fallbackName;
+  const existing = findProjectComponentByName(project.components, componentName);
+  if (existing) {
+    if (!existing.id && component?.id) existing.id = component.id;
+    Object.assign(existing, extra);
+    return existing;
+  }
+
+  const record = {
+    id: component?.id || null,
+    name: componentName,
+    ...extra,
+  };
+  project.components.push(record);
+  return record;
+}
+
+async function ensureProjectComponent(project, name, description, diagnostics = [], label = 'Component') {
+  const existingComponents = await getProjectComponents(project.key);
+  const existing = findProjectComponentByName(existingComponents, name);
+  if (existing) {
+    addProjectComponentRecord(project, existing, name);
+    diagnostics.push(`${label} ${project.key}: reused existing ${existing.name || name}.`);
+    return { component: existing, created: false };
+  }
+
+  try {
+    const component = await createProjectComponent(project.key, name, description);
+    addProjectComponentRecord(project, component, name);
+    diagnostics.push(`${label} ${project.key}: created ${component.name || name}.`);
+    return { component, created: true };
+  } catch (err) {
+    const message = String(err.message || '');
+    if (message.toLowerCase().includes('already exists')) {
+      const refreshed = findProjectComponentByName(await getProjectComponents(project.key), name);
+      if (refreshed) {
+        addProjectComponentRecord(project, refreshed, name);
+        diagnostics.push(`${label} ${project.key}: reused existing ${refreshed.name || name}.`);
+        return { component: refreshed, created: false };
+      }
+    }
+    throw err;
+  }
 }
 
 function getSoftwareComponentCatalog(project, industry) {
@@ -3896,21 +4725,31 @@ async function linkIssueToAtlassianGoal(issueKey, goalId, diagnostics = []) {
 
 async function linkIssueToCompassComponent(issueKey, component, diagnostics = []) {
   const payloads = [];
+  const jiraComponentId = component.jiraComponentId || component.projectComponentId || null;
+  const jiraComponentName = component.jiraComponentName || component.projectComponentName || component.name || '';
 
-  if (component.id) {
-    payloads.push({ update: { components: [{ add: { id: String(component.id) } }] } });
-    payloads.push({ fields: { components: [{ id: String(component.id) }] } });
+  // Jira's native "Components" field accepts Jira project component IDs, not
+  // Compass GraphQL component IDs. The Compass metadata stays on the run record,
+  // while the visible Jira component gives users something concrete to click in
+  // the project Components view and on generated issues.
+  if (jiraComponentId) {
+    payloads.push({ update: { components: [{ add: { id: String(jiraComponentId) } }] } });
+    payloads.push({ fields: { components: [{ id: String(jiraComponentId) }] } });
   }
-  if (component.name) {
-    payloads.push({ update: { components: [{ add: { name: String(component.name) } }] } });
-    payloads.push({ fields: { components: [{ name: String(component.name) }] } });
+  if (jiraComponentName) {
+    payloads.push({ update: { components: [{ add: { name: String(jiraComponentName) } }] } });
+    payloads.push({ fields: { components: [{ name: String(jiraComponentName) }] } });
+  }
+
+  if (payloads.length === 0) {
+    throw new Error('No Jira project component id or name was available for the Compass component.');
   }
 
   try {
     await updateIssueWithFirstWorkingPayload(issueKey, payloads);
-    diagnostics.push(`Compass link ${issueKey}: linked "${component.name}" to Components field.`);
+    diagnostics.push(`Compass link ${issueKey}: linked Jira component "${jiraComponentName || jiraComponentId}" for Compass component "${component.name}" to Components field.`);
   } catch (err) {
-    diagnostics.push(`Compass link ${issueKey}: "${component.name}" not linked: ${err.message}`);
+    diagnostics.push(`Compass link ${issueKey}: "${component.name}" not linked to Jira Components field: ${err.message}`);
     throw err;
   }
 }
@@ -6138,6 +6977,8 @@ async function addRelationshipEvidence(state, evidence) {
 function buildEnvironmentFilterDefinition(config, state) {
   const projectKeys = [
     ...state.results.jsmProjects.map(project => project.key),
+    ...(state.results.businessProjects || []).map(project => project.key),
+    ...(state.results.productDiscoveryProjects || []).map(project => project.key),
     ...state.results.softwareProjects.map(project => project.key),
   ].filter(Boolean);
 
@@ -6164,27 +7005,52 @@ function buildEnvironmentFilterDefinition(config, state) {
 function getDashboardProjectContext(config, state, target) {
   const isEnterprise = target.projectKind === 'business-enterprise' || target.projectKind === 'software-enterprise';
   const isSoftware = target.projectKind === 'software' || target.projectKind === 'software-enterprise';
-  const projectCollection = isSoftware ? state.results.softwareProjects : state.results.jsmProjects;
+  const isJsm = target.projectKind === 'business' || target.projectKind === 'business-enterprise';
+  const isWorkManagement = target.projectKind === 'business-project';
+  const isProductDiscovery = target.projectKind === 'product-discovery';
+  const projectCollection = isSoftware
+    ? state.results.softwareProjects
+    : isWorkManagement
+      ? (state.results.businessProjects || [])
+      : isProductDiscovery
+        ? (state.results.productDiscoveryProjects || [])
+        : state.results.jsmProjects;
   const targetProjects = isEnterprise
     ? projectCollection.filter(project => project?.key)
-    : [target.projectKind === 'software'
-    ? state.results.softwareProjects[target.projectIndex]
-    : state.results.jsmProjects[target.projectIndex]].filter(project => project?.key);
+    : [isSoftware
+      ? state.results.softwareProjects[target.projectIndex]
+      : isWorkManagement
+        ? (state.results.businessProjects || [])[target.projectIndex]
+        : isProductDiscovery
+          ? (state.results.productDiscoveryProjects || [])[target.projectIndex]
+          : state.results.jsmProjects[target.projectIndex]].filter(project => project?.key);
 
   if (targetProjects.length === 0) {
     return null;
   }
 
   const project = targetProjects[0];
-  const fallbackTitle = isSoftware ? 'Software Dashboard' : 'Service Management Dashboard';
+  const fallbackTitle = isSoftware
+    ? 'Software Dashboard'
+    : isWorkManagement
+      ? `${getBusinessSpaceCategoryLabel(project.businessSpaceType)} Dashboard`
+      : isProductDiscovery
+        ? 'Product Discovery Dashboard'
+        : `${getJsmServiceTypeLabel(project.jsmServiceType || 'ITSM')} Dashboard`;
   const dashboardSelection = target.dashboardSelection || {
     title: fallbackTitle,
     prompt: '',
     value: 'default',
   };
   const dashboardIntent = inferDashboardIntent(dashboardSelection.prompt, config.industry, dashboardSelection.value);
-  const projectMethodLabel = isSoftware && !isEnterprise
-    ? `${getProjectManagementStyleLabel(project.softwareProjectStyle)} ${normaliseSoftwareTemplate(project.softwareTemplate) === 'kanban' ? 'Kanban' : 'Scrum'}`
+  const projectMethodLabel = !isEnterprise
+    ? isSoftware
+      ? getSoftwareProjectMethodLabel(project)
+      : isWorkManagement
+        ? `${getBusinessSpaceCategoryLabel(project.businessSpaceType)} - ${getBusinessSpaceTypeLabel(project.businessSpaceType)}`
+        : isProductDiscovery
+          ? 'Jira Product Discovery'
+          : getJsmServiceTypeLabel(project.jsmServiceType || 'ITSM')
     : '';
   const dashboardTitle = dashboardSelection.value === 'default'
     ? fallbackTitle
@@ -6197,6 +7063,13 @@ function getDashboardProjectContext(config, state, target) {
   const customDateFields = targetProjects
     .map(item => item.demoDateFields)
     .find(fields => fields?.createdDateFieldId || fields?.resolvedDateFieldId) || {};
+  const projectTypeLabel = isSoftware
+    ? 'Dev'
+    : isWorkManagement
+      ? getBusinessSpaceCategoryLabel(project.businessSpaceType)
+      : isProductDiscovery
+        ? 'Product Discovery'
+        : normaliseJsmServiceType(project.jsmServiceType || 'ITSM');
 
   return {
     dashboardIndex: target.dashboardIndex,
@@ -6207,7 +7080,7 @@ function getDashboardProjectContext(config, state, target) {
     projectKeys,
     customDateFields,
     dateRangeDays: config.dateRangeDays || 180,
-    projectTypeLabel: isSoftware ? 'Dev' : 'ITSM',
+    projectTypeLabel,
     dashboardName: `${dashboardOwnerName} - ${dashboardTitle}`,
     filterName: `${dashboardOwnerName} - ${filterTitle} Open Work (${state.metadata.runLabel || createRunLabel()})`,
     filterDescription: `Auto-generated ${filterTitle} filter by the Cprime Demo Environment Creator for ${dashboardOwnerName}.`,
@@ -6231,10 +7104,31 @@ function getDashboardProjectContext(config, state, target) {
           })),
           sprints: softwareProject.sprints || [],
         }))
-      : targetProjects.map(jsmProject => ({
+      : isWorkManagement
+        ? targetProjects.map(businessProject => ({
+            key: businessProject.key,
+            name: businessProject.name,
+            type: getBusinessSpaceCategoryLabel(businessProject.businessSpaceType),
+            businessSpaceType: normaliseBusinessSpaceType(businessProject.businessSpaceType),
+            businessSpaceCategoryLabel: getBusinessSpaceCategoryLabel(businessProject.businessSpaceType),
+            businessSpaceTypeLabel: getBusinessSpaceTypeLabel(businessProject.businessSpaceType),
+            count: businessProject.issueRecords?.length || businessProject.issueCount || 0,
+            dateFields: businessProject.demoDateFields || {},
+          }))
+        : isProductDiscovery
+          ? targetProjects.map(discoveryProject => ({
+              key: discoveryProject.key,
+              name: discoveryProject.name,
+              type: 'Product Discovery',
+              productDiscoveryType: discoveryProject.productDiscoveryType || 'product-discovery',
+              count: discoveryProject.issueRecords?.length || discoveryProject.issueCount || 0,
+              dateFields: discoveryProject.demoDateFields || {},
+            }))
+          : targetProjects.map(jsmProject => ({
           key: jsmProject.key,
           name: jsmProject.name,
-          type: 'ITSM',
+          type: getJsmServiceTypeLabel(jsmProject.jsmServiceType || 'ITSM'),
+          jsmServiceType: normaliseJsmServiceType(jsmProject.jsmServiceType || 'ITSM'),
           count: jsmProject.incidents.length,
           requestTypes: jsmProject.requestTypes || [],
           queues: jsmProject.queues || [],
@@ -6308,7 +7202,9 @@ async function createSavedFilter({ name, description, jql }) {
 }
 
 function isCustomDateFieldNotSearchableError(err) {
-  return /Field 'cf\[\d+\]' is not searchable/i.test(String(err?.message || ''));
+  const message = String(err?.message || '');
+  return /Field 'cf\[\d+\]' is not searchable/i.test(message)
+    || /Field 'cf\[\d+\]' does not exist or you do not have permission to view it/i.test(message);
 }
 
 async function getSavedFilter(filterId) {
@@ -6990,6 +7886,7 @@ resolver.define('createDemoEnvironment', async ({ payload }) => {
     softwareProjectCount, softwareTemplate, softwareProjectStyle, issuesPerProject, sprintsPerProject,
   } = payload;
   const dateRangeDays = parseDateRangeDays(payload.dateRange);
+  const jsmServiceTypes = normaliseJsmServiceTypes(payload);
   const retentionPeriodDays = ACTIVE_TICKET_RETENTION_DAYS;
   const effectiveSprintsPerProject = normalisePositiveInteger(
     sprintsPerProject,
@@ -7049,16 +7946,17 @@ resolver.define('createDemoEnvironment', async ({ payload }) => {
     const priorities = ['Highest', 'High', 'High', 'Medium', 'Medium', 'Medium', 'Low', 'Lowest'];
 
     // ── STEP 1: JSM ITSM PROJECTS + INCIDENTS ─────────────────────────────────
-    console.log(`Creating ${jsmProjectCount} JSM ITSM project(s)...`);
+    console.log(`Creating ${jsmProjectCount} JSM project(s)...`);
     for (let i = 0; i < jsmProjectCount; i++) {
       try {
         const timestamp = Date.now();
-        const projectName = `${environmentName} - ${industry} Ops ${i + 1} (${timestamp})`;
+        const jsmServiceType = normaliseJsmServiceType(jsmServiceTypes[i] || 'ITSM');
+        const projectName = `${environmentName} - ${industry} ${jsmServiceType} Ops ${i + 1} (${timestamp})`;
         const projectKeyPrefix = deriveProjectKeyPrefix(environmentName, industry);
-        console.log(`Creating JSM ITSM project: ${projectName} (${projectKeyPrefix})`);
-        results.diagnostics.push(`JSM Project ${i + 1}: creating Jira Service Management ITSM project using template ${getJsmItsmTemplateKeys()[0]}.`);
+        console.log(`Creating ${getJsmServiceTypeLabel(jsmServiceType)} project: ${projectName} (${projectKeyPrefix})`);
+        results.diagnostics.push(`JSM Project ${i + 1}: creating ${getJsmServiceTypeLabel(jsmServiceType)} project using template ${getJsmTemplateKeys(jsmServiceType)[0]}.`);
 
-        const project = await createJSMProject(projectName, accountId, projectKeyPrefix, results.diagnostics);
+        const project = await createJSMProject(projectName, accountId, projectKeyPrefix, results.diagnostics, jsmServiceType);
         const screenSetup = await ensureDemoDateFieldsOnProjectScreens(project.id, project.key);
         const demoDateFields = screenSetup.demoDateFields || null;
         const assignableUsers = await getAssignableUsers(project.key, accountId);
@@ -7129,7 +8027,7 @@ resolver.define('createDemoEnvironment', async ({ payload }) => {
           }
         }
 
-        results.jsmProjects.push({ key: project.key, name: projectName, incidents: projectIncidents });
+        results.jsmProjects.push({ key: project.key, name: projectName, jsmServiceType, incidents: projectIncidents });
         console.log(`✅ JSM ITSM project ${project.key} created with ${projectIncidents.length} incidents`);
       } catch (err) {
         console.error(`JSM Project ${i + 1} error: ${err.message}`);
@@ -7467,8 +8365,11 @@ const ITSM_WORK_COUNT_DEFAULTS = {
 
 const DEFAULT_SOFTWARE_ISSUES_PER_PROJECT = 60;
 const DEMO_DOMAIN_PROJECT_PROPERTY_KEY = 'cprimeDemoDomainSetup';
-const JSM_SERVICE_TYPES = ['ITSM', 'HRSM', 'CSM'];
-const BUSINESS_SPACE_TYPES = ['task-tracking', 'budget-planning', 'procurement-management', 'recruitment-tracking'];
+const JSM_SERVICE_TYPES = ['ITSM', 'HRSM', 'CSM', 'FSM', 'LSM'];
+const BUSINESS_SPACE_TYPES = [
+  'task-tracking',
+  'budget-planning',
+];
 
 function normaliseBusinessSpaceType(value) {
   const raw = String(value || 'task-tracking').trim().toLowerCase();
@@ -7478,12 +8379,39 @@ function normaliseBusinessSpaceType(value) {
 function getBusinessSpaceTypeLabel(value) {
   const normalized = normaliseBusinessSpaceType(value);
   const labels = {
+    'project-management': 'Project management',
+    'go-to-market': 'Go-to-market',
     'task-tracking': 'Task tracking',
+    'process-control': 'Process control',
+    finance: 'Finance',
     'budget-planning': 'Budget planning',
+    marketing: 'Marketing',
+    design: 'Design',
+    legal: 'Legal',
+    sales: 'Sales',
     'procurement-management': 'Procurement management',
     'recruitment-tracking': 'Recruitment tracking',
   };
   return labels[normalized] || 'Task tracking';
+}
+
+function getBusinessSpaceCategoryLabel(value) {
+  const normalized = normaliseBusinessSpaceType(value);
+  const categories = {
+    'project-management': 'Work Management',
+    'go-to-market': 'Work Management',
+    'task-tracking': 'Work Management',
+    'process-control': 'Work Management',
+    'budget-planning': 'Work Management',
+    finance: 'Finance',
+    marketing: 'Marketing',
+    design: 'Design',
+    legal: 'Legal',
+    sales: 'Sales',
+    'recruitment-tracking': 'Human Resources',
+    'procurement-management': 'Operations',
+  };
+  return categories[normalized] || 'Work Management';
 }
 
 function normaliseBusinessProjectConfigs(payload = {}) {
@@ -7551,7 +8479,7 @@ function createDomainProjectName(domain, projectKind, index, details = {}) {
   }
 
   const template = normaliseSoftwareTemplate(details.softwareTemplate);
-  const templateLabel = template === 'kanban' ? 'Kanban' : 'Scrum';
+  const templateLabel = getSoftwareTemplateLabel(template);
   return `${cleanDomain} - ${templateLabel} Dev ${index + 1}`;
 }
 
@@ -7672,6 +8600,25 @@ function getProductDiscoveryProjectConfig(config, projectIndex) {
   };
 }
 
+function getBusinessProjectDashboardSelection(businessSpaceType) {
+  const normalized = normaliseBusinessSpaceType(businessSpaceType);
+  const categoryLabel = getBusinessSpaceCategoryLabel(normalized);
+  const typeLabel = getBusinessSpaceTypeLabel(normalized);
+  return {
+    value: `business-${normalized}-dashboard`,
+    title: `${typeLabel} Dashboard`,
+    prompt: `Project-level dashboard for a Jira ${categoryLabel} ${typeLabel} space. Show created vs resolved work, open work, overdue items, priority mix, owner workload, aging work, and completion trend for the selected business domain. Answer: What work needs attention for ${typeLabel}? Are items completing on time? KPIs: open work, overdue work, completion rate %, high-priority count, average age.`,
+  };
+}
+
+function getProductDiscoveryDashboardSelection() {
+  return {
+    value: 'product-discovery-dashboard',
+    title: 'Jira Product Discovery Dashboard',
+    prompt: 'Project-level dashboard for Jira Product Discovery. Show idea intake, open opportunities, priority or impact mix, owner workload, aging ideas, completion trend, and delivery readiness for the selected business domain. Answer: Which ideas need attention and what is ready for delivery? KPIs: open ideas, high-impact ideas, completion rate %, average idea age.',
+  };
+}
+
 function getTotalItsmWorkCount(itsmWorkCounts = {}) {
   return ACTIVE_ITSM_WORK_COUNT_KEYS.reduce((total, key) => total + (Number(itsmWorkCounts[key]) || 0), 0);
 }
@@ -7708,12 +8655,20 @@ function normalisePayload(payload) {
   const environmentName = String(payload.environmentName || industry).trim() || industry;
   const opsDashboardPrompt = String(payload.opsDashboardPrompt || payload.dashboardPrompt || '').trim();
   const softwareDashboardPrompt = String(payload.softwareDashboardPrompt || '').trim();
+  const businessDashboardPrompt = String(payload.businessDashboardPrompt || '').trim();
+  const productDiscoveryDashboardPrompt = String(payload.productDiscoveryDashboardPrompt || '').trim();
   const opsDashboardTypes = Array.isArray(payload.opsDashboardTypes)
     ? payload.opsDashboardTypes.filter(Boolean).map(String)
     : (payload.opsDashboardType ? [String(payload.opsDashboardType)] : []);
   const softwareDashboardTypes = Array.isArray(payload.softwareDashboardTypes)
     ? payload.softwareDashboardTypes.filter(Boolean).map(String)
     : (payload.softwareDashboardType ? [String(payload.softwareDashboardType)] : []);
+  const businessDashboardTypes = Array.isArray(payload.businessDashboardTypes)
+    ? payload.businessDashboardTypes.filter(Boolean).map(String)
+    : (payload.businessDashboardType ? [String(payload.businessDashboardType)] : []);
+  const productDiscoveryDashboardTypes = Array.isArray(payload.productDiscoveryDashboardTypes)
+    ? payload.productDiscoveryDashboardTypes.filter(Boolean).map(String)
+    : (payload.productDiscoveryDashboardType ? [String(payload.productDiscoveryDashboardType)] : []);
   const softwareTemplate = normaliseSoftwareTemplate(payload.softwareTemplate);
   const softwareProjectStyle = normaliseProjectManagementStyle(payload.softwareProjectStyle);
   const softwareProjects = normaliseSoftwareProjectConfigs(payload);
@@ -7737,6 +8692,18 @@ function normalisePayload(payload) {
     softwareDashboardPrompt,
     'Software Dashboard'
   );
+  const businessDashboardSelections = normaliseDashboardSelections(
+    payload.businessDashboardSelections,
+    businessDashboardTypes,
+    businessDashboardPrompt,
+    'Business Dashboard'
+  );
+  const productDiscoveryDashboardSelections = normaliseDashboardSelections(
+    payload.productDiscoveryDashboardSelections,
+    productDiscoveryDashboardTypes,
+    productDiscoveryDashboardPrompt,
+    'Product Discovery Dashboard'
+  );
 
   return {
     industry,
@@ -7751,10 +8718,20 @@ function normalisePayload(payload) {
     softwareDashboardType: softwareDashboardTypes[0] || '',
     softwareDashboardSelections,
     softwareDashboardPrompt,
+    businessDashboardTypes,
+    businessDashboardType: businessDashboardTypes[0] || '',
+    businessDashboardSelections,
+    businessDashboardPrompt,
+    productDiscoveryDashboardTypes,
+    productDiscoveryDashboardType: productDiscoveryDashboardTypes[0] || '',
+    productDiscoveryDashboardSelections,
+    productDiscoveryDashboardPrompt,
     dashboardPrompt: opsDashboardPrompt,
     dashboardIntent: inferDashboardIntent(opsDashboardPrompt, industry),
     opsDashboardIntent: inferDashboardIntent(opsDashboardPrompt, industry),
     softwareDashboardIntent: inferDashboardIntent(softwareDashboardPrompt, industry),
+    businessDashboardIntent: inferDashboardIntent(businessDashboardPrompt, industry),
+    productDiscoveryDashboardIntent: inferDashboardIntent(productDiscoveryDashboardPrompt, industry),
     addVolumeToExistingDomainData: Boolean(payload.addVolumeToExistingDomainData || volumeProjectKeys.length > 0),
     volumeProjectKeys,
     runSeed: payload.runSeed || null,
@@ -7899,19 +8876,26 @@ function buildChunkedExecutionPlan(config) {
     const businessProjectConfig = getBusinessProjectConfig(config, projectIndex);
     const issueCount = businessProjectConfig.issuesPerProject;
     const globalIndex = config.jsmProjectCount + projectIndex;
+    const businessCategoryLabel = getBusinessSpaceCategoryLabel(businessProjectConfig.businessSpaceType);
 
     steps.push({
       type: 'create-work-management-project-shell',
       projectIndex,
       projectName: createDomainProjectName(config.industry, 'business-project', projectIndex, businessProjectConfig),
       projectKeyPrefix: deriveRunProjectKeyPrefix({ ...config, runSeed }, config.industry, globalIndex),
-      label: `Find or create ${getBusinessSpaceTypeLabel(businessProjectConfig.businessSpaceType)} space ${projectIndex + 1} of ${config.businessProjectCount}`,
+      label: `Find or create ${businessCategoryLabel} ${getBusinessSpaceTypeLabel(businessProjectConfig.businessSpaceType)} space ${projectIndex + 1} of ${config.businessProjectCount}`,
     });
 
     steps.push({
       type: 'configure-work-management-date-fields',
       projectIndex,
-      label: `Configure demo date fields for Work Management space ${projectIndex + 1}`,
+      label: `Configure demo date fields for ${businessCategoryLabel} space ${projectIndex + 1}`,
+    });
+
+    steps.push({
+      type: 'create-work-management-components',
+      projectIndex,
+      label: `Create components for ${businessCategoryLabel} space ${projectIndex + 1}`,
     });
 
     if (!csvIssueCreation) {
@@ -7921,7 +8905,7 @@ function buildChunkedExecutionPlan(config) {
           projectIndex,
           start,
           count: Math.min(ISSUE_BATCH_SIZE, issueCount - start),
-          label: `Create Work Management items ${start + 1}-${Math.min(start + ISSUE_BATCH_SIZE, issueCount)} for space ${projectIndex + 1}`,
+          label: `Create ${businessCategoryLabel} items ${start + 1}-${Math.min(start + ISSUE_BATCH_SIZE, issueCount)} for space ${projectIndex + 1}`,
         });
       }
     }
@@ -7944,6 +8928,12 @@ function buildChunkedExecutionPlan(config) {
       type: 'configure-product-discovery-date-fields',
       projectIndex,
       label: `Configure demo date fields for Product Discovery space ${projectIndex + 1}`,
+    });
+
+    steps.push({
+      type: 'create-product-discovery-components',
+      projectIndex,
+      label: `Create components for Product Discovery space ${projectIndex + 1}`,
     });
 
     if (!csvIssueCreation) {
@@ -8000,7 +8990,7 @@ function buildChunkedExecutionPlan(config) {
       label: `Create components for software project ${projectIndex + 1}`,
     });
 
-    if (!csvIssueCreation) {
+    if (!csvIssueCreation && softwareTemplate === 'scrum') {
       const epicCount = getConfiguredContent(config).epics.length;
       for (let start = 0; start < epicCount; start += EPIC_BATCH_SIZE) {
         steps.push({
@@ -8013,17 +9003,21 @@ function buildChunkedExecutionPlan(config) {
       }
     }
 
-    steps.push({
-      type: 'create-atlassian-goals',
-      projectIndex,
-      label: `Create and link Atlassian Goals for software project ${projectIndex + 1}`,
-    });
+    if (softwareTemplate === 'scrum') {
+      steps.push({
+        type: 'create-atlassian-goals',
+        projectIndex,
+        label: `Create and link Atlassian Goals for software project ${projectIndex + 1}`,
+      });
+    }
 
-    steps.push({
-      type: 'lookup-software-board',
-      projectIndex,
-      label: `Find ${softwareTemplate === 'kanban' ? 'Kanban' : 'Scrum'} board for software project ${projectIndex + 1}`,
-    });
+    if (softwareTemplate === 'scrum' || softwareTemplate === 'kanban') {
+      steps.push({
+        type: 'lookup-software-board',
+        projectIndex,
+        label: `Find ${getSoftwareTemplateLabel(softwareTemplate)} board for software project ${projectIndex + 1}`,
+      });
+    }
 
     if (!csvIssueCreation) {
       for (let start = 0; start < issueCount; start += ISSUE_BATCH_SIZE) {
@@ -8053,11 +9047,17 @@ function buildChunkedExecutionPlan(config) {
             label: `Create sprint ${sprintIndex + 1} for Scrum software project ${projectIndex + 1}`,
           });
         }
-      } else {
+      } else if (softwareTemplate === 'kanban') {
         steps.push({
           type: 'populate-kanban-board',
           projectIndex,
           label: `Populate Kanban board for software project ${projectIndex + 1}`,
+        });
+      } else {
+        steps.push({
+          type: 'verify-bug-tracking-work',
+          projectIndex,
+          label: `Verify Bug Tracking work for software project ${projectIndex + 1}`,
         });
       }
     }
@@ -8111,9 +9111,19 @@ function buildChunkedExecutionPlan(config) {
       });
     }
 
+    for (let projectIndex = 0; projectIndex < config.jsmProjectCount; projectIndex++) {
+      steps.push({
+        type: 'create-github-development-activity',
+        projectKind: 'jsm',
+        projectIndex,
+        label: `Create GitHub demo activity for JSM project ${projectIndex + 1}`,
+      });
+    }
+
     for (let projectIndex = 0; projectIndex < config.softwareProjectCount; projectIndex++) {
       steps.push({
         type: 'create-github-development-activity',
+        projectKind: 'software',
         projectIndex,
         label: `Create GitHub demo activity for software project ${projectIndex + 1}`,
       });
@@ -8146,9 +9156,23 @@ function buildChunkedExecutionPlan(config) {
   const softwareDashboardSelections = config.softwareDashboardSelections?.length
     ? config.softwareDashboardSelections
     : [{ value: 'default', title: 'Software Dashboard', prompt: '' }];
+  const businessDashboardSelections = config.businessDashboardSelections?.length
+    ? config.businessDashboardSelections
+    : [];
+  const productDiscoveryDashboardSelections = config.productDiscoveryDashboardSelections?.length
+    ? config.productDiscoveryDashboardSelections
+    : [];
   const isEnterpriseDashboardSelection = selection => (
     inferDashboardIntent(selection.prompt, config.industry, selection.value).level === 'Enterprise'
   );
+  const isJsmProjectLevelDashboardAllowed = (selection, serviceType) => {
+    const selectionValue = String(selection?.value || '').toLowerCase();
+    const normalizedServiceType = normaliseJsmServiceType(serviceType);
+    if (selectionValue.startsWith('jsm-')) {
+      return selectionValue === `jsm-${normalizedServiceType.toLowerCase()}-dashboard`;
+    }
+    return normalizedServiceType === 'ITSM';
+  };
   const isSoftwareProjectLevelDashboardAllowed = (selection, projectConfig) => {
     const selectionValue = String(selection?.value || '').toLowerCase();
     const softwareTemplate = normaliseSoftwareTemplate(projectConfig?.softwareTemplate || config.softwareTemplate);
@@ -8159,6 +9183,10 @@ function buildChunkedExecutionPlan(config) {
 
     if (selectionValue.startsWith('kanban-')) {
       return softwareTemplate === 'kanban';
+    }
+
+    if (selectionValue.startsWith('bug-')) {
+      return softwareTemplate === 'bug-tracking';
     }
 
     return true;
@@ -8174,13 +9202,50 @@ function buildChunkedExecutionPlan(config) {
   }
 
   for (let projectIndex = 0; projectIndex < config.jsmProjectCount; projectIndex += 1) {
-    for (const dashboardSelection of opsDashboardSelections.filter(selection => !isEnterpriseDashboardSelection(selection))) {
+    const jsmServiceType = config.jsmServiceTypes?.[projectIndex] || 'ITSM';
+    for (const dashboardSelection of opsDashboardSelections
+      .filter(selection => !isEnterpriseDashboardSelection(selection))
+      .filter(selection => isJsmProjectLevelDashboardAllowed(selection, jsmServiceType))) {
       dashboardTargets.push({
         dashboardIndex: dashboardTargets.length,
         projectKind: 'business',
         projectIndex,
         dashboardSelection,
-        label: `ITSM project ${projectIndex + 1} ${dashboardSelection.title}`,
+        label: `JSM project ${projectIndex + 1} ${dashboardSelection.title}`,
+      });
+    }
+  }
+
+  for (let projectIndex = 0; projectIndex < config.businessProjectCount; projectIndex += 1) {
+    const businessProjectConfig = getBusinessProjectConfig(config, projectIndex);
+    const businessCategoryLabel = getBusinessSpaceCategoryLabel(businessProjectConfig.businessSpaceType);
+    const defaultSelection = getBusinessProjectDashboardSelection(businessProjectConfig.businessSpaceType);
+    const matchingSelections = config.businessDashboardTypes?.length
+      ? businessDashboardSelections.filter(selection => String(selection.value || '') === defaultSelection.value)
+      : [defaultSelection];
+    for (const dashboardSelection of matchingSelections) {
+      dashboardTargets.push({
+        dashboardIndex: dashboardTargets.length,
+        projectKind: 'business-project',
+        projectIndex,
+        dashboardSelection,
+        label: `${businessCategoryLabel} project ${projectIndex + 1} ${getBusinessSpaceTypeLabel(businessProjectConfig.businessSpaceType)} Dashboard`,
+      });
+    }
+  }
+
+  for (let projectIndex = 0; projectIndex < config.productDiscoveryProjectCount; projectIndex += 1) {
+    const defaultSelection = getProductDiscoveryDashboardSelection();
+    const matchingSelections = config.productDiscoveryDashboardTypes?.length
+      ? productDiscoveryDashboardSelections.filter(selection => String(selection.value || '') === defaultSelection.value)
+      : [defaultSelection];
+    for (const dashboardSelection of matchingSelections) {
+      dashboardTargets.push({
+        dashboardIndex: dashboardTargets.length,
+        projectKind: 'product-discovery',
+        projectIndex,
+        dashboardSelection,
+        label: `Product Discovery space ${projectIndex + 1} Dashboard`,
       });
     }
   }
@@ -8289,7 +9354,7 @@ async function executeBusinessProjectStep(config, state, step) {
   const jsmServiceType = normaliseJsmServiceType(step.jsmServiceType || config.jsmServiceTypes?.[step.projectIndex]);
 
   try {
-    addChunkedDiagnostics(state, [`JSM Project ${step.projectIndex + 1}: finding or creating Jira Service Management ${jsmServiceType} project using template ${getJsmItsmTemplateKeys()[0]}.`]);
+    addChunkedDiagnostics(state, [`JSM Project ${step.projectIndex + 1}: finding or creating ${getJsmServiceTypeLabel(jsmServiceType)} project using template ${getJsmTemplateKeys(jsmServiceType)[0]}.`]);
     const expectedKey = generateKey(projectKeyPrefix, 0);
     const existingDomainProject = await findReusableDomainProject(config, {
       kind: 'business',
@@ -8304,10 +9369,10 @@ async function executeBusinessProjectStep(config, state, step) {
           serviceDeskAvailable: true,
           projectTypeKey: existingProject.projectTypeKey || 'service_desk',
         }
-      : await createJSMProject(projectName, state.metadata.accountId, projectKeyPrefix, state.results.diagnostics);
+      : await createJSMProject(projectName, state.metadata.accountId, projectKeyPrefix, state.results.diagnostics, jsmServiceType);
 
     if (existingProject) {
-      addChunkedDiagnostics(state, [`JSM Project ${step.projectIndex + 1}: reused existing ${jsmServiceType} project ${existingProject.key} for ${config.industry}.`]);
+      addChunkedDiagnostics(state, [`JSM Project ${step.projectIndex + 1}: reused existing ${getJsmServiceTypeLabel(jsmServiceType)} project ${existingProject.key} for ${config.industry}.`]);
     }
 
     const existingIssueCount = await getIssueCountForProject(project.key);
@@ -8326,6 +9391,8 @@ async function executeBusinessProjectStep(config, state, step) {
       name: existingProject?.name || projectName,
       serviceDeskAvailable: project.serviceDeskAvailable !== false,
       projectTypeKey: project.projectTypeKey || 'service_desk',
+      compatibilityMode: project.compatibilityMode || null,
+      compatibilityReason: project.compatibilityReason || null,
       reusedExistingDomainData: Boolean(existingProject && existingIssueCount > 0),
       addVolumeToExistingDomainData: addVolumeToExistingProject,
       existingIssueCount,
@@ -8383,6 +9450,10 @@ async function executeBusinessFormStep(config, state, step) {
     addChunkedDiagnostics(state, [`JSM Project ${step.projectIndex + 1}: skipped form setup because the ITSM/JSM project was not created.`]);
     return;
   }
+  if (project.serviceDeskAvailable === false) {
+    addChunkedDiagnostics(state, [`Forms ${project.key}: skipped JSM request form because ${getJsmServiceTypeLabel(project.jsmServiceType)} is running in compatibility mode on a Jira Work Management space.`]);
+    return;
+  }
 
   try {
     const formSetup = await ensureDefaultSmartIntakeForm(project.key, project.name, config.industry, {
@@ -8416,6 +9487,16 @@ async function executeItsmFoundationStep(config, state, step) {
   const project = state.results.jsmProjects[step.projectIndex];
   if (!project?.key) {
     addChunkedDiagnostics(state, [`JSM Project ${step.projectIndex + 1}: skipped ITSM foundation setup because the ITSM/JSM project was not created.`]);
+    return;
+  }
+  if (project.serviceDeskAvailable === false) {
+    addChunkedDiagnostics(state, [`ITSM foundation ${project.key}: skipped JSM queue/request-type setup because ${getJsmServiceTypeLabel(project.jsmServiceType)} is running in compatibility mode on a Jira Work Management space.`]);
+    const knowledgeBase = await ensureKnowledgeBaseSpace(project.key, project.name, config.industry, state.results.diagnostics);
+    project.knowledgeBase = knowledgeBase;
+    if (knowledgeBase.success) {
+      state.results.confluenceSpaces.push(knowledgeBase);
+      addChunkedDiagnostics(state, [`Knowledge base ${project.key}: created ${knowledgeBase.pages.length} page(s) for service-management guidance.`]);
+    }
     return;
   }
 
@@ -8489,7 +9570,7 @@ async function executeBusinessIncidentBatchStep(config, state, step) {
   const boardStatusCycle = ['To Do', 'In Progress', 'Done'];
   const demoDateFields = project.demoDateFields || await getProjectDemoDateFieldIds(project.key, state.results.diagnostics);
   project.demoDateFields = demoDateFields;
-  if (!project.serviceDeskId) {
+  if (!project.serviceDeskId && project.serviceDeskAvailable !== false) {
     project.serviceDeskId = await getServiceDeskIdWithRetry(project.key, {
       attempts: 4,
       delayMs: 1000,
@@ -8605,17 +9686,65 @@ function getWorkManagementItemTemplate(config, businessSpaceType, index) {
   const domain = config.industry || 'Business';
   const type = normaliseBusinessSpaceType(businessSpaceType);
   const catalog = {
+    'project-management': [
+      'Define project milestone',
+      'Review project risk',
+      'Update stakeholder status',
+      'Coordinate project dependency',
+    ],
+    'go-to-market': [
+      'Prepare launch readiness review',
+      'Coordinate market enablement',
+      'Validate launch messaging',
+      'Track launch blocker',
+    ],
     'task-tracking': [
       'Coordinate stakeholder review',
       'Prepare operational checklist',
       'Track delivery dependency',
       'Update monthly execution plan',
     ],
+    'process-control': [
+      'Review process control exception',
+      'Update workflow control step',
+      'Track recurring process improvement',
+      'Validate process handoff',
+    ],
+    finance: [
+      'Review finance request',
+      'Validate forecast assumptions',
+      'Prepare month-end finance task',
+      'Track approval for spend change',
+    ],
     'budget-planning': [
       'Review budget variance',
       'Prepare funding request',
       'Validate spend forecast',
       'Reconcile vendor allocation',
+    ],
+    marketing: [
+      'Plan campaign asset review',
+      'Coordinate audience segment update',
+      'Review campaign performance',
+      'Prepare launch communication',
+    ],
+    design: [
+      'Review design request',
+      'Prepare prototype feedback',
+      'Validate design handoff',
+      'Track accessibility review',
+    ],
+    legal: [
+      'Review contract request',
+      'Track legal approval',
+      'Prepare compliance review',
+      'Update legal matter status',
+    ],
+    sales: [
+      'Review sales opportunity handoff',
+      'Prepare account follow-up',
+      'Track proposal approval',
+      'Update pipeline action item',
     ],
     'procurement-management': [
       'Review purchase request',
@@ -8635,7 +9764,7 @@ function getWorkManagementItemTemplate(config, businessSpaceType, index) {
   return {
     title,
     type: 'Task',
-    description: `${getBusinessSpaceTypeLabel(type)} demo work for ${domain}. Includes realistic scheduling, ownership, comment, and dependency signals for the selected business domain.`,
+    description: `${getBusinessSpaceCategoryLabel(type)} - ${getBusinessSpaceTypeLabel(type)} demo work for ${domain}. Includes realistic scheduling, ownership, comment, and dependency signals for the selected business domain.`,
     labels: [
       'demo-data',
       slugifyGitHubPart(domain, 'domain'),
@@ -8648,10 +9777,34 @@ function getWorkManagementItemTemplate(config, businessSpaceType, index) {
 function getProductDiscoveryIdeaTemplate(config, index) {
   const content = getConfiguredContent(config);
   const source = content.issues?.[index % (content.issues.length || 1)] || { title: 'Improve customer experience', description: 'Discovery idea for the selected domain.' };
+  const roadmapCycle = ['Now', 'Next', 'Next', 'Later', "Won't do"];
+  const themeCycle = [
+    'Increase revenue',
+    'Win enterprise customers',
+    'Delight users',
+    'Expand horizons',
+  ];
+  const customerSegmentCycle = [
+    ['Enterprise'],
+    ['SMB', 'Startups'],
+    ['Healthcare teams'],
+    ['Operations leaders'],
+  ];
+  const projectTargetCycle = ['Jul-Sep, 2026', 'Oct-Dec, 2026', 'Jan-Mar, 2027'];
   return {
     title: `${config.industry} discovery idea ${index + 1}: ${source.title}`,
     type: 'Idea',
     description: `${source.description || 'Product discovery item.'}\n\nOpportunity: evaluate customer value, delivery confidence, and roadmap fit before implementation.`,
+    theme: themeCycle[index % themeCycle.length],
+    roadmap: roadmapCycle[index % roadmapCycle.length],
+    projectTarget: projectTargetCycle[index % projectTargetCycle.length],
+    specReady: index % 4 !== 3,
+    designsReady: index % 3 === 0,
+    reach: [300, 180, 120, 80, 40][index % 5],
+    impact: Math.max(1, 5 - (index % 5)),
+    confidence: [100, 80, 70, 60, 50][index % 5],
+    effort: Math.max(1, (index % 5) + 1),
+    customerSegments: customerSegmentCycle[index % customerSegmentCycle.length],
     labels: [
       'demo-data',
       'product-discovery',
@@ -8661,13 +9814,268 @@ function getProductDiscoveryIdeaTemplate(config, index) {
   };
 }
 
+const productDiscoveryFieldConfigCache = new Map();
+
+function findEditableProductDiscoveryField(fields, candidateNames) {
+  const normalisedCandidates = candidateNames.map(normaliseFieldName);
+  const entries = Object.entries(fields || {});
+  return entries.find(([, field]) => {
+    const name = normaliseFieldName(field?.name || '');
+    return normalisedCandidates.includes(name);
+  }) || entries.find(([, field]) => {
+    const name = normaliseFieldName(field?.name || '');
+    return normalisedCandidates.some(candidate => candidate && name.includes(candidate));
+  }) || null;
+}
+
+async function getEditableProductDiscoveryFieldConfig(project, issueKey, diagnostics = []) {
+  if (productDiscoveryFieldConfigCache.has(project.key)) {
+    return productDiscoveryFieldConfigCache.get(project.key);
+  }
+
+  const config = {
+    theme: null,
+    roadmap: null,
+    projectTarget: null,
+    specReady: null,
+    designsReady: null,
+    reach: null,
+    impact: null,
+    confidence: null,
+    effort: null,
+    customerSegments: null,
+  };
+
+  try {
+    const editMeta = await jiraGet(`/rest/api/3/issue/${encodeURIComponent(issueKey)}/editmeta`);
+    const fields = editMeta?.fields || {};
+    const matches = {
+      theme: findEditableProductDiscoveryField(fields, ['Theme']),
+      roadmap: findEditableProductDiscoveryField(fields, ['Roadmap']),
+      projectTarget: findEditableProductDiscoveryField(fields, ['Project target', 'Target']),
+      specReady: findEditableProductDiscoveryField(fields, ['Spec ready', 'Specification ready']),
+      designsReady: findEditableProductDiscoveryField(fields, ['Designs ready', 'Design ready']),
+      reach: findEditableProductDiscoveryField(fields, ['Reach']),
+      impact: findEditableProductDiscoveryField(fields, ['Impact']),
+      confidence: findEditableProductDiscoveryField(fields, ['Confidence']),
+      effort: findEditableProductDiscoveryField(fields, ['Effort']),
+      customerSegments: findEditableProductDiscoveryField(fields, ['Customer segments', 'Customer segment']),
+    };
+
+    for (const [key, match] of Object.entries(matches)) {
+      if (match) {
+        const [fieldId, metadata] = match;
+        config[key] = { id: fieldId, metadata };
+      }
+    }
+
+    const found = Object.entries(config)
+      .filter(([, value]) => value)
+      .map(([key, value]) => `${key}:${value.id}`);
+    diagnostics.push(found.length > 0
+      ? `Product Discovery ${project.key}: editable JPD fields resolved (${found.join(', ')}).`
+      : `Product Discovery ${project.key}: Jira edit metadata did not expose native JPD scoring fields; generated ideas will remain blank for those native JPD columns.`);
+  } catch (err) {
+    diagnostics.push(`Product Discovery ${project.key}: JPD field lookup failed: ${err.message}`);
+  }
+
+  productDiscoveryFieldConfigCache.set(project.key, config);
+  return config;
+}
+
+function normaliseOptionLabel(value) {
+  return normaliseFieldName(value).replace(/wont/g, 'willnot');
+}
+
+function getAllowedValueLabel(value) {
+  return String(value?.value || value?.name || value?.label || value?.title || '').trim();
+}
+
+function chooseAllowedValue(metadata, desiredLabel, fallbackIndex = 0) {
+  const allowedValues = Array.isArray(metadata?.allowedValues) ? metadata.allowedValues : [];
+  if (allowedValues.length === 0) {
+    return null;
+  }
+
+  const desired = normaliseOptionLabel(desiredLabel);
+  return allowedValues.find(value => normaliseOptionLabel(getAllowedValueLabel(value)) === desired) ||
+    allowedValues.find(value => normaliseOptionLabel(getAllowedValueLabel(value)).includes(desired)) ||
+    allowedValues[fallbackIndex % allowedValues.length];
+}
+
+function buildAllowedValuePayload(value) {
+  if (!value || typeof value !== 'object') {
+    return value;
+  }
+
+  if (value.id) {
+    return { id: String(value.id) };
+  }
+  if (value.value) {
+    return { value: String(value.value) };
+  }
+  if (value.name) {
+    return { name: String(value.name) };
+  }
+  return value;
+}
+
+function buildProductDiscoveryFieldPayloads(fieldConfig, desiredValue, fallbackIndex) {
+  const metadata = fieldConfig?.metadata || {};
+  const schemaType = String(metadata?.schema?.type || '').toLowerCase();
+  const payloads = [];
+
+  if (Array.isArray(desiredValue)) {
+    const optionPayloads = desiredValue
+      .map((value, index) => chooseAllowedValue(metadata, value, fallbackIndex + index))
+      .filter(Boolean)
+      .map(buildAllowedValuePayload);
+
+    if (optionPayloads.length > 0) {
+      payloads.push({ fields: { [fieldConfig.id]: optionPayloads } });
+      payloads.push({ update: { [fieldConfig.id]: [{ set: optionPayloads }] } });
+    }
+
+    return payloads;
+  }
+
+  const allowedValue = chooseAllowedValue(metadata, desiredValue, fallbackIndex);
+
+  if (allowedValue) {
+    const optionPayload = buildAllowedValuePayload(allowedValue);
+    payloads.push({ fields: { [fieldConfig.id]: schemaType === 'array' ? [optionPayload] : optionPayload } });
+    payloads.push({ update: { [fieldConfig.id]: [{ set: schemaType === 'array' ? [optionPayload] : optionPayload }] } });
+  }
+
+  if (typeof desiredValue === 'number') {
+    payloads.push({ fields: { [fieldConfig.id]: desiredValue } });
+    payloads.push({ update: { [fieldConfig.id]: [{ set: desiredValue }] } });
+  }
+
+  if (typeof desiredValue === 'boolean') {
+    payloads.push({ fields: { [fieldConfig.id]: desiredValue } });
+    payloads.push({ update: { [fieldConfig.id]: [{ set: desiredValue }] } });
+  }
+
+  if (typeof desiredValue === 'string' && schemaType !== 'array') {
+    payloads.push({ fields: { [fieldConfig.id]: desiredValue } });
+    payloads.push({ update: { [fieldConfig.id]: [{ set: desiredValue }] } });
+  }
+
+  return payloads;
+}
+
+async function updateProductDiscoveryIdeaFields(issueKey, project, template, issueIndex, diagnostics = []) {
+  const fieldConfig = await getEditableProductDiscoveryFieldConfig(project, issueKey, diagnostics);
+  const desiredValues = {
+    theme: template.theme,
+    roadmap: template.roadmap,
+    projectTarget: template.projectTarget,
+    specReady: template.specReady,
+    designsReady: template.designsReady,
+    reach: template.reach,
+    impact: template.impact,
+    confidence: template.confidence,
+    effort: template.effort,
+    customerSegments: template.customerSegments,
+  };
+  const updated = [];
+  const skipped = [];
+
+  for (const [fieldName, desiredValue] of Object.entries(desiredValues)) {
+    const config = fieldConfig[fieldName];
+    if (!config) {
+      skipped.push(fieldName);
+      continue;
+    }
+
+    const payloads = buildProductDiscoveryFieldPayloads(config, desiredValue, issueIndex);
+    if (payloads.length === 0) {
+      skipped.push(fieldName);
+      continue;
+    }
+
+    try {
+      await updateIssueWithFirstWorkingPayload(issueKey, payloads, {
+        querySuffixes: [
+          'notifyUsers=false',
+          'notifyUsers=false&overrideScreenSecurity=true&overrideEditableFlag=true',
+        ],
+      });
+      updated.push(fieldName);
+    } catch (err) {
+      skipped.push(fieldName);
+      if (!project.productDiscoveryFieldUpdateWarningLogged) {
+        diagnostics.push(`Product Discovery ${project.key}: ${fieldName} update failed for ${issueKey}: ${err.message}`);
+      }
+    }
+  }
+
+  if (!project.productDiscoveryFieldUpdateSummaryLogged) {
+    diagnostics.push(updated.length > 0
+      ? `Product Discovery ${project.key}: generated ideas will be enriched with editable JPD fields (${updated.join(', ')}).`
+      : `Product Discovery ${project.key}: generated ideas were created, but Jira did not accept JPD field enrichment through REST.`);
+    if (skipped.length > 0) {
+      diagnostics.push(`Product Discovery ${project.key}: JPD fields not updated on first generated idea: ${[...new Set(skipped)].join(', ')}.`);
+    }
+    project.productDiscoveryFieldUpdateSummaryLogged = true;
+    project.productDiscoveryFieldUpdateWarningLogged = true;
+  }
+}
+
+function getProductDiscoveryComponentCatalog(config) {
+  const industrySlug = slugifyGitHubPart(config.industry, 'product');
+  return [
+    'Discovery Intake',
+    'Roadmap Prioritization',
+    `${industrySlug}-customer-signals`,
+    `${industrySlug}-delivery-readiness`,
+  ].map(name => name
+    .split('-')
+    .map(part => part ? `${part.charAt(0).toUpperCase()}${part.slice(1)}` : part)
+    .join(' '));
+}
+
+function chooseProductDiscoveryComponentNames(project, issueIndex) {
+  const components = project?.components || [];
+  if (components.length === 0) {
+    return [];
+  }
+  return [components[issueIndex % components.length]?.name].filter(Boolean);
+}
+
+function getWorkManagementComponentCatalog(config, businessSpaceType) {
+  const industrySlug = slugifyGitHubPart(config.industry, 'business');
+  const type = normaliseBusinessSpaceType(businessSpaceType);
+  const typeLabel = getBusinessSpaceTypeLabel(type);
+  return [
+    `${typeLabel} Intake`,
+    `${typeLabel} Delivery`,
+    `${industrySlug}-operations`,
+    `${industrySlug}-stakeholder-review`,
+  ].map(name => name
+    .split('-')
+    .map(part => part ? `${part.charAt(0).toUpperCase()}${part.slice(1)}` : part)
+    .join(' '));
+}
+
+function chooseWorkManagementComponentNames(project, issueIndex) {
+  const components = project?.components || [];
+  if (components.length === 0) {
+    return [];
+  }
+  return [components[issueIndex % components.length]?.name].filter(Boolean);
+}
+
 async function executeWorkManagementProjectStep(config, state, step) {
   const projectConfig = getBusinessProjectConfig(config, step.projectIndex);
   const projectName = step.projectName || createDomainProjectName(config.industry, 'business-project', step.projectIndex, projectConfig);
   const projectKeyPrefix = step.projectKeyPrefix || deriveRunProjectKeyPrefix(config, config.industry, step.projectIndex + config.jsmProjectCount);
   const businessSpaceType = normaliseBusinessSpaceType(projectConfig.businessSpaceType);
+  const businessCategoryLabel = getBusinessSpaceCategoryLabel(businessSpaceType);
 
   try {
+    addChunkedDiagnostics(state, [`${businessCategoryLabel} ${step.projectIndex + 1}: finding or creating ${getBusinessSpaceTypeLabel(businessSpaceType)} using template ${getBusinessProjectTemplateKeys(businessSpaceType)[0]}.`]);
     const expectedProject = projectConfig.projectKey ? await getProjectByKeyIfExists(projectConfig.projectKey) : null;
     const existingDomainProject = expectedProject || await findReusableDomainProject(config, {
       kind: 'business-project',
@@ -8677,7 +10085,7 @@ async function executeWorkManagementProjectStep(config, state, step) {
     const existingProject = existingDomainProject || await getProjectByKeyIfExists(generateKey(projectKeyPrefix, 0));
     const project = existingProject
       ? existingProject
-      : await createWorkManagementProject(projectName, state.metadata.accountId, projectKeyPrefix, businessSpaceType);
+      : await createWorkManagementProject(projectName, state.metadata.accountId, projectKeyPrefix, businessSpaceType, state.results.diagnostics);
 
     const existingIssueCount = await getIssueCountForProject(project.key);
     const addVolumeToExistingProject = Boolean(existingProject && shouldAddVolumeToExistingProject(config, project.key));
@@ -8705,7 +10113,7 @@ async function executeWorkManagementProjectStep(config, state, step) {
       demoDateFields: null,
       demoDateFieldsReady: false,
     };
-    addChunkedDiagnostics(state, [`Work Management ${project.key}: ${existingProject ? 'reused existing' : 'created'} ${getBusinessSpaceTypeLabel(businessSpaceType)} space.`]);
+    addChunkedDiagnostics(state, [`${businessCategoryLabel} ${project.key}: ${existingProject ? 'reused existing' : 'created'} ${getBusinessSpaceTypeLabel(businessSpaceType)} space.`]);
   } catch (err) {
     state.results.businessProjects[step.projectIndex] = {
       id: null,
@@ -8716,7 +10124,7 @@ async function executeWorkManagementProjectStep(config, state, step) {
       businessSpaceType,
       issueKeys: [],
     };
-    addChunkedError(state, `Work Management space ${step.projectIndex + 1}: ${err.message}`);
+    addChunkedError(state, `${businessCategoryLabel} space ${step.projectIndex + 1}: ${err.message}`);
   }
 }
 
@@ -8726,15 +10134,24 @@ async function executeProductDiscoveryProjectStep(config, state, step) {
   const projectKeyPrefix = step.projectKeyPrefix || deriveRunProjectKeyPrefix(config, config.industry, step.projectIndex + config.jsmProjectCount + config.businessProjectCount);
 
   try {
+    addChunkedDiagnostics(state, ['Product Discovery: finding or creating a native Jira Product Discovery space.']);
     const expectedProject = projectConfig.projectKey ? await getProjectByKeyIfExists(projectConfig.projectKey) : null;
+    if (expectedProject && !isNativeProductDiscoveryProject(expectedProject)) {
+      throw new Error(`Configured Product Discovery project key ${expectedProject.key} points to a ${expectedProject.projectTypeKey || 'non-product-discovery'} project. Select a native Jira Product Discovery space or leave the key blank so the app can create one.`);
+    }
     const existingDomainProject = expectedProject || await findReusableDomainProject(config, {
       kind: 'product-discovery',
       excludeKeys: state.results.productDiscoveryProjects.map(project => project?.key),
     });
-    const existingProject = existingDomainProject || await getProjectByKeyIfExists(generateKey(projectKeyPrefix, 0));
-    const project = existingProject
+    const matchingGeneratedKeyProject = await getProjectByKeyIfExists(generateKey(projectKeyPrefix, 0));
+    const existingProject = existingDomainProject || (isNativeProductDiscoveryProject(matchingGeneratedKeyProject) ? matchingGeneratedKeyProject : null);
+    const projectShell = existingProject
       ? existingProject
-      : await createProductDiscoveryProject(projectName, state.metadata.accountId, projectKeyPrefix);
+      : await createProductDiscoveryProject(projectName, state.metadata.accountId, projectKeyPrefix, state.results.diagnostics);
+    const project = existingProject ? projectShell : await refreshProjectAfterCreate(projectShell, state.results.diagnostics);
+    if (!isNativeProductDiscoveryProject(project)) {
+      throw new Error(`Jira returned project ${project.key} as ${project.projectTypeKey || 'unknown'} instead of product_discovery. The app will not treat a Work Management or Software project as Jira Product Discovery.`);
+    }
 
     const existingIssueCount = await getIssueCountForProject(project.key);
     const addVolumeToExistingProject = Boolean(existingProject && shouldAddVolumeToExistingProject(config, project.key));
@@ -8750,10 +10167,8 @@ async function executeProductDiscoveryProjectStep(config, state, step) {
       id: project.id,
       key: project.key,
       name: existingProject?.name || projectName,
-      projectTypeKey: project.projectTypeKey || (project.productDiscoveryFallback ? 'business' : 'product_discovery'),
+      projectTypeKey: project.projectTypeKey || 'product_discovery',
       productDiscoveryType: 'product-discovery',
-      productDiscoveryFallback: Boolean(project.productDiscoveryFallback),
-      productDiscoveryFallbackReason: project.productDiscoveryFallbackReason || '',
       reusedExistingDomainData: Boolean(existingProject && existingIssueCount > 0),
       addVolumeToExistingDomainData: addVolumeToExistingProject,
       existingIssueCount,
@@ -8764,11 +10179,7 @@ async function executeProductDiscoveryProjectStep(config, state, step) {
       demoDateFields: null,
       demoDateFieldsReady: false,
     };
-    addChunkedDiagnostics(state, [
-      project.productDiscoveryFallback
-        ? `Product Discovery ${project.key}: Jira blocked native Product Discovery project creation, so a discovery-style Work Management space was created and tagged as Product Discovery demo data.`
-        : `Product Discovery ${project.key}: ${existingProject ? 'reused existing' : 'created'} discovery space.`,
-    ]);
+    addChunkedDiagnostics(state, [`Product Discovery ${project.key}: ${existingProject ? 'reused existing native' : 'created native'} discovery space.`]);
   } catch (err) {
     state.results.productDiscoveryProjects[step.projectIndex] = {
       id: null,
@@ -8783,9 +10194,66 @@ async function executeProductDiscoveryProjectStep(config, state, step) {
   }
 }
 
+async function executeProductDiscoveryComponentsStep(config, state, step) {
+  const project = state.results.productDiscoveryProjects[step.projectIndex];
+  if (!project?.key) {
+    if (project?.failed) {
+      return;
+    }
+    addChunkedDiagnostics(state, [`Product Discovery space ${step.projectIndex + 1}: skipped components because the project was not created.`]);
+    return;
+  }
+
+  const componentNames = getProductDiscoveryComponentCatalog(config);
+  project.components = project.components || [];
+
+  for (const componentName of componentNames) {
+    try {
+      await ensureProjectComponent(
+        project,
+        componentName,
+        `${componentName} demo discovery area for ${project.name}. Used for roadmap grouping, idea triage, and product discovery demos.`,
+        state.results.diagnostics,
+        'Product Discovery component'
+      );
+    } catch (err) {
+      addChunkedDiagnostics(state, [`Product Discovery component ${project.key}: create skipped for ${componentName}: ${err.message}`]);
+    }
+  }
+}
+
+async function executeWorkManagementComponentsStep(config, state, step) {
+  const project = state.results.businessProjects[step.projectIndex];
+  const businessCategoryLabel = getBusinessSpaceCategoryLabel(project?.businessSpaceType);
+  if (!project?.key) {
+    addChunkedDiagnostics(state, [`${businessCategoryLabel} space ${step.projectIndex + 1}: skipped components because the project was not created.`]);
+    return;
+  }
+
+  const componentNames = getWorkManagementComponentCatalog(config, project.businessSpaceType);
+  project.components = project.components || [];
+
+  for (const componentName of componentNames) {
+    try {
+      await ensureProjectComponent(
+        project,
+        componentName,
+        `${componentName} demo work area for ${project.name}. Used for grouping work items, ownership, dependencies, and reporting demos.`,
+        state.results.diagnostics,
+        `${businessCategoryLabel} component`
+      );
+    } catch (err) {
+      addChunkedDiagnostics(state, [`${businessCategoryLabel} component ${project.key}: create skipped for ${componentName}: ${err.message}`]);
+    }
+  }
+}
+
 async function executeGenericProjectDateFieldStep(state, step, resultKey, label) {
   const project = state.results[resultKey]?.[step.projectIndex];
   if (!project?.key) {
+    if (project?.failed) {
+      return;
+    }
     addChunkedDiagnostics(state, [`${label} ${step.projectIndex + 1}: skipped date field setup because the project was not created.`]);
     return;
   }
@@ -8799,12 +10267,13 @@ async function executeGenericProjectDateFieldStep(state, step, resultKey, label)
 
 async function executeWorkManagementIssueBatchStep(config, state, step) {
   const project = state.results.businessProjects[step.projectIndex];
+  const businessCategoryLabel = getBusinessSpaceCategoryLabel(project?.businessSpaceType);
   if (!project?.key) {
-    addChunkedDiagnostics(state, [`Work Management space ${step.projectIndex + 1}: skipped work item batch because the project was not created.`]);
+    addChunkedDiagnostics(state, [`${businessCategoryLabel} space ${step.projectIndex + 1}: skipped work item batch because the project was not created.`]);
     return;
   }
   if (project.reusedExistingDomainData && !project.addVolumeToExistingDomainData) {
-    addChunkedDiagnostics(state, [`Work Management ${project.key}: reused ${project.existingIssueCount || 0} existing work items; skipped duplicate item creation.`]);
+    addChunkedDiagnostics(state, [`${businessCategoryLabel} ${project.key}: reused ${project.existingIssueCount || 0} existing work items; skipped duplicate item creation.`]);
     return;
   }
 
@@ -8839,13 +10308,14 @@ async function executeWorkManagementIssueBatchStep(config, state, step) {
         retentionPeriodDays: config.retentionPeriodDays,
         description: template.description,
         labels: template.labels,
+        components: chooseWorkManagementComponentNames(project, issueIndex),
         issueIndex,
       });
       if (status !== 'To Do') {
         await transitionIssue(issue.key, status);
       }
       await addIssueComment(issue.key, [
-        `Demo update: ${getBusinessSpaceTypeLabel(project.businessSpaceType)} item created for ${config.industry}.`,
+        `Demo update: ${businessCategoryLabel} ${getBusinessSpaceTypeLabel(project.businessSpaceType)} item created for ${config.industry}.`,
         `Related context: due ${dueDate}; status target ${status}; use this item for timeline, calendar, and operational tracking demos.`,
       ], state.results.diagnostics);
 
@@ -8858,7 +10328,7 @@ async function executeWorkManagementIssueBatchStep(config, state, step) {
       project.issueRecords.push({ key: issue.key, title: template.title, status, priority, dueDate, createdAt: lifecycle.createdAt, resolvedAt: lifecycle.resolvedAt });
       project.issueCount++;
     } catch (err) {
-      addChunkedError(state, `Work Management item ${issueIndex + 1} for ${project.key}: ${err.message}`);
+      addChunkedError(state, `${businessCategoryLabel} item ${issueIndex + 1} for ${project.key}: ${err.message}`);
     }
   }
 }
@@ -8866,6 +10336,9 @@ async function executeWorkManagementIssueBatchStep(config, state, step) {
 async function executeProductDiscoveryIdeaBatchStep(config, state, step) {
   const project = state.results.productDiscoveryProjects[step.projectIndex];
   if (!project?.key) {
+    if (project?.failed) {
+      return;
+    }
     addChunkedDiagnostics(state, [`Product Discovery space ${step.projectIndex + 1}: skipped idea batch because the project was not created.`]);
     return;
   }
@@ -8874,11 +10347,14 @@ async function executeProductDiscoveryIdeaBatchStep(config, state, step) {
     return;
   }
 
-  const assignableUsers = await getAssignableUsers(project.key, state.metadata.accountId);
   const demoDateFields = project.demoDateFields || await getProjectDemoDateFieldIds(project.key, state.results.diagnostics);
   project.demoDateFields = demoDateFields;
   const priorities = ['Highest', 'High', 'Medium', 'Low'];
   const statusCycle = ['To Do', 'In Progress', 'Done'];
+  if (!project.productDiscoveryAssigneeSkipLogged) {
+    addChunkedDiagnostics(state, [`Product Discovery ${project.key}: idea creation leaves assignee empty because this Jira site rejects assignable-user values during native Product Discovery issue creation.`]);
+    project.productDiscoveryAssigneeSkipLogged = true;
+  }
 
   for (let offset = 0; offset < step.count; offset += 1) {
     const issueIndex = step.start + offset;
@@ -8892,11 +10368,9 @@ async function executeProductDiscoveryIdeaBatchStep(config, state, step) {
       maxAgeDays: config.dateRangeDays,
     }), status);
     const dueDate = buildDueDateFromLifecycle(lifecycle, priority, issueIndex);
-    const assigneeAccountId = chooseDemoAssigneeAccountId(assignableUsers, issueIndex, step.projectIndex);
 
     try {
       const issue = await createIssue(project.key, template.title, template.type, null, priority, dueDate, null, {
-        assigneeAccountId,
         demoDateFields,
         diagnostics: state.results.diagnostics,
         environmentName: config.environmentName,
@@ -8907,6 +10381,7 @@ async function executeProductDiscoveryIdeaBatchStep(config, state, step) {
         labels: template.labels,
         issueIndex,
       });
+      await updateProductDiscoveryIdeaFields(issue.key, project, template, issueIndex, state.results.diagnostics);
       if (status !== 'To Do') {
         await transitionIssue(issue.key, status);
       }
@@ -8938,7 +10413,7 @@ async function executeSoftwareProjectStep(config, state, step) {
   const softwareProjectStyle = normaliseProjectManagementStyle(softwareProjectConfig.softwareProjectStyle);
 
   try {
-    addChunkedDiagnostics(state, [`Software Project ${step.projectIndex + 1}: creating ${getProjectManagementStyleLabel(softwareProjectStyle)} ${softwareTemplate === 'kanban' ? 'Kanban' : 'Scrum'} project from selected dropdown values.`]);
+    addChunkedDiagnostics(state, [`Software Project ${step.projectIndex + 1}: creating ${getSoftwareProjectMethodLabel(softwareTemplate, softwareProjectStyle)} project from selected dropdown values.`]);
     const expectedKey = generateKey(projectKeyPrefix, 0);
     const existingDomainProject = await findReusableDomainProject(config, {
       kind: 'software',
@@ -8949,10 +10424,10 @@ async function executeSoftwareProjectStep(config, state, step) {
     const existingProject = existingDomainProject || await getProjectByKeyIfExists(expectedKey);
     const project = existingProject
       ? existingProject
-      : await createSoftwareProject(projectName, state.metadata.accountId, projectKeyPrefix, softwareTemplate, softwareProjectStyle);
+      : await createSoftwareProject(projectName, state.metadata.accountId, projectKeyPrefix, softwareTemplate, softwareProjectStyle, state.results.diagnostics);
 
     if (existingProject) {
-      addChunkedDiagnostics(state, [`Software Project ${step.projectIndex + 1}: reused existing ${softwareTemplate} ${getProjectManagementStyleLabel(softwareProjectStyle)} project ${existingProject.key} for ${config.industry}.`]);
+      addChunkedDiagnostics(state, [`Software Project ${step.projectIndex + 1}: reused existing ${getSoftwareProjectMethodLabel(softwareTemplate, softwareProjectStyle)} project ${existingProject.key} for ${config.industry}.`]);
     }
 
     const existingIssueCount = await getIssueCountForProject(project.key);
@@ -9136,8 +10611,7 @@ async function executeSoftwareComponentsStep(config, state, step) {
     return;
   }
   if (project.reusedExistingDomainData && !project.addVolumeToExistingDomainData) {
-    addChunkedDiagnostics(state, [`Component ${project.key}: reused existing domain project data; skipped duplicate component creation.`]);
-    return;
+    addChunkedDiagnostics(state, [`Component ${project.key}: reused existing domain project data; verifying project components are present.`]);
   }
 
   const componentNames = getSoftwareComponentCatalog(project, config.industry);
@@ -9145,24 +10619,15 @@ async function executeSoftwareComponentsStep(config, state, step) {
 
   for (const componentName of componentNames) {
     try {
-      const component = await createProjectComponent(
-        project.key,
+      await ensureProjectComponent(
+        project,
         componentName,
-        `${componentName} demo ownership area for ${project.name}. Used for release, dependency, and defect triage demos.`
+        `${componentName} demo ownership area for ${project.name}. Used for release, dependency, and defect triage demos.`,
+        state.results.diagnostics,
+        'Component'
       );
-      project.components.push({
-        id: component.id || null,
-        name: component.name || componentName,
-      });
-      addChunkedDiagnostics(state, [`Component ${project.key}: created ${component.name || componentName}.`]);
     } catch (err) {
-      const message = String(err.message || '');
-      if (message.toLowerCase().includes('already exists')) {
-        project.components.push({ id: null, name: componentName });
-        addChunkedDiagnostics(state, [`Component ${project.key}: reused existing ${componentName}.`]);
-      } else {
-        addChunkedDiagnostics(state, [`Component ${project.key}: create skipped for ${componentName}: ${message}`]);
-      }
+      addChunkedDiagnostics(state, [`Component ${project.key}: create skipped for ${componentName}: ${err.message}`]);
     }
   }
 }
@@ -9204,11 +10669,33 @@ async function executeCompassComponentsStep(config, state, step) {
           metadataApplied: Boolean(component.metadataApplied),
           createMode: component.createMode || (component.richPayloadApplied ? 'rich' : 'simple'),
         };
+
+        try {
+          const jiraComponent = await ensureProjectComponent(
+            project,
+            record.name,
+            `Attached Compass ${record.typeId} component created through GraphQL. Compass component id: ${record.id}.`,
+            state.results.diagnostics,
+            'Compass-backed Jira component'
+          );
+          record.jiraComponentId = jiraComponent.component?.id || null;
+          record.jiraComponentName = jiraComponent.component?.name || record.name;
+          record.visibleInJiraComponents = Boolean(record.jiraComponentId || record.jiraComponentName);
+          addProjectComponentRecord(project, jiraComponent.component, record.name, {
+            compassId: record.id,
+            compassTypeId: record.typeId,
+            compassBacked: true,
+          });
+        } catch (jiraComponentErr) {
+          record.visibleInJiraComponents = false;
+          addChunkedDiagnostics(state, [`Compass ${project.key}: "${record.name}" was created in Compass but its Jira project component was not created: ${jiraComponentErr.message}`]);
+        }
+
         project.compassComponents = project.compassComponents || [];
         project.compassComponents.push(record);
         state.results.compassComponents.push(record);
         createdCompassComponents.push(record);
-        addChunkedDiagnostics(state, [`Compass ${project.key}: created ${record.name} (${record.typeId}) using ${record.createMode} payload${record.repositoryLinked ? ' with repository link' : ''}${record.relatedLinkCount ? ` and ${record.relatedLinkCount} related link(s)` : ''}${record.ownerConfigured ? ' and owner team' : ''}.`]);
+        addChunkedDiagnostics(state, [`Compass ${project.key}: created ${record.name} (${record.typeId}) using ${record.createMode} payload${record.repositoryLinked ? ' with repository link' : ''}${record.relatedLinkCount ? ` and ${record.relatedLinkCount} related link(s)` : ''}${record.ownerConfigured ? ' and owner team' : ''}${record.visibleInJiraComponents ? '; visible in Jira Components' : ''}.`]);
         if (component.richPayloadApplied === false && component.richPayloadError) {
           addChunkedDiagnostics(state, [`Compass ${project.key}: "${record.name}" used metadata/simple fallback after richer metadata was rejected: ${component.richPayloadError}`]);
         }
@@ -9490,9 +10977,9 @@ async function executeSoftwareIssueBatchStep(config, state, step) {
       const startDate = lifecycleForStatus?.createdAt ? toJiraDateOnly(lifecycleForStatus.createdAt) : null;
       const releaseVersions = chooseReleaseVersionIds(project, variantIndex, template.type);
       const methodologyDescription = getSoftwareMethodologyDescription(project, variantIndex);
-      const epicKey = softwareTemplate === 'kanban'
-        ? null
-        : project.epicKeys[variantIndex % (project.epicKeys.length || 1)] || null;
+      const epicKey = softwareTemplate === 'scrum'
+        ? project.epicKeys[variantIndex % (project.epicKeys.length || 1)] || null
+        : null;
       const issue = await createIssue(
         project.key,
         template.title,
@@ -9513,7 +11000,7 @@ async function executeSoftwareIssueBatchStep(config, state, step) {
           startDate,
           startDateFieldId: project.timelineStartDateFieldId,
           description: [template.description || '', methodologyDescription].filter(Boolean).join('\n\n'),
-          skipEpicLink: softwareTemplate === 'kanban',
+          skipEpicLink: softwareTemplate !== 'scrum',
           labels: getSoftwareMethodologyLabels(project, variantIndex, template.type),
           components: chooseSoftwareComponentNames(project, variantIndex, template.type),
           issueIndex: variantIndex,
@@ -9713,6 +11200,27 @@ async function executeKanbanBoardPopulationStep(config, state, step) {
   } catch (err) {
     addChunkedError(state, `Kanban board population for ${project.key}: ${err.message}`);
   }
+}
+
+async function executeBugTrackingVerificationStep(config, state, step) {
+  const project = state.results.softwareProjects[step.projectIndex];
+  if (!project?.key) {
+    addChunkedError(state, `Software Project ${step.projectIndex + 1}: skipped Bug Tracking verification because the project was not created.`);
+    return;
+  }
+
+  const softwareTemplate = normaliseSoftwareTemplate(project.softwareTemplate || config.softwareTemplate);
+  if (softwareTemplate !== 'bug-tracking') {
+    return;
+  }
+
+  const issueRecords = Array.isArray(project.issueRecords) ? project.issueRecords : [];
+  if (issueRecords.length === 0 && !project.reusedExistingDomainData) {
+    addChunkedError(state, `Bug Tracking ${project.key}: no generated bug-tracking work items were created.`);
+    return;
+  }
+
+  addChunkedDiagnostics(state, [`Bug Tracking ${project.key}: ${project.reusedExistingDomainData && !project.addVolumeToExistingDomainData ? 'reused existing domain data' : `created ${issueRecords.length} defect/review work item(s)`}; Scrum sprint and Kanban board setup intentionally skipped for the Bug Tracking template.`]);
 }
 
 async function createNativeJiraPlan(config, project, state, siteDetails) {
@@ -10060,6 +11568,37 @@ async function executeDependencyStep(state, step = {}) {
       }
     }
 
+    if (shouldRunScope('product-discovery-delivery') || shouldRunScope('all')) {
+      const discoveryIdeas = (state.results.productDiscoveryProjects || [])
+        .flatMap(project => (project?.issueRecords || []).map(record => ({ ...record, project })))
+        .filter(record => record.key);
+      const deliveryIssues = (state.results.softwareProjects || [])
+        .flatMap(project => (project?.issueRecords || []).map(record => ({ ...record, project })))
+        .filter(record => record.key);
+
+      if (discoveryIdeas.length > 0 && deliveryIssues.length > 0) {
+        const deliveryLinkLimit = Math.min(discoveryIdeas.length, deliveryIssues.length, 12 - attemptedLinks);
+        for (let index = 0; index < deliveryLinkLimit; index += 1) {
+          const idea = discoveryIdeas[index];
+          const delivery = deliveryIssues[index % deliveryIssues.length];
+          await linkAndTrack(
+            delivery.key,
+            idea.key,
+            'Relates',
+            `Product Discovery delivery link: idea ${idea.key} relates to delivery work ${delivery.key}.`,
+            {
+              category: 'product-discovery-delivery',
+              project: idea.project,
+              fromRecord: delivery,
+              toRecord: idea,
+            }
+          );
+        }
+      } else if (discoveryIdeas.length > 0 && deliveryIssues.length === 0) {
+        addChunkedDiagnostics(state, ['Product Discovery delivery status: no Software project issues were created in this run, so generated ideas have no linked delivery work for Jira to count.']);
+      }
+    }
+
     if (linked.length > 0) {
       addChunkedDiagnostics(state, linked.slice(0, 12));
     }
@@ -10080,10 +11619,39 @@ async function executeDependencyStep(state, step = {}) {
   }
 }
 
-async function executeGitHubDevelopmentActivityStep(config, state, step) {
+function getGitHubActivityProjectTarget(state, step) {
+  const projectKind = step.projectKind || 'software';
+  if (projectKind === 'jsm') {
+    const project = state.results.jsmProjects[step.projectIndex];
+    return {
+      projectKind,
+      project,
+      label: `JSM project ${step.projectIndex + 1}`,
+      issueRecords: (project?.itsmWorkItems || project?.incidents || []).map(item => ({
+        key: item.key,
+        title: item.title,
+        issueType: item.workType || item.issueType || 'Service work',
+        priority: item.priority,
+        status: item.status,
+        methodologyPhase: item.workType || 'service-delivery',
+      })),
+    };
+  }
+
   const project = state.results.softwareProjects[step.projectIndex];
+  return {
+    projectKind: 'software',
+    project,
+    label: `software project ${step.projectIndex + 1}`,
+    issueRecords: project?.issueRecords || [],
+  };
+}
+
+async function executeGitHubDevelopmentActivityStep(config, state, step) {
+  const target = getGitHubActivityProjectTarget(state, step);
+  const { project, projectKind, issueRecords: targetIssueRecords } = target;
   if (!project?.key) {
-    addChunkedDiagnostics(state, [`GitHub activity skipped for software project ${step.projectIndex + 1}: project was not created.`]);
+    addChunkedDiagnostics(state, [`GitHub activity skipped for ${target.label}: project was not created.`]);
     return;
   }
 
@@ -10097,12 +11665,12 @@ async function executeGitHubDevelopmentActivityStep(config, state, step) {
     return;
   }
 
-  const issueRecords = (project.issueRecords || [])
+  const issueRecords = (targetIssueRecords || [])
     .filter(issue => issue?.key)
     .slice(0, GITHUB_DEMO_ACTIVITY_PER_PROJECT);
 
   if (issueRecords.length === 0) {
-    addChunkedDiagnostics(state, [`GitHub activity ${project.key}: skipped because no software issues were created.`]);
+    addChunkedDiagnostics(state, [`GitHub activity ${project.key}: skipped because no ${projectKind === 'jsm' ? 'JSM work items' : 'software issues'} were created.`]);
     return;
   }
 
@@ -10126,11 +11694,11 @@ async function executeGitHubDevelopmentActivityStep(config, state, step) {
         '',
         `Client demo: ${config.environmentName}`,
         `Jira project: ${project.key}`,
-        `Software work type: ${issue.issueType || 'Software work'}`,
+        `${projectKind === 'jsm' ? 'Service work type' : 'Software work type'}: ${issue.issueType || (projectKind === 'jsm' ? 'Service work' : 'Software work')}`,
       ].join('\n');
 
       await ensureGitHubBranch(githubConfig, branchName, sha);
-      await upsertGitHubDemoFile(
+      const fileUpdate = await upsertGitHubDemoFile(
         githubConfig,
         branchName,
         filePath,
@@ -10139,24 +11707,72 @@ async function executeGitHubDevelopmentActivityStep(config, state, step) {
       );
       const pullRequest = await ensureGitHubPullRequest(githubConfig, defaultBranch, branchName, pullTitle, pullBody);
       const deployment = await createGitHubDeployment(githubConfig, branchName, environment, issue, pullRequest.url);
+      const commitSha = fileUpdate.commit?.sha || fileUpdate.content?.sha || sha;
+      const repositoryUrl = `https://github.com/${githubConfig.owner}/${githubConfig.repo}`;
 
       createdRecords.push({
         issueKey: issue.key,
         projectKey: project.key,
         branchName,
+        branchUrl: `${repositoryUrl}/tree/${encodeURIComponent(branchName)}`,
+        commitMessage,
+        commitSha,
+        commitUrl: `${repositoryUrl}/commit/${commitSha}`,
+        filePath,
+        fileUrl: fileUpdate.content?.html_url || `${repositoryUrl}/blob/${encodeURIComponent(branchName)}/${filePath}`,
         pullRequestNumber: pullRequest.number,
+        pullRequestTitle: pullTitle,
         pullRequestUrl: pullRequest.url,
         deploymentId: deployment.id,
+        deploymentUrl: deployment.url,
         deploymentEnvironment: deployment.environment,
         deploymentStatus: deployment.status,
         reusedPullRequest: pullRequest.reused,
       });
     }
 
+    try {
+      const devInfoResult = await submitJiraDevelopmentInformation(githubConfig, project, defaultBranch, createdRecords);
+      const acceptedDevInfo = devInfoResult?.acceptedDevinfoEntities
+        ? Object.values(devInfoResult.acceptedDevinfoEntities).flat().length
+        : 0;
+      const unknownIssueKeys = devInfoResult?.unknownIssueKeys || [];
+      createdRecords.forEach(record => {
+        record.jiraDevelopmentInfoSubmitted = true;
+      });
+      addChunkedDiagnostics(state, [
+        `Jira dev panel ${project.key}: submitted branch/commit/PR data for ${createdRecords.length} item(s)${acceptedDevInfo ? `; ${acceptedDevInfo} dev-info entity group(s) accepted` : ''}.`,
+        ...(unknownIssueKeys.length ? [`Jira dev panel ${project.key}: unknown issue key(s): ${unknownIssueKeys.join(', ')}.`] : []),
+      ]);
+    } catch (devInfoErr) {
+      createdRecords.forEach(record => {
+        record.jiraDevelopmentInfoSubmitted = false;
+      });
+      addChunkedDiagnostics(state, [`Jira dev panel ${project.key}: branch/commit/PR submission skipped or rejected: ${devInfoErr.message}`]);
+    }
+
+    try {
+      const deploymentResult = await submitJiraDeploymentInformation(githubConfig, project, createdRecords);
+      const acceptedDeployments = deploymentResult?.acceptedDeployments || [];
+      const rejectedDeployments = deploymentResult?.rejectedDeployments || [];
+      createdRecords.forEach(record => {
+        record.jiraDeploymentInfoSubmitted = true;
+      });
+      addChunkedDiagnostics(state, [
+        `Jira dev panel ${project.key}: submitted deployment data for ${createdRecords.length} item(s); ${acceptedDeployments.length} accepted.`,
+        ...(rejectedDeployments.length ? [`Jira dev panel ${project.key}: ${rejectedDeployments.length} deployment item(s) rejected.`] : []),
+      ]);
+    } catch (deploymentInfoErr) {
+      createdRecords.forEach(record => {
+        record.jiraDeploymentInfoSubmitted = false;
+      });
+      addChunkedDiagnostics(state, [`Jira dev panel ${project.key}: deployment submission skipped or rejected: ${deploymentInfoErr.message}`]);
+    }
+
     state.results.githubActivity.push(...createdRecords);
     addChunkedDiagnostics(state, [
       `GitHub activity ${project.key}: created ${createdRecords.length} branch/commit/PR/deployment demo item(s) in ${githubConfig.owner}/${githubConfig.repo}.`,
-      ...createdRecords.slice(0, 3).map(record => `GitHub activity: ${record.issueKey} -> PR #${record.pullRequestNumber}, deployment ${record.deploymentStatus}.`),
+      ...createdRecords.slice(0, 3).map(record => `GitHub activity: ${record.issueKey} -> commit ${String(record.commitSha || '').slice(0, 7)}, PR #${record.pullRequestNumber}, deployment ${record.deploymentStatus}.`),
     ]);
   } catch (err) {
     addChunkedError(state, `GitHub activity ${project.key}: ${err.message}`);
@@ -11130,7 +12746,8 @@ resolver.define('getBusinessDomainInventory', async ({ payload }) => {
 
   try {
     const requestedSpaceType = String(payload?.spaceType || '').trim();
-    const projects = await searchDomainProjects(domain, { spaceType: requestedSpaceType });
+    const diagnostics = [];
+    const projects = await searchDomainProjects(domain, { spaceType: requestedSpaceType, diagnostics });
     const serviceProjects = projects.filter(project => project.kind === 'business');
     const softwareProjects = projects.filter(project => project.kind === 'software');
     const businessProjects = projects.filter(project => project.kind === 'business-project');
@@ -11144,9 +12761,13 @@ resolver.define('getBusinessDomainInventory', async ({ payload }) => {
       softwareProjects,
       businessProjects,
       productDiscoveryProjects,
+      diagnostics,
       summary: projects.length
         ? `${projects.length} existing ${domain}${requestedSpaceType ? ' matching' : ''} project(s) found. Select one to add volume, delete, or add a new project below.`
-        : `No existing ${domain}${requestedSpaceType ? ' matching' : ''} project found for this selection yet.`,
+        : [
+            `No existing ${domain}${requestedSpaceType ? ' matching' : ''} project found for this selection yet.`,
+            ...diagnostics,
+          ].join(' '),
     };
   } catch (err) {
     return {
@@ -11230,7 +12851,20 @@ resolver.define('getProjectInsightsData', async ({ payload }) => {
     const diagnostics = [];
     const customDateFields = await resolveDemoDateFieldsWithoutScreenSetup(projectKey, diagnostics);
     const project = await jiraGet(`/rest/api/3/project/${encodeURIComponent(projectKey)}`);
-    const projectType = project?.projectTypeKey === 'service_desk' ? 'ITSM' : 'Software';
+    const domainMetadata = await getProjectDemoDomainMetadata(projectKey);
+    const metadata = domainMetadata?.value || {};
+    const metadataKind = metadata.kind || '';
+    const metadataBusinessSpaceType = normaliseBusinessSpaceType(metadata.businessSpaceType);
+    const projectType = project?.projectTypeKey === 'service_desk'
+      ? normaliseJsmServiceType(metadata.jsmServiceType || 'ITSM')
+      : metadataKind === 'business-project' || project?.projectTypeKey === 'business'
+        ? getBusinessSpaceCategoryLabel(metadataBusinessSpaceType)
+        : metadataKind === 'product-discovery' || project?.projectTypeKey === 'product_discovery' || project?.projectTypeKey === 'product-discovery'
+          ? 'Product Discovery'
+          : 'Software';
+    const projectTypeDisplay = ['ITSM', 'HRSM', 'CSM'].includes(projectType)
+      ? getJsmServiceTypeLabel(projectType)
+      : projectType;
     const baseJql = `project = ${projectKey}`;
     const allWorkJql = `${baseJql} ORDER BY updated DESC`;
     const config = {
@@ -11238,11 +12872,11 @@ resolver.define('getProjectInsightsData', async ({ payload }) => {
       title: 'Summary & Reports',
       subtitle: 'Project sidebar insights using generated custom Created Date and Resolved Date fields.',
       visualType: 'summary-grid',
-      sectionLabel: projectType === 'ITSM' ? 'Service Project Summary' : 'Software Project Summary',
+      sectionLabel: `${projectTypeDisplay} Summary`,
       environmentName: project?.name || projectKey,
       dashboardProfile: `${project?.name || projectKey} Summary`,
       dashboardLevel: 'project',
-      dashboardDomain: projectType,
+      dashboardDomain: projectTypeDisplay,
       dashboardMetrics: ['Work by status', 'Created vs resolved', 'Open work', 'Priority'],
       dashboardQuestions: ['Is work moving and completing over time?'],
       dashboardKpis: ['Resolution rate %', 'Average cycle time', 'High Priority', 'Throughput'],
@@ -11259,7 +12893,7 @@ resolver.define('getProjectInsightsData', async ({ payload }) => {
       projects: [{
         key: projectKey,
         name: project?.name || projectKey,
-        type: projectType,
+        type: projectTypeDisplay,
         count: 0,
         sprints: [],
         dateFields: customDateFields,
@@ -11312,8 +12946,13 @@ function validateGeneratedVolumeAccuracy(config, state) {
   const expectedItsmPerProject = config.incidentsPerProject;
 
   for (const project of createdJsmProjects) {
-    const actual = project.incidents?.length || 0;
-    const expected = project.configuredItsmWorkCount ?? expectedItsmPerProject;
+    const configured = project.configuredItsmWorkCount ?? expectedItsmPerProject;
+    const expected = project.addVolumeToExistingDomainData
+      ? (project.existingIssueCount || 0) + configured
+      : configured;
+    const actual = project.addVolumeToExistingDomainData
+      ? (project.existingIssueCount || 0) + (project.incidents?.length || 0)
+      : (project.incidents?.length || 0);
 
     if (actual !== expected) {
       addUniqueChunkedError(
@@ -11328,13 +12967,54 @@ function validateGeneratedVolumeAccuracy(config, state) {
       continue;
     }
 
-    const expected = project.configuredIssueCount || getSoftwareProjectConfig(config, projectIndex).issuesPerProject;
+    const configured = project.configuredIssueCount || getSoftwareProjectConfig(config, projectIndex).issuesPerProject;
+    const expected = project.addVolumeToExistingDomainData
+      ? (project.existingIssueCount || 0) + configured
+      : configured;
     const actual = project.issueCount || 0;
 
     if (actual !== expected) {
       addUniqueChunkedError(
         state,
         `Volume mismatch ${project.key}: expected ${expected} software issue(s) from the selected Issues value, but created ${actual}. Epics are excluded from this selected issue count and from software dashboard filters.`
+      );
+    }
+  }
+
+  for (const [projectIndex, project] of (state.results.businessProjects || []).entries()) {
+    if (!project?.key || project.failed) {
+      continue;
+    }
+
+    const configured = project.configuredIssueCount || getBusinessProjectConfig(config, projectIndex).issuesPerProject;
+    const expected = project.addVolumeToExistingDomainData
+      ? (project.existingIssueCount || 0) + configured
+      : configured;
+    const actual = project.issueCount || project.issueRecords?.length || 0;
+
+    if (actual !== expected) {
+      addUniqueChunkedError(
+        state,
+        `Volume mismatch ${project.key}: expected ${expected} ${getBusinessSpaceCategoryLabel(project.businessSpaceType)} item(s) for ${getBusinessSpaceTypeLabel(project.businessSpaceType)}, but created ${actual}.`
+      );
+    }
+  }
+
+  for (const [projectIndex, project] of (state.results.productDiscoveryProjects || []).entries()) {
+    if (!project?.key || project.failed) {
+      continue;
+    }
+
+    const configured = project.configuredIssueCount || getProductDiscoveryProjectConfig(config, projectIndex).issuesPerProject;
+    const expected = project.addVolumeToExistingDomainData
+      ? (project.existingIssueCount || 0) + configured
+      : configured;
+    const actual = project.issueCount || project.issueRecords?.length || 0;
+
+    if (actual !== expected) {
+      addUniqueChunkedError(
+        state,
+        `Volume mismatch ${project.key}: expected ${expected} Product Discovery idea(s), but created ${actual}.`
       );
     }
   }
@@ -11372,12 +13052,14 @@ function buildChunkedSummary(config, state) {
     || createdBusinessProjects.length > 0
     || createdProductDiscoveryProjects.length > 0;
   const softwareTemplates = Array.from(new Set((config.softwareProjects || []).map(project => normaliseSoftwareTemplate(project.softwareTemplate))));
-  const softwareStyles = Array.from(new Set((config.softwareProjects || []).map(project => getProjectManagementStyleLabel(project.softwareProjectStyle))));
+  const softwareStyles = Array.from(new Set((config.softwareProjects || [])
+    .filter(project => normaliseSoftwareTemplate(project.softwareTemplate) !== 'bug-tracking')
+    .map(project => getProjectManagementStyleLabel(project.softwareProjectStyle))));
   const softwareTemplateSummary = softwareTemplates.length === 0
-    ? normaliseSoftwareTemplate(config.softwareTemplate)
-    : softwareTemplates.map(template => template === 'kanban' ? 'Kanban' : 'Scrum').join(', ');
+    ? getSoftwareTemplateLabel(config.softwareTemplate)
+    : softwareTemplates.map(getSoftwareTemplateLabel).join(', ');
   const softwareStyleSummary = softwareStyles.length === 0
-    ? getProjectManagementStyleLabel(config.softwareProjectStyle)
+    ? (softwareTemplates.includes('bug-tracking') ? 'Not applicable for Bug Tracking' : getProjectManagementStyleLabel(config.softwareProjectStyle))
     : softwareStyles.join(', ');
   const softwareProjectCountWithSprints = (config.softwareProjects || [])
     .filter(project => normaliseSoftwareTemplate(project.softwareTemplate) === 'scrum')
@@ -11385,6 +13067,9 @@ function buildChunkedSummary(config, state) {
   const softwareVersions = results.softwareProjects.flatMap(project => project.versions || []);
   const softwareSprints = results.softwareProjects.flatMap(project => project.sprints || []);
   const softwareComponents = results.softwareProjects.flatMap(project => project.components || []);
+  const workManagementComponents = createdBusinessProjects.flatMap(project => project.components || []);
+  const productDiscoveryComponents = createdProductDiscoveryProjects.flatMap(project => project.components || []);
+  const jiraProjectComponents = [...softwareComponents, ...workManagementComponents, ...productDiscoveryComponents];
   const releaseStageCounts = softwareVersions.reduce((counts, version) => {
     const stage = version.releaseStage || (version.released ? 'past' : 'upcoming');
     counts[stage] = (counts[stage] || 0) + 1;
@@ -11402,11 +13087,14 @@ function buildChunkedSummary(config, state) {
   const jiraRoadmaps = results.jiraRoadmaps?.filter(Boolean) || [];
   const confluenceSpaces = results.confluenceSpaces?.filter(space => space?.success) || [];
   const githubActivity = results.githubActivity?.filter(Boolean) || [];
+  const jiraDevInfoSubmitted = githubActivity.filter(record => record.jiraDevelopmentInfoSubmitted);
+  const jiraDeploymentInfoSubmitted = githubActivity.filter(record => record.jiraDeploymentInfoSubmitted);
   const compassComponents = results.compassComponents?.filter(Boolean) || [];
   const linkedCompassComponents = compassComponents.filter(component => component.linkedIssueKey);
   const repositoryLinkedCompassComponents = compassComponents.filter(component => component.repositoryLinked);
   const dependencyLinkedCompassComponents = compassComponents.filter(component => component.dependencyLinked);
   const ownedCompassComponents = compassComponents.filter(component => component.ownerConfigured);
+  const visibleJiraCompassComponents = compassComponents.filter(component => component.visibleInJiraComponents);
   const atlassianGoals = results.atlassianGoals?.filter(Boolean) || [];
   const linkedAtlassianGoals = atlassianGoals.filter(goal => goal.nativeLinked);
   const projectGoals = results.projectGoals?.filter(Boolean) || [];
@@ -11431,9 +13119,9 @@ function buildChunkedSummary(config, state) {
     'Summary:',
     `- Industry: ${config.industry}`,
     `- Ticket Data Duration: ${config.dateRange}`,
-    `- JSM ITSM Projects: ${createdJsmProjects.length} (${results.totalIncidents} ITSM work items total)`,
-    `- ITSM Work Mix per JSM Project: ${formatItsmWorkMix(config.itsmWorkCounts)}`,
-    `- Business / Work Management Spaces: ${createdBusinessProjects.length} (${createdBusinessProjects.reduce((total, project) => total + (project.issueRecords?.length || 0), 0)} work items created this run)`,
+    `- Jira Service Management Projects: ${createdJsmProjects.length} (${results.totalIncidents} service work items total; selected types: ${config.jsmServiceTypes.map(getJsmServiceTypeLabel).join(', ') || 'None'})`,
+    `- Service Work Mix per JSM Project: ${formatItsmWorkMix(config.itsmWorkCounts)}`,
+    `- Business / Category Spaces: ${createdBusinessProjects.length} (${createdBusinessProjects.reduce((total, project) => total + (project.issueRecords?.length || 0), 0)} work items created this run)`,
     `- Jira Product Discovery Spaces: ${createdProductDiscoveryProjects.length} (${createdProductDiscoveryProjects.reduce((total, project) => total + (project.issueRecords?.length || 0), 0)} ideas created this run)`,
     `- Software Projects: ${results.softwareProjects.length} (${results.totalIssues} issues total)`,
     `- Software Templates: ${softwareTemplateSummary}`,
@@ -11441,8 +13129,10 @@ function buildChunkedSummary(config, state) {
     `- Sprints per Scrum Software Project: ${softwareProjectCountWithSprints > 0 ? config.sprintsPerProject : 0}`,
     `- Software Release Coverage: ${softwareVersions.length} version(s) modelled (${releaseStageCounts.past || 0} past, ${releaseStageCounts.current || 0} current, ${releaseStageCounts.upcoming || 0} upcoming); fix versions and affected versions are populated where Jira allows them.`,
     `- Software Components: ${softwareComponents.length} project component(s) created and assigned to generated software issues.`,
+    `- Work Management Components: ${workManagementComponents.length} project component(s) created and assigned where Jira allows.`,
+    `- Product Discovery Components: ${productDiscoveryComponents.length} project component(s) created and assigned where Jira allows.`,
     `- Sprint Coverage: ${softwareSprints.length} sprint(s) modelled (${sprintStateCounts.closed || 0} completed, ${sprintStateCounts.active || 0} active, ${sprintStateCounts.future || 0} upcoming).`,
-    '- Delivery Method Coverage: Scrum/Kanban execution plus waterfall phase labels for requirements, design, build, test, and release traceability.',
+    '- Delivery Method Coverage: Scrum, Kanban, and Bug Tracking execution plus waterfall phase labels for requirements, design, build, test, and release traceability.',
     `- Ticket Lifecycle: archive generated tickets after 6 months, then delete them after 1 year in archived state`,
     `- Issue Creation Mode: ${isCsvIssueCreationMode() ? 'CSV-first historical import' : isRestDatePatchMode() ? 'Forge REST creation + CSV date patch' : 'Forge REST issue creation'}`,
     ...(isCsvIssueCreationMode()
@@ -11463,9 +13153,9 @@ function buildChunkedSummary(config, state) {
     `- Report Filters: ${reports.length > 0 ? `${reports.length} auto-created` : 'Not created'}`,
     `- Jira Plans: ${jiraPlans.length > 0 ? `${jiraPlans.filter(plan => plan.success).length} native plan(s) created, ${jiraRoadmaps.length} roadmap seed(s) prepared` : 'Not created'}`,
     `- Knowledge Bases: ${confluenceSpaces.length > 0 ? `${confluenceSpaces.length} Confluence space(s) created` : 'Not created'}`,
-    `- GitHub Development Activity: ${githubActivity.length > 0 ? `${githubActivity.length} linked branch/commit/PR/deployment item(s) created` : 'Not created or not configured'}`,
-    `- Jira Project Components: ${softwareComponents.length > 0 ? `${softwareComponents.length} created and assigned to generated software issues` : 'Not created'}`,
-    `- Compass Components: ${compassComponents.length > 0 ? `${compassComponents.length} created, ${linkedCompassComponents.length} linked to work items, ${repositoryLinkedCompassComponents.length} repository link(s), ${dependencyLinkedCompassComponents.length} dependency link(s), ${ownedCompassComponents.length} owner assignment(s)` : 'Not created or not configured'}`,
+    `- GitHub Development Activity: ${githubActivity.length > 0 ? `${githubActivity.length} branch/commit/PR/deployment item(s) created; ${jiraDevInfoSubmitted.length} submitted to Jira dev panel; ${jiraDeploymentInfoSubmitted.length} deployment item(s) submitted to Jira` : config.softwareProjectCount === 0 ? 'Not created: add a Software Project to generate Jira development panel commits, PRs, and deployments' : 'Not created or not configured'}`,
+    `- Jira Project Components: ${jiraProjectComponents.length > 0 ? `${jiraProjectComponents.length} created and assigned where Jira allows` : 'Not created'}`,
+    `- Compass Components: ${compassComponents.length > 0 ? `${compassComponents.length} created, ${visibleJiraCompassComponents.length} visible in Jira Components, ${linkedCompassComponents.length} linked to work items, ${repositoryLinkedCompassComponents.length} repository link(s), ${dependencyLinkedCompassComponents.length} dependency link(s), ${ownedCompassComponents.length} owner assignment(s)` : 'Not created or not configured'}`,
     `- Goal Work Items: ${projectGoals.length > 0 ? `${projectGoals.length} Jira work item(s) created with goal labels` : 'Not created'}`,
     `- Native Atlassian Goals: ${atlassianGoals.length > 0 ? `${atlassianGoals.length} created, ${linkedAtlassianGoals.length} linked through Jira Goals field, ${atlassianGoals.filter(goal => goal.statusUpdated).length} status update(s) applied with varied target progress` : 'Not created or not configured'}`,
     `- Dashboard Filter Wiring: ${dashboards.length > 0 && dashboards.every(dashboard => dashboard.filterApplied) ? 'Applied automatically' : 'Needs verification'}`,
@@ -11482,8 +13172,8 @@ function buildChunkedSummary(config, state) {
   }
 
   if (createdJsmProjects.length > 0) {
-    lines.push('JSM ITSM Projects Created:');
-    lines.push(...createdJsmProjects.map(project => `- ${project.key}: ${project.name} (${isCsvIssueCreationMode() ? 'CSV import pending' : `${project.incidents.length} ITSM work items`})`));
+    lines.push('Jira Service Management Projects Created:');
+    lines.push(...createdJsmProjects.map(project => `- ${project.key}: ${project.name} (${getJsmServiceTypeLabel(project.jsmServiceType || 'ITSM')}; ${isCsvIssueCreationMode() ? 'CSV import pending' : `${project.incidents.length} service work items`})`));
     const projectsWithForms = createdJsmProjects.filter(project => project.smartForm?.name);
     if (projectsWithForms.length > 0) {
       lines.push('');
@@ -11493,7 +13183,7 @@ function buildChunkedSummary(config, state) {
     const projectsWithItsmConfig = createdJsmProjects.filter(project => (project.requestTypes?.length || project.queues?.length || project.knowledgeBase?.success));
     if (projectsWithItsmConfig.length > 0) {
       lines.push('');
-      lines.push('ITSM Setup:');
+      lines.push('JSM Setup:');
       lines.push(...projectsWithItsmConfig.map(project => {
         const requestTypes = (project.requestTypes || []).map(requestType => requestType.name).slice(0, 6).join(', ') || 'template defaults';
         const queues = (project.queues || []).map(queue => queue.name).slice(0, 6).join(', ') || 'template defaults';
@@ -11505,8 +13195,8 @@ function buildChunkedSummary(config, state) {
   }
 
   if (createdBusinessProjects.length > 0) {
-    lines.push('Business / Work Management Spaces Created:');
-    lines.push(...createdBusinessProjects.map(project => `- ${project.key}: ${project.name} (${getBusinessSpaceTypeLabel(project.businessSpaceType)}; ${project.issueRecords?.length || 0} new work items${project.reusedExistingDomainData ? `; reused existing project with ${project.existingIssueCount || 0} existing items` : ''})`));
+    lines.push('Business / Category Spaces Created:');
+    lines.push(...createdBusinessProjects.map(project => `- ${project.key}: ${project.name} (${getBusinessSpaceCategoryLabel(project.businessSpaceType)} - ${getBusinessSpaceTypeLabel(project.businessSpaceType)}; ${project.issueRecords?.length || 0} new work items${project.reusedExistingDomainData ? `; reused existing project with ${project.existingIssueCount || 0} existing items` : ''})`));
     lines.push('');
   }
 
@@ -11534,10 +13224,15 @@ function buildChunkedSummary(config, state) {
       const releaseSummary = `${versions.length} versions: ${projectReleaseCounts.past || 0} past, ${projectReleaseCounts.current || 0} current, ${projectReleaseCounts.upcoming || 0} upcoming`;
       const componentSummary = `${(project.components || []).length} components`;
       const sprintSummary = `; sprints ${projectSprintCounts.closed || 0} done, ${projectSprintCounts.active || 0} active, ${projectSprintCounts.future || 0} upcoming`;
-      const kanbanSummary = normaliseSoftwareTemplate(project.softwareTemplate) === 'kanban' ? '; Kanban flow/WIP labels applied' : '';
+      const projectTemplate = normaliseSoftwareTemplate(project.softwareTemplate);
+      const kanbanSummary = projectTemplate === 'kanban'
+        ? '; Kanban flow/WIP labels applied'
+        : projectTemplate === 'bug-tracking'
+          ? '; Bug tracking triage/review flow applied'
+          : '';
       const goalSummary = `; ${(project.projectGoals || []).length} goal work items; ${(project.atlassianGoals || []).length} native goals; ${(project.atlassianGoals || []).filter(goal => goal.nativeLinked).length} native goal links`;
       const compassLinkSummary = `; ${(project.compassComponents || []).filter(component => component.linkedIssueKey).length} Compass links`;
-      return `- ${project.key}: ${project.name} (${isCsvIssueCreationMode() ? 'CSV import pending' : `${project.issueCount} issues`}, ${getProjectManagementStyleLabel(project.softwareProjectStyle)}, board ${project.boardId || 'pending'}; ${releaseSummary}; ${componentSummary}${sprintSummary}${kanbanSummary}${goalSummary}${compassLinkSummary})`;
+      return `- ${project.key}: ${project.name} (${isCsvIssueCreationMode() ? 'CSV import pending' : `${project.issueCount} issues`}, ${getSoftwareProjectMethodLabel(project)}, board ${project.boardId || 'pending'}; ${releaseSummary}; ${componentSummary}${sprintSummary}${kanbanSummary}${goalSummary}${compassLinkSummary})`;
     }));
     const softwareProjectsWithForms = results.softwareProjects.filter(project => project.smartForm?.name);
     if (softwareProjectsWithForms.length > 0) {
@@ -11548,9 +13243,21 @@ function buildChunkedSummary(config, state) {
     lines.push('');
   }
 
-  if (softwareComponents.length > 0) {
+  if (jiraProjectComponents.length > 0) {
     lines.push('Jira Project Components Created:');
     for (const project of results.softwareProjects) {
+      const componentNames = (project.components || []).map(component => component.name).filter(Boolean);
+      if (componentNames.length > 0) {
+        lines.push(`- ${project.key}: ${componentNames.join(', ')}`);
+      }
+    }
+    for (const project of createdBusinessProjects) {
+      const componentNames = (project.components || []).map(component => component.name).filter(Boolean);
+      if (componentNames.length > 0) {
+        lines.push(`- ${project.key}: ${componentNames.join(', ')}`);
+      }
+    }
+    for (const project of createdProductDiscoveryProjects) {
       const componentNames = (project.components || []).map(component => component.name).filter(Boolean);
       if (componentNames.length > 0) {
         lines.push(`- ${project.key}: ${componentNames.join(', ')}`);
@@ -11591,7 +13298,7 @@ function buildChunkedSummary(config, state) {
   if (githubActivity.length > 0) {
     lines.push('GitHub Development Activity Created:');
     lines.push(...githubActivity.slice(0, 20).map(record => (
-      `- ${record.issueKey}: branch ${record.branchName}, PR #${record.pullRequestNumber}, deployment ${record.deploymentStatus} (${record.deploymentEnvironment})`
+      `- ${record.issueKey}: branch ${record.branchName}, commit ${String(record.commitSha || '').slice(0, 7)}, PR #${record.pullRequestNumber}, deployment ${record.deploymentStatus} (${record.deploymentEnvironment}); Jira dev panel ${record.jiraDevelopmentInfoSubmitted ? 'submitted' : 'not submitted'}, deployment ${record.jiraDeploymentInfoSubmitted ? 'submitted' : 'not submitted'}`
     )));
     if (githubActivity.length > 20) {
       lines.push(`- ...and ${githubActivity.length - 20} more GitHub activity item(s).`);
@@ -11624,7 +13331,7 @@ function buildChunkedSummary(config, state) {
   if (compassComponents.length > 0) {
     lines.push('Compass Components Created:');
     lines.push(...compassComponents.slice(0, 20).map(component => (
-      `- ${component.projectKey}: ${component.name} (${component.typeId})${component.linkedIssueKey ? ` linked to ${component.linkedIssueKey}` : ' not linked to work items'}${component.repositoryLinked ? '; repository linked' : ''}${component.dependencyLinked ? '; dependency linked' : ''}${component.ownerConfigured ? '; owner assigned' : ''}`
+      `- ${component.projectKey}: ${component.name} (${component.typeId})${component.visibleInJiraComponents ? ` visible as Jira component ${component.jiraComponentName || component.name}` : ' not visible in Jira Components'}${component.linkedIssueKey ? `; linked to ${component.linkedIssueKey}` : '; not linked to work items'}${component.repositoryLinked ? '; repository linked' : ''}${component.dependencyLinked ? '; dependency linked' : ''}${component.ownerConfigured ? '; owner assigned' : ''}`
     )));
     if (compassComponents.length > 20) {
       lines.push(`- ...and ${compassComponents.length - 20} more Compass component(s).`);
@@ -11727,6 +13434,20 @@ resolver.define('prepareDemoEnvironment', async ({ payload }) => {
     };
   }
 
+  const readinessDiagnostics = [];
+  const productDiscoveryReadiness = await validateProductDiscoveryReadiness(config, readinessDiagnostics);
+  if (!productDiscoveryReadiness.ok) {
+    return {
+      success: false,
+      summary: [
+        productDiscoveryReadiness.message,
+        '',
+        'No demo resources were created.',
+        ...(readinessDiagnostics.length ? ['', 'Diagnostics:', ...readinessDiagnostics.map(line => `- ${line}`)] : []),
+      ].join('\n'),
+    };
+  }
+
   return {
     success: true,
     config,
@@ -11786,8 +13507,13 @@ resolver.define('executeDemoEnvironmentStep', async ({ payload }) => {
     case 'create-work-management-project-shell':
       await executeWorkManagementProjectStep(config, state, step);
       break;
-    case 'configure-work-management-date-fields':
-      await executeGenericProjectDateFieldStep(state, step, 'businessProjects', 'Work Management space');
+    case 'configure-work-management-date-fields': {
+      const businessProjectConfig = getBusinessProjectConfig(config, step.projectIndex);
+      await executeGenericProjectDateFieldStep(state, step, 'businessProjects', `${getBusinessSpaceCategoryLabel(businessProjectConfig.businessSpaceType)} space`);
+      break;
+    }
+    case 'create-work-management-components':
+      await executeWorkManagementComponentsStep(config, state, step);
       break;
     case 'create-work-management-issues-batch':
       await executeWorkManagementIssueBatchStep(config, state, step);
@@ -11797,6 +13523,9 @@ resolver.define('executeDemoEnvironmentStep', async ({ payload }) => {
       break;
     case 'configure-product-discovery-date-fields':
       await executeGenericProjectDateFieldStep(state, step, 'productDiscoveryProjects', 'Product Discovery space');
+      break;
+    case 'create-product-discovery-components':
+      await executeProductDiscoveryComponentsStep(config, state, step);
       break;
     case 'create-product-discovery-ideas-batch':
       await executeProductDiscoveryIdeaBatchStep(config, state, step);
@@ -11836,6 +13565,9 @@ resolver.define('executeDemoEnvironmentStep', async ({ payload }) => {
       break;
     case 'populate-kanban-board':
       await executeKanbanBoardPopulationStep(config, state, step);
+      break;
+    case 'verify-bug-tracking-work':
+      await executeBugTrackingVerificationStep(config, state, step);
       break;
     case 'create-dependencies':
       await executeDependencyStep(state, step);
