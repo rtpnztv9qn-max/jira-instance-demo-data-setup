@@ -16,6 +16,7 @@ const spaceTypeOptions = [
   { value: 'jpd:product-discovery', label: 'Jira Product Discovery', group: 'Product Management' },
   { value: 'business:task-tracking', label: 'Task Tracking', group: 'Work Management' },
   { value: 'business:budget-planning', label: 'Budget Planning', group: 'Work Management' },
+  { value: 'business:procurement-management', label: 'Procurement Management', group: 'Work Management' },
   { value: 'jsm:ITSM', label: 'IT Service Management', group: 'Jira Service Management' },
   { value: 'jsm:HRSM', label: 'HR Service Management', group: 'Jira Service Management' },
   { value: 'jsm:CSM', label: 'Customer Service Management', group: 'Jira Service Management' },
@@ -2944,6 +2945,7 @@ function App() {
       'create-software-sprint',
       'populate-kanban-board',
       'create-dependencies',
+      'create-github-development-activity',
     ].includes(step.type);
     const maxAttempts = isProjectCreationStep ? 3 : isTransientStep ? 3 : 1;
     let lastError = null;

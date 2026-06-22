@@ -35,7 +35,7 @@ const WORKER_DATE_PATCH_ENDPOINT = process.env.WORKER_DATE_PATCH_ENDPOINT
 const ISSUE_CREATION_MODE = process.env.ISSUE_CREATION_MODE || 'rest';
 const WORKER_FETCH_TIMEOUT_MS = 10000;
 const GITHUB_DEMO_ACTIVITY_ENABLED = String(process.env.GITHUB_DEMO_ACTIVITY_ENABLED || 'true').toLowerCase() !== 'false';
-const GITHUB_DEMO_ACTIVITY_PER_PROJECT = Math.max(1, Math.min(Number(process.env.GITHUB_DEMO_ACTIVITY_PER_PROJECT) || 1, 1));
+const GITHUB_DEMO_ACTIVITY_PER_PROJECT = Math.max(1, Math.min(Number(process.env.GITHUB_DEMO_ACTIVITY_PER_PROJECT) || 5, 50));
 const GITHUB_FETCH_TIMEOUT_MS = 6000;
 const COMPASS_DEMO_COMPONENTS_ENABLED = String(process.env.COMPASS_DEMO_COMPONENTS_ENABLED || 'true').toLowerCase() !== 'false';
 const GOALS_DEMO_ENABLED = String(process.env.GOALS_DEMO_ENABLED || 'true').toLowerCase() !== 'false';
@@ -1682,14 +1682,28 @@ function buildGitHubDemoFilePath(config, project, issue) {
   ].join('/');
 }
 
-function buildGitHubDemoFileContent(config, project, issue) {
+function getGitHubActivityWorkLabel(projectKind) {
+  if (projectKind === 'jsm') return 'Service work type';
+  if (projectKind === 'business') return 'Business work type';
+  if (projectKind === 'product-discovery') return 'Discovery idea type';
+  return 'Software work type';
+}
+
+function getGitHubActivityProjectLabel(projectKind) {
+  if (projectKind === 'jsm') return 'Jira service project';
+  if (projectKind === 'business') return 'Jira business space';
+  if (projectKind === 'product-discovery') return 'Jira Product Discovery space';
+  return 'Jira software project';
+}
+
+function buildGitHubDemoFileContent(config, project, issue, projectKind = 'software') {
   return [
     `# ${issue.key} GitHub Delivery Activity`,
     '',
     `Client demo: ${config.environmentName}`,
-    `Jira software project: ${project.key} - ${project.name}`,
+    `${getGitHubActivityProjectLabel(projectKind)}: ${project.key} - ${project.name}`,
     `Work item: ${issue.key} - ${issue.title || 'Generated demo work'}`,
-    `Work type: ${issue.issueType || 'Software work'}`,
+    `Work type: ${issue.issueType || getGitHubActivityWorkLabel(projectKind)}`,
     `Priority: ${issue.priority || 'Medium'}`,
     `Status: ${issue.status || 'To Do'}`,
     `Delivery phase: ${issue.methodologyPhase || 'build'}`,
@@ -1879,6 +1893,14 @@ function getGitHubRepositoryId(config) {
   return `${config.owner}/${config.repo}`;
 }
 
+function toJiraDevInfoId(value, fallback = 'cprime-demo') {
+  const safe = String(value || '')
+    .replace(/[^A-Za-z0-9\-._~]+/g, '-')
+    .replace(/^-+|-+$/g, '')
+    .slice(0, 255);
+  return safe || fallback;
+}
+
 function getGitHubAuthor() {
   return {
     name: 'Cprime Demo Agent',
@@ -1889,7 +1911,8 @@ function getGitHubAuthor() {
 }
 
 function buildJiraDevInfoRepository(config, project, defaultBranch, records) {
-  const repositoryId = getGitHubRepositoryId(config);
+  const repositoryName = getGitHubRepositoryId(config);
+  const repositoryId = toJiraDevInfoId(repositoryName, 'cprime-demo-repository');
   const repositoryUrl = `https://github.com/${config.owner}/${config.repo}`;
   const author = getGitHubAuthor();
   const now = new Date().toISOString();
@@ -1897,7 +1920,7 @@ function buildJiraDevInfoRepository(config, project, defaultBranch, records) {
 
   return {
     id: repositoryId,
-    name: repositoryId,
+    name: repositoryName,
     url: repositoryUrl,
     description: `GitHub delivery activity generated for ${project.key}.`,
     updateSequenceId,
@@ -1905,7 +1928,6 @@ function buildJiraDevInfoRepository(config, project, defaultBranch, records) {
       const sequence = updateSequenceId + index + 1;
       return {
         id: record.commitSha,
-        issueKeys: [record.issueKey],
         associations: [{ associationType: 'issueIdOrKeys', values: [record.issueKey] }],
         updateSequenceId: sequence,
         hash: record.commitSha,
@@ -1927,14 +1949,12 @@ function buildJiraDevInfoRepository(config, project, defaultBranch, records) {
     branches: records.map((record, index) => {
       const sequence = updateSequenceId + records.length + index + 1;
       return {
-        id: `${repositoryId}:${record.branchName}`,
-        issueKeys: [record.issueKey],
+        id: toJiraDevInfoId(`${repositoryId}-${record.branchName}`, `${repositoryId}-branch-${index + 1}`),
         associations: [{ associationType: 'issueIdOrKeys', values: [record.issueKey] }],
         updateSequenceId: sequence,
         name: record.branchName,
         lastCommit: {
           id: record.commitSha,
-          issueKeys: [record.issueKey],
           updateSequenceId: sequence,
           hash: record.commitSha,
           message: record.commitMessage,
@@ -1951,8 +1971,7 @@ function buildJiraDevInfoRepository(config, project, defaultBranch, records) {
     pullRequests: records.map((record, index) => {
       const sequence = updateSequenceId + (records.length * 2) + index + 1;
       return {
-        id: `${repositoryId}:pull:${record.pullRequestNumber}`,
-        issueKeys: [record.issueKey],
+        id: toJiraDevInfoId(`${repositoryId}-pull-${record.pullRequestNumber}`, `${repositoryId}-pull-${index + 1}`),
         associations: [{ associationType: 'issueIdOrKeys', values: [record.issueKey] }],
         updateSequenceId: sequence,
         status: 'OPEN',
@@ -1977,14 +1996,14 @@ async function submitJiraDevelopmentInformation(config, project, defaultBranch, 
     return null;
   }
 
-  return jiraPost('/rest/devinfo/0.10/bulk', {
+  return jiraAppPost('/rest/devinfo/0.10/bulk', {
     repositories: [buildJiraDevInfoRepository(config, project, defaultBranch, records)],
     preventTransitions: true,
     operationType: 'NORMAL',
     properties: {
       source: 'cprime-demo-agent',
       projectKey: project.key,
-      repository: getGitHubRepositoryId(config),
+      repository: toJiraDevInfoId(getGitHubRepositoryId(config), 'cprime-demo-repository'),
     },
     providerMetadata: {
       product: 'Cprime Demo GitHub Activity',
@@ -2007,18 +2026,18 @@ async function submitJiraDeploymentInformation(config, project, records) {
   }
 
   const repositoryUrl = `https://github.com/${config.owner}/${config.repo}`;
+  const repositoryId = toJiraDevInfoId(getGitHubRepositoryId(config), 'cprime-demo-repository');
   const updateSequenceNumber = Date.now();
-  return jiraPost('/rest/deployments/0.1/bulk', {
+  return jiraAppPost('/rest/deployments/0.1/bulk', {
     properties: {
       source: 'cprime-demo-agent',
       projectKey: project.key,
-      repository: getGitHubRepositoryId(config),
+      repository: repositoryId,
     },
     deployments: records.map((record, index) => ({
       deploymentSequenceNumber: Number(record.deploymentId || updateSequenceNumber + index),
       updateSequenceNumber: updateSequenceNumber + index,
       issueKeys: [record.issueKey],
-      associations: [{ associationType: 'issueIdOrKeys', values: [record.issueKey] }],
       displayName: `${record.issueKey} demo deployment`,
       url: record.deploymentUrl || record.pullRequestUrl || repositoryUrl,
       description: `Demo deployment generated from GitHub activity for ${record.issueKey}.`,
@@ -2027,12 +2046,12 @@ async function submitJiraDeploymentInformation(config, project, records) {
       duration: 60,
       state: mapGitHubDeploymentStateToJira(record.deploymentStatus),
       pipeline: {
-        id: `${project.key}-github-demo-pipeline`,
+        id: toJiraDevInfoId(`${project.key}-github-demo-pipeline`, `${project.key}-pipeline`),
         displayName: `${project.key} GitHub demo pipeline`,
         url: repositoryUrl,
       },
       environment: {
-        id: record.deploymentEnvironment,
+        id: toJiraDevInfoId(record.deploymentEnvironment, `${project.key}-development`),
         displayName: record.deploymentEnvironment,
         type: 'development',
       },
@@ -3868,19 +3887,20 @@ async function validateProductDiscoveryReadiness(config, diagnostics = []) {
     return { ok: true };
   }
 
-  const projectsToCreate = [];
   for (let index = 0; index < config.productDiscoveryProjectCount; index += 1) {
     const projectConfig = getProductDiscoveryProjectConfig(config, index);
     if (!projectConfig.projectKey) {
-      projectsToCreate.push(projectConfig);
-      continue;
+      return {
+        ok: false,
+        message: 'Jira Product Discovery spaces must be created manually from Jira first. Select the existing native Product Discovery space with the Volume checkbox, then run the agent to add demo ideas into that space.',
+      };
     }
 
     const existingProject = await getProjectByKeyIfExists(projectConfig.projectKey);
     if (!existingProject) {
       return {
         ok: false,
-        message: `Configured Product Discovery project key ${projectConfig.projectKey} was not found. Select an existing native Jira Product Discovery space or remove the key so the app can create one.`,
+        message: `Configured Product Discovery project key ${projectConfig.projectKey} was not found. Create the Product Discovery space manually in Jira first, then select it with the Volume checkbox.`,
       };
     }
 
@@ -3891,16 +3911,6 @@ async function validateProductDiscoveryReadiness(config, diagnostics = []) {
       };
     }
 
-  }
-
-  if (projectsToCreate.length > 0) {
-    const templateKeys = await getLiveProductDiscoveryTemplateKeys(diagnostics);
-    if (templateKeys.length === 0) {
-      return {
-        ok: false,
-        message: 'Jira Product Discovery is selected, but this Jira site does not expose a native Product Discovery project template through Jira REST. The app will not create a type-only Product Discovery shell because Jira Polaris pages can fail with "Something went wrong" when the space is not fully initialized. Create the Product Discovery space from Jira UI first and select it for volume, or enable a Jira Product Discovery template that is exposed to REST.',
-      };
-    }
   }
 
   return { ok: true };
@@ -6513,8 +6523,10 @@ async function transitionIssue(issueKey, targetStatus) {
   }
 }
 
-async function getBoardId(projectKey, boardType = 'scrum') {
+async function getBoardId(projectKey, boardType = 'scrum', options = {}) {
   const safeBoardType = normaliseSoftwareTemplate(boardType) === 'kanban' ? 'kanban' : 'scrum';
+  const maxAttempts = Math.max(1, Number.parseInt(options.maxAttempts, 10) || 8);
+  const retryDelayMs = Math.max(0, Number.parseInt(options.retryDelayMs, 10) || 2000);
   let fallbackBoardId = null;
   const lookupPaths = [
     `/rest/agile/1.0/board?projectKeyOrId=${encodeURIComponent(projectKey)}&type=${safeBoardType}`,
@@ -6523,7 +6535,7 @@ async function getBoardId(projectKey, boardType = 'scrum') {
 
   // Newly-created software projects do not always surface their Scrum board instantly.
   // A short retry loop makes the sprint step far more reliable without needing a manual rerun.
-  for (let attempt = 0; attempt < 8; attempt++) {
+  for (let attempt = 0; attempt < maxAttempts; attempt++) {
     for (const boardPath of lookupPaths) {
       const data = await jiraGet(boardPath);
       const boards = Array.isArray(data.values) ? data.values : [];
@@ -6545,7 +6557,9 @@ async function getBoardId(projectKey, boardType = 'scrum') {
       }
     }
 
-    await wait(2000);
+    if (attempt < maxAttempts - 1 && retryDelayMs > 0) {
+      await wait(retryDelayMs);
+    }
   }
 
   return fallbackBoardId;
@@ -6724,7 +6738,8 @@ function sprintFieldValueContainsSprint(value, sprintId) {
 
 async function getIssueSprintMembershipCount(sprintId, issueKeys, diagnostics = []) {
   const sprintFieldId = await getSprintFieldId(diagnostics);
-  const keys = Array.isArray(issueKeys) ? issueKeys.filter(Boolean) : [];
+  const allKeys = Array.isArray(issueKeys) ? issueKeys.filter(Boolean) : [];
+  const keys = allKeys.slice(0, 5);
 
   if (!sprintFieldId || keys.length === 0) {
     return 0;
@@ -6740,6 +6755,10 @@ async function getIssueSprintMembershipCount(sprintId, issueKeys, diagnostics = 
     } catch (err) {
       diagnostics.push(`Sprint ${sprintId}: could not verify Sprint field on ${issueKey}: ${err.message}`);
     }
+  }
+
+  if (allKeys.length > keys.length) {
+    diagnostics.push(`Sprint ${sprintId}: verified Sprint field on ${keys.length} of ${allKeys.length} assigned issue(s) to keep the Forge step under the timeout limit.`);
   }
 
   return count;
@@ -8369,6 +8388,7 @@ const JSM_SERVICE_TYPES = ['ITSM', 'HRSM', 'CSM', 'FSM', 'LSM'];
 const BUSINESS_SPACE_TYPES = [
   'task-tracking',
   'budget-planning',
+  'procurement-management',
 ];
 
 function normaliseBusinessSpaceType(value) {
@@ -8409,7 +8429,7 @@ function getBusinessSpaceCategoryLabel(value) {
     legal: 'Legal',
     sales: 'Sales',
     'recruitment-tracking': 'Human Resources',
-    'procurement-management': 'Operations',
+    'procurement-management': 'Work Management',
   };
   return categories[normalized] || 'Work Management';
 }
@@ -8921,7 +8941,7 @@ function buildChunkedExecutionPlan(config) {
       projectIndex,
       projectName: createDomainProjectName(config.industry, 'product-discovery', projectIndex, productDiscoveryProjectConfig),
       projectKeyPrefix: deriveRunProjectKeyPrefix({ ...config, runSeed }, config.industry, globalIndex),
-      label: `Find or create Jira Product Discovery space ${projectIndex + 1} of ${config.productDiscoveryProjectCount}`,
+      label: `Use existing Jira Product Discovery space ${projectIndex + 1} of ${config.productDiscoveryProjectCount}`,
     });
 
     steps.push({
@@ -9111,23 +9131,25 @@ function buildChunkedExecutionPlan(config) {
       });
     }
 
-    for (let projectIndex = 0; projectIndex < config.jsmProjectCount; projectIndex++) {
-      steps.push({
-        type: 'create-github-development-activity',
-        projectKind: 'jsm',
-        projectIndex,
-        label: `Create GitHub demo activity for JSM project ${projectIndex + 1}`,
-      });
-    }
+    const addGitHubActivitySteps = (projectKind, projectCount, labelPrefix) => {
+      for (let projectIndex = 0; projectIndex < projectCount; projectIndex++) {
+        for (let activityIndex = 0; activityIndex < GITHUB_DEMO_ACTIVITY_PER_PROJECT; activityIndex++) {
+          steps.push({
+            type: 'create-github-development-activity',
+            projectKind,
+            projectIndex,
+            activityStart: activityIndex,
+            activityCount: 1,
+            label: `${labelPrefix} ${projectIndex + 1} - GitHub item ${activityIndex + 1}`,
+          });
+        }
+      }
+    };
 
-    for (let projectIndex = 0; projectIndex < config.softwareProjectCount; projectIndex++) {
-      steps.push({
-        type: 'create-github-development-activity',
-        projectKind: 'software',
-        projectIndex,
-        label: `Create GitHub demo activity for software project ${projectIndex + 1}`,
-      });
-    }
+    addGitHubActivitySteps('jsm', config.jsmProjectCount, 'Create GitHub demo activity for JSM project');
+    addGitHubActivitySteps('business', config.businessProjectCount, 'Create GitHub demo activity for business space');
+    addGitHubActivitySteps('product-discovery', config.productDiscoveryProjectCount, 'Create GitHub demo activity for Product Discovery space');
+    addGitHubActivitySteps('software', config.softwareProjectCount, 'Create GitHub demo activity for software project');
 
     if (isRestDatePatchMode()) {
       steps.push({
@@ -10131,30 +10153,24 @@ async function executeWorkManagementProjectStep(config, state, step) {
 async function executeProductDiscoveryProjectStep(config, state, step) {
   const projectConfig = getProductDiscoveryProjectConfig(config, step.projectIndex);
   const projectName = step.projectName || createDomainProjectName(config.industry, 'product-discovery', step.projectIndex, projectConfig);
-  const projectKeyPrefix = step.projectKeyPrefix || deriveRunProjectKeyPrefix(config, config.industry, step.projectIndex + config.jsmProjectCount + config.businessProjectCount);
 
   try {
-    addChunkedDiagnostics(state, ['Product Discovery: finding or creating a native Jira Product Discovery space.']);
-    const expectedProject = projectConfig.projectKey ? await getProjectByKeyIfExists(projectConfig.projectKey) : null;
-    if (expectedProject && !isNativeProductDiscoveryProject(expectedProject)) {
-      throw new Error(`Configured Product Discovery project key ${expectedProject.key} points to a ${expectedProject.projectTypeKey || 'non-product-discovery'} project. Select a native Jira Product Discovery space or leave the key blank so the app can create one.`);
+    addChunkedDiagnostics(state, ['Product Discovery: using an existing native Jira Product Discovery space selected for volume.']);
+    if (!projectConfig.projectKey) {
+      throw new Error('Jira Product Discovery spaces must be created manually from Jira first. Select the existing native Product Discovery space with the Volume checkbox, then run the agent to add demo ideas.');
     }
-    const existingDomainProject = expectedProject || await findReusableDomainProject(config, {
-      kind: 'product-discovery',
-      excludeKeys: state.results.productDiscoveryProjects.map(project => project?.key),
-    });
-    const matchingGeneratedKeyProject = await getProjectByKeyIfExists(generateKey(projectKeyPrefix, 0));
-    const existingProject = existingDomainProject || (isNativeProductDiscoveryProject(matchingGeneratedKeyProject) ? matchingGeneratedKeyProject : null);
-    const projectShell = existingProject
-      ? existingProject
-      : await createProductDiscoveryProject(projectName, state.metadata.accountId, projectKeyPrefix, state.results.diagnostics);
-    const project = existingProject ? projectShell : await refreshProjectAfterCreate(projectShell, state.results.diagnostics);
+
+    const project = await getProjectByKeyIfExists(projectConfig.projectKey);
+    if (!project) {
+      throw new Error(`Configured Product Discovery project key ${projectConfig.projectKey} was not found. Create the Product Discovery space manually in Jira first, then select it with the Volume checkbox.`);
+    }
+
     if (!isNativeProductDiscoveryProject(project)) {
       throw new Error(`Jira returned project ${project.key} as ${project.projectTypeKey || 'unknown'} instead of product_discovery. The app will not treat a Work Management or Software project as Jira Product Discovery.`);
     }
 
     const existingIssueCount = await getIssueCountForProject(project.key);
-    const addVolumeToExistingProject = Boolean(existingProject && shouldAddVolumeToExistingProject(config, project.key));
+    const addVolumeToExistingProject = shouldAddVolumeToExistingProject(config, project.key);
     await saveProjectDemoDomainMetadata(project, {
       domain: config.industry,
       kind: 'product-discovery',
@@ -10166,20 +10182,20 @@ async function executeProductDiscoveryProjectStep(config, state, step) {
     state.results.productDiscoveryProjects[step.projectIndex] = {
       id: project.id,
       key: project.key,
-      name: existingProject?.name || projectName,
+      name: project.name || projectName,
       projectTypeKey: project.projectTypeKey || 'product_discovery',
       productDiscoveryType: 'product-discovery',
-      reusedExistingDomainData: Boolean(existingProject && existingIssueCount > 0),
+      reusedExistingDomainData: existingIssueCount > 0,
       addVolumeToExistingDomainData: addVolumeToExistingProject,
       existingIssueCount,
-      issueCount: existingProject && existingIssueCount > 0 ? existingIssueCount : 0,
+      issueCount: existingIssueCount > 0 ? existingIssueCount : 0,
       issueKeys: [],
       issueRecords: [],
       configuredIssueCount: projectConfig.issuesPerProject,
       demoDateFields: null,
       demoDateFieldsReady: false,
     };
-    addChunkedDiagnostics(state, [`Product Discovery ${project.key}: ${existingProject ? 'reused existing native' : 'created native'} discovery space.`]);
+    addChunkedDiagnostics(state, [`Product Discovery ${project.key}: using existing native discovery space; demo ideas will be added as volume.`]);
   } catch (err) {
     state.results.productDiscoveryProjects[step.projectIndex] = {
       id: null,
@@ -11065,13 +11081,15 @@ async function executeSoftwareSprintStep(config, state, step) {
     return;
   }
 
-  let sprintBoardId = null;
+  let sprintBoardId = project.sprintBoardId || project.boardId || null;
 
-  try {
-    sprintBoardId = await getBoardId(project.key, 'scrum');
-  } catch (err) {
-    addChunkedError(state, `Sprint ${step.sprintIndex + 1} for ${project.key}: native Scrum board lookup failed: ${err.message}`);
-    return;
+  if (!sprintBoardId) {
+    try {
+      sprintBoardId = await getBoardId(project.key, 'scrum', { maxAttempts: 2, retryDelayMs: 1000 });
+    } catch (err) {
+      addChunkedError(state, `Sprint ${step.sprintIndex + 1} for ${project.key}: native Scrum board lookup failed: ${err.message}`);
+      return;
+    }
   }
 
   if (!sprintBoardId) {
@@ -11127,13 +11145,6 @@ async function executeSoftwareSprintStep(config, state, step) {
           endDate: formatDateForJira(schedule.endDate),
           state: 'active',
         });
-        if (issueChunk.length > 0) {
-          const assignResult = await assignAndVerifyIssuesToSprint(sprint.id, issueChunk, state.results.diagnostics);
-          addChunkedDiagnostics(state, [`Sprint ${sprint.id}: confirmed ${issueChunk.length} issue(s) in active sprint ${sprint.name} (${assignResult.moved ? 'Agile move ok' : 'Agile move fallback used'}, Sprint field writes ${assignResult.fieldAssigned}/${issueChunk.length}, verified ${assignResult.verifiedCount}).`]);
-          if (assignResult.verifiedCount === 0) {
-            addChunkedError(state, `Sprint ${sprint.id} for ${project.key}: active sprint ${sprint.name} has 0 verified issues after start.`);
-          }
-        }
         try {
           const activeSprint = await getSprint(sprint.id);
           if (String(activeSprint?.state || '').toLowerCase() !== 'active') {
@@ -11189,12 +11200,16 @@ async function executeKanbanBoardPopulationStep(config, state, step) {
     addChunkedDiagnostics(state, [`Kanban ${project.key}: skipped duplicate status transition pass; generated issues were already transitioned during issue creation.`]);
 
     if (project.boardId) {
-      const boardIssues = await jiraGet(`/rest/agile/1.0/board/${encodeURIComponent(project.boardId)}/issue?jql=${encodeURIComponent(`project = ${project.key} ORDER BY Rank ASC`)}&maxResults=1`);
-      const visibleTotal = Number(boardIssues.total || 0);
-      if (visibleTotal === 0 && issueRecords.length > 0) {
-        addChunkedError(state, `Kanban ${project.key}: ${issueRecords.length} issue(s) were created, but board ${project.boardId} returned 0 visible issues.`);
-      } else {
-        addChunkedDiagnostics(state, [`Kanban ${project.key}: board ${project.boardId} can see ${visibleTotal} generated issue(s).`]);
+      try {
+        const boardIssues = await jiraGet(`/rest/agile/1.0/board/${encodeURIComponent(project.boardId)}/issue?jql=${encodeURIComponent(`project = ${project.key} ORDER BY Rank ASC`)}&maxResults=1`);
+        const visibleTotal = Number(boardIssues.total || 0);
+        if (visibleTotal === 0 && issueRecords.length > 0) {
+          addChunkedError(state, `Kanban ${project.key}: ${issueRecords.length} issue(s) were created, but board ${project.boardId} returned 0 visible issues.`);
+        } else {
+          addChunkedDiagnostics(state, [`Kanban ${project.key}: board ${project.boardId} can see ${visibleTotal} generated issue(s).`]);
+        }
+      } catch (verifyErr) {
+        addChunkedDiagnostics(state, [`Kanban ${project.key}: board visibility verification skipped because Jira Agile API access was unavailable: ${verifyErr.message}`]);
       }
     }
   } catch (err) {
@@ -11638,6 +11653,40 @@ function getGitHubActivityProjectTarget(state, step) {
     };
   }
 
+  if (projectKind === 'business') {
+    const project = state.results.businessProjects[step.projectIndex];
+    return {
+      projectKind,
+      project,
+      label: `business space ${step.projectIndex + 1}`,
+      issueRecords: (project?.issueRecords || []).map(item => ({
+        key: item.key,
+        title: item.title,
+        issueType: item.issueType || 'Business work',
+        priority: item.priority,
+        status: item.status,
+        methodologyPhase: project?.businessSpaceType || 'business-delivery',
+      })),
+    };
+  }
+
+  if (projectKind === 'product-discovery') {
+    const project = state.results.productDiscoveryProjects[step.projectIndex];
+    return {
+      projectKind,
+      project,
+      label: `Product Discovery space ${step.projectIndex + 1}`,
+      issueRecords: (project?.issueRecords || []).map(item => ({
+        key: item.key,
+        title: item.title,
+        issueType: item.issueType || 'Idea',
+        priority: item.priority,
+        status: item.status,
+        methodologyPhase: 'product-discovery',
+      })),
+    };
+  }
+
   const project = state.results.softwareProjects[step.projectIndex];
   return {
     projectKind: 'software',
@@ -11665,12 +11714,15 @@ async function executeGitHubDevelopmentActivityStep(config, state, step) {
     return;
   }
 
-  const issueRecords = (targetIssueRecords || [])
+  const allIssueRecords = (targetIssueRecords || [])
     .filter(issue => issue?.key)
     .slice(0, GITHUB_DEMO_ACTIVITY_PER_PROJECT);
+  const activityStart = Math.max(0, Number.parseInt(step.activityStart, 10) || 0);
+  const activityCount = Math.max(1, Math.min(Number.parseInt(step.activityCount, 10) || GITHUB_DEMO_ACTIVITY_PER_PROJECT, GITHUB_DEMO_ACTIVITY_PER_PROJECT));
+  const issueRecords = allIssueRecords.slice(activityStart, activityStart + activityCount);
 
   if (issueRecords.length === 0) {
-    addChunkedDiagnostics(state, [`GitHub activity ${project.key}: skipped because no ${projectKind === 'jsm' ? 'JSM work items' : 'software issues'} were created.`]);
+    addChunkedDiagnostics(state, [`GitHub activity ${project.key}: skipped item ${activityStart + 1} because no ${getGitHubActivityWorkLabel(projectKind).toLowerCase()} record was available.`]);
     return;
   }
 
@@ -11684,8 +11736,9 @@ async function executeGitHubDevelopmentActivityStep(config, state, step) {
     const createdRecords = [];
 
     for (let index = 0; index < issueRecords.length; index += 1) {
+      const activityIndex = activityStart + index;
       const issue = issueRecords[index];
-      const branchName = buildGitHubBranchName(config, project, issue, index);
+      const branchName = buildGitHubBranchName(config, project, issue, activityIndex);
       const filePath = buildGitHubDemoFilePath(config, project, issue);
       const commitMessage = `${issue.key} demo delivery activity for ${project.key}`;
       const pullTitle = `${issue.key} demo delivery activity for ${project.key}`;
@@ -11694,7 +11747,7 @@ async function executeGitHubDevelopmentActivityStep(config, state, step) {
         '',
         `Client demo: ${config.environmentName}`,
         `Jira project: ${project.key}`,
-        `${projectKind === 'jsm' ? 'Service work type' : 'Software work type'}: ${issue.issueType || (projectKind === 'jsm' ? 'Service work' : 'Software work')}`,
+        `${getGitHubActivityWorkLabel(projectKind)}: ${issue.issueType || getGitHubActivityWorkLabel(projectKind)}`,
       ].join('\n');
 
       await ensureGitHubBranch(githubConfig, branchName, sha);
@@ -11702,7 +11755,7 @@ async function executeGitHubDevelopmentActivityStep(config, state, step) {
         githubConfig,
         branchName,
         filePath,
-        buildGitHubDemoFileContent(config, project, issue),
+        buildGitHubDemoFileContent(config, project, issue, projectKind),
         commitMessage
       );
       const pullRequest = await ensureGitHubPullRequest(githubConfig, defaultBranch, branchName, pullTitle, pullBody);
@@ -11736,13 +11789,19 @@ async function executeGitHubDevelopmentActivityStep(config, state, step) {
       const acceptedDevInfo = devInfoResult?.acceptedDevinfoEntities
         ? Object.values(devInfoResult.acceptedDevinfoEntities).flat().length
         : 0;
+      const failedDevInfo = devInfoResult?.failedDevinfoEntities
+        ? Object.values(devInfoResult.failedDevinfoEntities).flat().length
+        : 0;
       const unknownIssueKeys = devInfoResult?.unknownIssueKeys || [];
+      const unknownAssociations = devInfoResult?.unknownAssociations || [];
+      const devInfoAccepted = failedDevInfo === 0 && unknownIssueKeys.length === 0 && unknownAssociations.length === 0;
       createdRecords.forEach(record => {
-        record.jiraDevelopmentInfoSubmitted = true;
+        record.jiraDevelopmentInfoSubmitted = devInfoAccepted;
       });
       addChunkedDiagnostics(state, [
-        `Jira dev panel ${project.key}: submitted branch/commit/PR data for ${createdRecords.length} item(s)${acceptedDevInfo ? `; ${acceptedDevInfo} dev-info entity group(s) accepted` : ''}.`,
+        `Jira dev panel ${project.key}: submitted branch/commit/PR data for ${createdRecords.length} item(s)${acceptedDevInfo ? `; ${acceptedDevInfo} dev-info entity group(s) accepted` : ''}${failedDevInfo ? `; ${failedDevInfo} failed` : ''}.`,
         ...(unknownIssueKeys.length ? [`Jira dev panel ${project.key}: unknown issue key(s): ${unknownIssueKeys.join(', ')}.`] : []),
+        ...(unknownAssociations.length ? [`Jira dev panel ${project.key}: unknown association(s): ${JSON.stringify(unknownAssociations).slice(0, 500)}.`] : []),
       ]);
     } catch (devInfoErr) {
       createdRecords.forEach(record => {
@@ -11755,12 +11814,13 @@ async function executeGitHubDevelopmentActivityStep(config, state, step) {
       const deploymentResult = await submitJiraDeploymentInformation(githubConfig, project, createdRecords);
       const acceptedDeployments = deploymentResult?.acceptedDeployments || [];
       const rejectedDeployments = deploymentResult?.rejectedDeployments || [];
+      const deploymentsAccepted = rejectedDeployments.length === 0;
       createdRecords.forEach(record => {
-        record.jiraDeploymentInfoSubmitted = true;
+        record.jiraDeploymentInfoSubmitted = deploymentsAccepted;
       });
       addChunkedDiagnostics(state, [
         `Jira dev panel ${project.key}: submitted deployment data for ${createdRecords.length} item(s); ${acceptedDeployments.length} accepted.`,
-        ...(rejectedDeployments.length ? [`Jira dev panel ${project.key}: ${rejectedDeployments.length} deployment item(s) rejected.`] : []),
+        ...(rejectedDeployments.length ? [`Jira dev panel ${project.key}: ${rejectedDeployments.length} deployment item(s) rejected: ${JSON.stringify(rejectedDeployments).slice(0, 500)}.`] : []),
       ]);
     } catch (deploymentInfoErr) {
       createdRecords.forEach(record => {
