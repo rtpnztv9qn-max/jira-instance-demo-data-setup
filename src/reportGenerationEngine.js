@@ -7,9 +7,9 @@ export function buildEnterpriseReports({ config, projectKeys, dashboardId }) {
     ['SLA report', `${baseJql} AND priority in (Highest, High)`, 'High-severity service work and likely SLA exposure.'],
     ['Resolution time report', `${baseJql} AND statusCategory = Done`, 'Resolved work with realistic lifecycle timestamps.'],
     ['Workload report', `${baseJql} AND assignee is not EMPTY`, 'Cross-project workload by assignee and priority.'],
-    ['Ticket aging report', `${baseJql} AND statusCategory != Done ORDER BY created ASC`, 'Open ticket age bands and stale work detection.'],
+    ['Ticket aging report', `${baseJql} AND statusCategory != Done ORDER BY priority DESC, duedate ASC`, 'Open ticket age bands and stale work detection.'],
     ['Escalation report', `${baseJql} AND priority in (Highest, High) AND statusCategory != Done`, 'Escalation candidates across generated projects.'],
-    ['Incident trend report', `${baseJql} AND issuetype = Bug ORDER BY created DESC`, 'Incident intake and resolution trend analysis based on generated support bugs.'],
+    ['Incident trend report', `${baseJql} AND issuetype = Bug ORDER BY priority DESC, duedate ASC`, 'Incident intake and resolution trend analysis based on generated support bugs.'],
   ];
 
   return reports.map(([name, jql, description]) => ({

@@ -35,7 +35,7 @@ const WORKER_DATE_PATCH_ENDPOINT = process.env.WORKER_DATE_PATCH_ENDPOINT
 const ISSUE_CREATION_MODE = process.env.ISSUE_CREATION_MODE || 'rest';
 const WORKER_FETCH_TIMEOUT_MS = 10000;
 const GITHUB_DEMO_ACTIVITY_ENABLED = String(process.env.GITHUB_DEMO_ACTIVITY_ENABLED || 'true').toLowerCase() !== 'false';
-const GITHUB_DEMO_ACTIVITY_PER_PROJECT = Math.max(1, Math.min(Number(process.env.GITHUB_DEMO_ACTIVITY_PER_PROJECT) || 5, 50));
+const GITHUB_DEMO_ACTIVITY_PER_PROJECT = Math.max(1, Math.min(Number(process.env.GITHUB_DEMO_ACTIVITY_PER_PROJECT) || 50, 100));
 const GITHUB_DEMO_BRANCHES_PER_ISSUE = Math.max(1, Math.min(Number(process.env.GITHUB_DEMO_BRANCHES_PER_ISSUE) || 1, 5));
 const GITHUB_DEMO_PULL_REQUESTS_PER_ISSUE = Math.max(0, Math.min(Number(process.env.GITHUB_DEMO_PULL_REQUESTS_PER_ISSUE) || GITHUB_DEMO_BRANCHES_PER_ISSUE, GITHUB_DEMO_BRANCHES_PER_ISSUE));
 const GITHUB_FETCH_TIMEOUT_MS = 6000;
@@ -1698,6 +1698,30 @@ function getGitHubActivityProjectLabel(projectKind) {
   return 'Jira software project';
 }
 
+function uniqueGitHubActivityIssueRecords(records = []) {
+  const byKey = new Map();
+  for (const record of records || []) {
+    if (record?.key && !byKey.has(record.key)) {
+      byKey.set(record.key, record);
+    }
+  }
+  return Array.from(byKey.values());
+}
+
+function getSoftwareGitHubActivityIssueRecords(project) {
+  const issueRecords = Array.isArray(project?.issueRecords) ? project.issueRecords : [];
+  const epicRecords = (project?.epicKeys || []).filter(Boolean).map((key, index) => ({
+    key,
+    title: `${project.key} delivery epic ${index + 1}`,
+    issueType: 'Epic',
+    priority: 'Medium',
+    status: 'To Do',
+    methodologyPhase: 'planning',
+  }));
+
+  return uniqueGitHubActivityIssueRecords([...issueRecords, ...epicRecords]);
+}
+
 function buildGitHubDemoFileContent(config, project, issue, projectKind = 'software', variantIndex = 0) {
   return [
     `# ${issue.key} GitHub Delivery Activity`,
@@ -2112,6 +2136,42 @@ async function submitJiraDeploymentInformation(config, project, records) {
       product: 'Cprime Demo GitHub Deployments',
     },
   });
+}
+
+async function addGitHubActivityIssueEvidence(record, diagnostics = []) {
+  if (!record?.issueKey) {
+    return 0;
+  }
+
+  let added = 0;
+  const links = [
+    {
+      url: record.pullRequestUrl,
+      title: `${record.issueKey} GitHub pull request #${record.pullRequestNumber}`,
+      relationship: 'reviewed in',
+      summary: `Generated demo pull request for ${record.issueKey}.`,
+    },
+    {
+      url: record.commitUrl,
+      title: `${record.issueKey} GitHub commit ${String(record.commitSha || '').slice(0, 7)}`,
+      relationship: 'implemented by',
+      summary: `Generated demo commit for ${record.issueKey}.`,
+    },
+    {
+      url: record.branchUrl,
+      title: `${record.issueKey} GitHub branch`,
+      relationship: 'developed on',
+      summary: `Generated demo branch for ${record.issueKey}.`,
+    },
+  ];
+
+  for (const link of links) {
+    if (await addIssueRemoteLink(record.issueKey, link, diagnostics)) {
+      added += 1;
+    }
+  }
+
+  return added;
 }
 
 function buildTrustedJiraRoute(path) {
@@ -7338,14 +7398,34 @@ function getJqlCustomFieldRef(fieldId) {
   return match ? `cf[${match[1]}]` : null;
 }
 
-function buildCustomDateRangeClause(fieldId, days) {
-  const fieldRef = getJqlCustomFieldRef(fieldId);
+function quoteJqlFieldName(value) {
+  return `"${String(value || '').replace(/"/g, '\\"')}"`;
+}
+
+function getDemoDateFieldName(dateFieldKind) {
+  return DEMO_DATE_FIELD_DEFINITIONS[dateFieldKind]?.name || '';
+}
+
+function getJqlCustomDateFieldRefs(fieldId, dateFieldKind) {
+  const refs = [
+    getJqlCustomFieldRef(fieldId),
+    getDemoDateFieldName(dateFieldKind) ? quoteJqlFieldName(getDemoDateFieldName(dateFieldKind)) : null,
+  ].filter(Boolean);
+
+  return Array.from(new Set(refs));
+}
+
+function buildCustomDateRangeClauseForRef(fieldRef, days) {
   if (!fieldRef) {
     return null;
   }
 
   const rangeDays = Math.max(1, Number.parseInt(days, 10) || 180);
   return `${fieldRef} >= startOfDay("-${rangeDays}d")`;
+}
+
+function buildCustomDateRangeClause(fieldId, days) {
+  return buildCustomDateRangeClauseForRef(getJqlCustomFieldRef(fieldId), days);
 }
 
 function buildProjectFilterDefinition(context) {
@@ -7399,7 +7479,11 @@ async function createSavedFilter({ name, description, jql }) {
 function isCustomDateFieldNotSearchableError(err) {
   const message = String(err?.message || '');
   return /Field 'cf\[\d+\]' is not searchable/i.test(message)
-    || /Field 'cf\[\d+\]' does not exist or you do not have permission to view it/i.test(message);
+    || /Field 'cf\[\d+\]' does not exist or you do not have permission to view it/i.test(message)
+    || /Field '.*Date' is not searchable/i.test(message)
+    || /Field '.*Date' does not exist or you do not have permission to view it/i.test(message)
+    || /order by .*cf\[\d+\]/i.test(message)
+    || /cf\[\d+\].*order by/i.test(message);
 }
 
 async function getSavedFilter(filterId) {
@@ -7597,6 +7681,14 @@ async function getDashboardItemProperty(dashboardId, itemId, propertyKey) {
   return data.value;
 }
 
+async function getDashboardItemPropertyOptional(dashboardId, itemId, propertyKey) {
+  try {
+    return await getDashboardItemProperty(dashboardId, itemId, propertyKey);
+  } catch {
+    return null;
+  }
+}
+
 async function setDashboardGadgetPreferences(dashboardId, gadgetId, preferences) {
   // Jira's built-in dashboard gadgets still read their edit-form values from
   // legacy gadget preferences. The documented dashboard item property API is
@@ -7617,6 +7709,9 @@ async function setDashboardGadgetPreferences(dashboardId, gadgetId, preferences)
 async function setDashboardGadgetPreferencesWithPropertyFallback(dashboardId, gadgetId, preferences, propertyValues = {}) {
   try {
     await setDashboardGadgetPreferences(dashboardId, gadgetId, preferences);
+    for (const [propertyKey, value] of Object.entries(propertyValues)) {
+      await setDashboardItemProperty(dashboardId, gadgetId, propertyKey, value);
+    }
     return;
   } catch (err) {
     console.warn(`Legacy dashboard gadget preference update failed for ${gadgetId}: ${err.message}`);
@@ -7636,6 +7731,73 @@ async function applyFilterToDashboardGadget(dashboardId, itemId, filter) {
   await setDashboardItemProperty(dashboardId, itemId, 'name', String(filter.name));
   await setDashboardItemProperty(dashboardId, itemId, 'filterId', String(filter.id));
   await setDashboardItemProperty(dashboardId, itemId, 'filterName', String(filter.name));
+}
+
+function dashboardPropertyHasFilter(value, filter) {
+  if (!filter?.id || value === null || value === undefined) {
+    return false;
+  }
+
+  const expectedId = String(filter.id);
+  if (String(value) === expectedId) {
+    return true;
+  }
+
+  if (typeof value !== 'object') {
+    return false;
+  }
+
+  return [
+    value.id,
+    value.filterId,
+    value.projectOrFilterId,
+    value.up_id,
+    value.up_filterId,
+    value.up_projectOrFilterId,
+  ].some(candidate => String(candidate || '') === expectedId);
+}
+
+async function verifyDashboardGadgetFilterWiring(dashboardId, itemId, filter, propertyKeys = ['config', 'filterId', 'id', 'projectOrFilterId']) {
+  for (const propertyKey of propertyKeys) {
+    const value = await getDashboardItemPropertyOptional(dashboardId, itemId, propertyKey);
+    if (dashboardPropertyHasFilter(value, filter)) {
+      return {
+        verified: true,
+        propertyKey,
+      };
+    }
+  }
+
+  return {
+    verified: false,
+    propertyKey: null,
+  };
+}
+
+function recordDashboardFilterVerification(state, dashboardRecord, gadgetPlan, gadgetId, verification) {
+  dashboardRecord.filterWiring = dashboardRecord.filterWiring || {
+    verified: false,
+    gadgets: [],
+  };
+
+  dashboardRecord.filterWiring.gadgets.push({
+    gadgetId: String(gadgetId),
+    role: gadgetPlan.role,
+    title: gadgetPlan.title,
+    verified: Boolean(verification?.verified),
+    propertyKey: verification?.propertyKey || null,
+  });
+
+  if (verification?.verified) {
+    dashboardRecord.filterWiring.verified = true;
+    dashboardRecord.filterApplied = true;
+    state.results.dashboardFilterApplied = true;
+    addChunkedDiagnostics(state, [
+      `Dashboard ${dashboardRecord.id}: verified filter wiring for "${gadgetPlan.title}" using dashboard item property "${verification.propertyKey}".`,
+    ]);
+  } else {
+    addChunkedError(state, `Dashboard ${dashboardRecord.id}: filter wiring for "${gadgetPlan.title}" could not be verified after configuration.`);
+  }
 }
 
 async function configureFilterResultsGadget(dashboardId, itemId, filter) {
@@ -7875,20 +8037,22 @@ function buildDashboardReportFilterDefinitions(dashboardContext, dashboardFilter
   }
 
   const reportPrefix = `${dashboardContext.dashboardName} - Report`;
-  const createdDateRangeClause = buildCustomDateRangeClause(
+  const createdDateFieldRefs = getJqlCustomDateFieldRefs(
     dashboardContext.customDateFields?.createdDateFieldId,
-    dashboardContext.dateRangeDays
+    'created'
   );
-  const resolvedDateRangeClause = buildCustomDateRangeClause(
+  const resolvedDateFieldRefs = getJqlCustomDateFieldRefs(
     dashboardContext.customDateFields?.resolvedDateFieldId,
-    dashboardContext.dateRangeDays
+    'resolved'
   );
+  const createdDateRangeClause = buildCustomDateRangeClauseForRef(createdDateFieldRefs[0], dashboardContext.dateRangeDays);
+  const resolvedDateRangeClause = buildCustomDateRangeClauseForRef(resolvedDateFieldRefs[0], dashboardContext.dateRangeDays);
   const createdDateDescription = createdDateRangeClause
     ? ' Uses the generated Created Date custom field for the selected ticket duration.'
-    : ' Uses Jira native Created because the generated Created Date custom field was not available.';
+    : ' Omits the Created date window because the generated Created Date custom field was not available.';
   const resolvedDateDescription = resolvedDateRangeClause
     ? ' Uses the generated Resolved Date custom field for the selected ticket duration.'
-    : ' Uses Jira native Updated because the generated Resolved Date custom field was not available.';
+    : ' Omits the Resolved date window because the generated Resolved Date custom field was not available.';
   const common = {
     dashboardIndex: dashboardContext.dashboardIndex,
     dashboardName: dashboardContext.dashboardName,
@@ -7896,11 +8060,20 @@ function buildDashboardReportFilterDefinitions(dashboardContext, dashboardFilter
     customDateFields: dashboardContext.customDateFields || {},
     dateRangeDays: dashboardContext.dateRangeDays || 180,
   };
-  const createdWindowJql = createdDateRangeClause ? ` AND ${createdDateRangeClause}` : '';
-  const resolvedWindowJql = resolvedDateRangeClause ? ` AND ${resolvedDateRangeClause}` : '';
+  const createdWindowJql = fieldRef => {
+    const clause = buildCustomDateRangeClauseForRef(fieldRef, dashboardContext.dateRangeDays);
+    return clause ? ` AND ${clause}` : '';
+  };
+  const resolvedWindowJql = fieldRef => {
+    const clause = buildCustomDateRangeClauseForRef(fieldRef, dashboardContext.dateRangeDays);
+    return clause ? ` AND ${clause}` : '';
+  };
   const urgentWorkJql = `${baseJql} AND priority in (Highest, High, Critical) ORDER BY priority DESC, duedate ASC`;
   const agingOpenWorkJql = `${baseJql} AND statusCategory != Done ORDER BY priority DESC, duedate ASC`;
-  const completedTrendJql = `${baseJql} AND statusCategory = Done ORDER BY updated DESC`;
+  const completedTrendJql = `${baseJql} AND statusCategory = Done ORDER BY priority DESC, duedate ASC`;
+  const createdDateAlternates = createdDateFieldRefs.slice(1);
+  const resolvedDateAlternates = resolvedDateFieldRefs.slice(1);
+  const resolvedDateSort = resolvedDateFieldRefs[0] ? ` ORDER BY ${resolvedDateFieldRefs[0]} DESC` : ' ORDER BY priority DESC, duedate ASC';
 
   return [
     {
@@ -7908,7 +8081,8 @@ function buildDashboardReportFilterDefinitions(dashboardContext, dashboardFilter
       reportType: 'Urgent Work',
       name: `${reportPrefix} - Urgent Work`,
       description: `High-priority report filter for ${dashboardContext.dashboardName}.${createdDateDescription}`,
-      jql: `${baseJql}${createdWindowJql} AND priority in (Highest, High, Critical) ORDER BY priority DESC, duedate ASC`,
+      jql: `${baseJql}${createdWindowJql(createdDateFieldRefs[0])} AND priority in (Highest, High, Critical) ORDER BY priority DESC, duedate ASC`,
+      alternateJqls: createdDateAlternates.map(fieldRef => `${baseJql}${createdWindowJql(fieldRef)} AND priority in (Highest, High, Critical) ORDER BY priority DESC, duedate ASC`),
       fallbackJql: urgentWorkJql,
     },
     {
@@ -7916,7 +8090,8 @@ function buildDashboardReportFilterDefinitions(dashboardContext, dashboardFilter
       reportType: 'Aging Open Work',
       name: `${reportPrefix} - Aging Open Work`,
       description: `Open aging work report filter for ${dashboardContext.dashboardName}.${createdDateDescription}`,
-      jql: `${baseJql}${createdWindowJql} AND statusCategory != Done ORDER BY priority DESC, duedate ASC`,
+      jql: `${baseJql}${createdWindowJql(createdDateFieldRefs[0])} AND statusCategory != Done ORDER BY priority DESC, duedate ASC`,
+      alternateJqls: createdDateAlternates.map(fieldRef => `${baseJql}${createdWindowJql(fieldRef)} AND statusCategory != Done ORDER BY priority DESC, duedate ASC`),
       fallbackJql: agingOpenWorkJql,
     },
     {
@@ -7924,7 +8099,8 @@ function buildDashboardReportFilterDefinitions(dashboardContext, dashboardFilter
       reportType: 'Completed Trend',
       name: `${reportPrefix} - Completed Trend`,
       description: `Completed work trend report filter for ${dashboardContext.dashboardName}.${resolvedDateDescription}`,
-      jql: `${baseJql}${resolvedWindowJql} AND statusCategory = Done ORDER BY updated DESC`,
+      jql: `${baseJql}${resolvedWindowJql(resolvedDateFieldRefs[0])} AND statusCategory = Done${resolvedDateSort}`,
+      alternateJqls: resolvedDateAlternates.map(fieldRef => `${baseJql}${resolvedWindowJql(fieldRef)} AND statusCategory = Done ORDER BY ${fieldRef} DESC`),
       fallbackJql: completedTrendJql,
     },
   ];
@@ -7937,28 +8113,53 @@ async function ensureDashboardReportFilters(state, dashboardContext, dashboardFi
 
   for (const definition of definitions) {
     try {
-      let customDateFilterApplied = true;
+      let customDateFilterApplied = definition.jql !== definition.fallbackJql;
       let activeDefinition = definition;
       let reportFilter;
 
       try {
         reportFilter = await createSavedFilter(activeDefinition);
       } catch (err) {
-        const canFallback = definition.fallbackJql && definition.fallbackJql !== definition.jql;
-        if (!canFallback || !isCustomDateFieldNotSearchableError(err)) {
-          throw err;
+        let alternateCreated = false;
+        for (const alternateJql of definition.alternateJqls || []) {
+          try {
+            activeDefinition = {
+              ...definition,
+              jql: alternateJql,
+              description: `${definition.description} Saved filter uses an alternate generated custom date field JQL reference accepted by this Jira site.`,
+            };
+            reportFilter = await createSavedFilter(activeDefinition);
+            alternateCreated = true;
+            addChunkedDiagnostics(state, [
+              `Report filter "${definition.name}" used an alternate custom date field JQL reference instead of native Jira date fields.`,
+            ]);
+            break;
+          } catch (alternateErr) {
+            if (!isCustomDateFieldNotSearchableError(alternateErr)) {
+              throw alternateErr;
+            }
+          }
         }
 
-        customDateFilterApplied = false;
-        activeDefinition = {
-          ...definition,
-          jql: definition.fallbackJql,
-          description: `${definition.description} Saved filter uses Jira-native JQL because this site does not expose the generated date fields as searchable JQL fields; the app report chart still uses generated Created Date and Resolved Date values directly.`,
-        };
-        reportFilter = await createSavedFilter(activeDefinition);
-        addChunkedDiagnostics(state, [
-          `Report filter "${definition.name}" used fallback Jira-native JQL because generated custom date fields are not searchable in saved filters; in-app Summary and Reports charts still use those custom field values directly.`,
-        ]);
+        if (alternateCreated) {
+          customDateFilterApplied = true;
+        } else {
+          const canFallback = definition.fallbackJql && definition.fallbackJql !== definition.jql;
+          if (!canFallback || !isCustomDateFieldNotSearchableError(err)) {
+            throw err;
+          }
+
+          customDateFilterApplied = false;
+          activeDefinition = {
+            ...definition,
+            jql: definition.fallbackJql,
+            description: `${definition.description} Saved filter omits the date window because this site does not expose the generated date fields as searchable JQL fields; the app report chart still uses generated Created Date and Resolved Date values directly.`,
+          };
+          reportFilter = await createSavedFilter(activeDefinition);
+          addChunkedDiagnostics(state, [
+            `Report filter "${definition.name}" omitted the saved-filter date window because generated custom date fields are not searchable in JQL; in-app Summary and Reports charts still use those custom field values directly.`,
+          ]);
+        }
       }
 
       const report = {
@@ -11873,7 +12074,7 @@ function getGitHubActivityProjectTarget(state, step) {
     projectKind: 'software',
     project,
     label: `software project ${step.projectIndex + 1}`,
-    issueRecords: project?.issueRecords || [],
+    issueRecords: getSoftwareGitHubActivityIssueRecords(project),
   };
 }
 
@@ -11903,9 +12104,16 @@ async function executeGitHubDevelopmentActivityStep(config, state, step) {
     return;
   }
 
-  const allIssueRecords = (targetIssueRecords || [])
+  let allIssueRecords = (targetIssueRecords || [])
     .filter(issue => issue?.key)
     .slice(0, GITHUB_DEMO_ACTIVITY_PER_PROJECT);
+
+  if (allIssueRecords.length === 0) {
+    allIssueRecords = await searchExistingIssuesForGitHubActivity(project, projectKind);
+    if (allIssueRecords.length > 0) {
+      addChunkedDiagnostics(state, [`GitHub activity ${project.key}: using ${allIssueRecords.length} existing ${getGitHubActivityWorkLabel(projectKind).toLowerCase()} record(s) for Jira development panel data.`]);
+    }
+  }
   const activityStart = Math.max(0, Number.parseInt(step.activityStart, 10) || 0);
   const activityCount = Math.max(1, Math.min(Number.parseInt(step.activityCount, 10) || GITHUB_DEMO_ACTIVITY_PER_PROJECT, GITHUB_DEMO_ACTIVITY_PER_PROJECT));
   const issueRecords = allIssueRecords.slice(activityStart, activityStart + activityCount);
@@ -11986,6 +12194,11 @@ async function executeGitHubDevelopmentActivityStep(config, state, step) {
       ...createdRecords,
     ];
 
+    let evidenceLinksAdded = 0;
+    for (const record of createdRecords) {
+      evidenceLinksAdded += await addGitHubActivityIssueEvidence(record, state.results.diagnostics);
+    }
+
     try {
       const devInfoResult = await submitJiraDevelopmentInformation(githubConfig, project, defaultBranch, projectRecordsForSubmission);
       const acceptedDevInfo = devInfoResult?.acceptedDevinfoEntities
@@ -12034,8 +12247,9 @@ async function executeGitHubDevelopmentActivityStep(config, state, step) {
     state.results.githubActivity.push(...createdRecords);
     addChunkedDiagnostics(state, [
       `GitHub activity ${project.key}: created ${createdRecords.length} branch/commit/PR/deployment demo item(s) in ${githubConfig.owner}/${githubConfig.repo}.`,
+      evidenceLinksAdded > 0 ? `GitHub activity ${project.key}: added ${evidenceLinksAdded} visible GitHub remote link(s) to Jira issue(s).` : '',
       ...createdRecords.slice(0, 3).map(record => `GitHub activity: ${record.issueKey} -> commit ${String(record.commitSha || '').slice(0, 7)}${record.pullRequestNumber ? `, PR #${record.pullRequestNumber}` : ''}, deployment ${record.deploymentStatus}.`),
-    ]);
+    ].filter(Boolean));
   } catch (err) {
     if (isGitHubWriteAccessError(err)) {
       const message = buildGitHubWriteAccessMessage(githubConfig);
@@ -12135,6 +12349,10 @@ async function executeDashboardShellStep(config, state, step) {
       viewUrl: dashboard.view || null,
       templateId: 'managed-layout',
       filterApplied: false,
+      filterWiring: {
+        verified: false,
+        gadgets: [],
+      },
       filterId: filter?.id || null,
       projectKey: dashboardContext.projectKeys.join(','),
       projectType: dashboardContext.projectTypeLabel,
@@ -12204,8 +12422,8 @@ async function executeDashboardGadgetStep(config, state, step) {
 
     if (gadgetPlan.role.startsWith('forge-')) {
       await configureForgeDemoGadget(dashboardId, added.id, gadgetPlan, state, filter, config, dashboardContext);
-      dashboardRecord.filterApplied = true;
-      state.results.dashboardFilterApplied = true;
+      const verification = await verifyDashboardGadgetFilterWiring(dashboardId, added.id, filter, ['config']);
+      recordDashboardFilterVerification(state, dashboardRecord, gadgetPlan, added.id, verification);
       return;
     }
 
@@ -12217,32 +12435,32 @@ async function executeDashboardGadgetStep(config, state, step) {
     if (gadgetPlan.role === 'filter-results') {
       await configureFilterResultsGadget(dashboardId, added.id, filter);
       await applyFilterToDashboardGadget(dashboardId, added.id, filter);
-      dashboardRecord.filterApplied = true;
-      state.results.dashboardFilterApplied = true;
+      const verification = await verifyDashboardGadgetFilterWiring(dashboardId, added.id, filter);
+      recordDashboardFilterVerification(state, dashboardRecord, gadgetPlan, added.id, verification);
       return;
     }
 
     if (gadgetPlan.role === 'pie-chart-status') {
       await configurePieChartGadget(dashboardId, added.id, filter, 'statuses', gadgetPlan.title);
       await applyFilterToDashboardGadget(dashboardId, added.id, filter);
-      dashboardRecord.filterApplied = true;
-      state.results.dashboardFilterApplied = true;
+      const verification = await verifyDashboardGadgetFilterWiring(dashboardId, added.id, filter);
+      recordDashboardFilterVerification(state, dashboardRecord, gadgetPlan, added.id, verification);
       return;
     }
 
     if (gadgetPlan.role === 'pie-chart-priority') {
       await configurePieChartGadget(dashboardId, added.id, filter, 'priorities', gadgetPlan.title);
       await applyFilterToDashboardGadget(dashboardId, added.id, filter);
-      dashboardRecord.filterApplied = true;
-      state.results.dashboardFilterApplied = true;
+      const verification = await verifyDashboardGadgetFilterWiring(dashboardId, added.id, filter);
+      recordDashboardFilterVerification(state, dashboardRecord, gadgetPlan, added.id, verification);
       return;
     }
 
     if (gadgetPlan.role === 'pie-chart-assignee') {
       await configurePieChartGadget(dashboardId, added.id, filter, 'assignees', gadgetPlan.title);
       await applyFilterToDashboardGadget(dashboardId, added.id, filter);
-      dashboardRecord.filterApplied = true;
-      state.results.dashboardFilterApplied = true;
+      const verification = await verifyDashboardGadgetFilterWiring(dashboardId, added.id, filter);
+      recordDashboardFilterVerification(state, dashboardRecord, gadgetPlan, added.id, verification);
       return;
     }
 
@@ -12252,8 +12470,8 @@ async function executeDashboardGadgetStep(config, state, step) {
         periodName: 'daily',
         isCumulative: 'true',
       });
-      dashboardRecord.filterApplied = true;
-      state.results.dashboardFilterApplied = true;
+      const verification = await verifyDashboardGadgetFilterWiring(dashboardId, added.id, filter, ['config', 'id', 'projectOrFilterId']);
+      recordDashboardFilterVerification(state, dashboardRecord, gadgetPlan, added.id, verification);
       return;
     }
 
@@ -12262,8 +12480,8 @@ async function executeDashboardGadgetStep(config, state, step) {
         daysprevious: '30',
         periodName: 'daily',
       });
-      dashboardRecord.filterApplied = true;
-      state.results.dashboardFilterApplied = true;
+      const verification = await verifyDashboardGadgetFilterWiring(dashboardId, added.id, filter, ['config', 'id', 'projectOrFilterId']);
+      recordDashboardFilterVerification(state, dashboardRecord, gadgetPlan, added.id, verification);
       return;
     }
 
@@ -12272,8 +12490,8 @@ async function executeDashboardGadgetStep(config, state, step) {
         daysprevious: '30',
         periodName: 'daily',
       });
-      dashboardRecord.filterApplied = true;
-      state.results.dashboardFilterApplied = true;
+      const verification = await verifyDashboardGadgetFilterWiring(dashboardId, added.id, filter, ['config', 'id', 'projectOrFilterId']);
+      recordDashboardFilterVerification(state, dashboardRecord, gadgetPlan, added.id, verification);
     }
   } catch (err) {
     addChunkedError(state, `Gadget "${gadgetPlan.title}" for dashboard ${dashboardId}: ${err.message}`);
@@ -12327,6 +12545,39 @@ async function enrichIssuesWithDemoDateProperties(issues, customDateFields = {})
   }));
 
   return issues;
+}
+
+async function searchExistingIssuesForGitHubActivity(project, projectKind) {
+  if (!project?.key) {
+    return [];
+  }
+
+  try {
+    const data = await jiraPost('/rest/api/3/search/jql', {
+      jql: `project = ${quoteJqlValue(project.key)} ORDER BY key DESC`,
+      maxResults: GITHUB_DEMO_ACTIVITY_PER_PROJECT,
+      fields: ['summary', 'status', 'priority', 'issuetype'],
+    });
+
+    return (Array.isArray(data.issues) ? data.issues : [])
+      .filter(issue => issue?.key)
+      .map(issue => ({
+        key: issue.key,
+        title: issue.fields?.summary || issue.key,
+        issueType: issue.fields?.issuetype?.name || getGitHubActivityWorkLabel(projectKind),
+        priority: issue.fields?.priority?.name,
+        status: issue.fields?.status?.name,
+        methodologyPhase: projectKind === 'product-discovery'
+          ? 'product-discovery'
+          : projectKind === 'business'
+            ? project.businessSpaceType || 'business-delivery'
+            : projectKind === 'jsm'
+              ? 'service-delivery'
+              : project.softwareTemplate || 'software-delivery',
+      }));
+  } catch (err) {
+    throw new Error(`could not read existing issues for development activity: ${err.message}`);
+  }
 }
 
 function getDemoDateIssueProperty(issue) {
@@ -13177,7 +13428,7 @@ resolver.define('getProjectInsightsData', async ({ payload }) => {
       ? getJsmServiceTypeLabel(projectType)
       : projectType;
     const baseJql = `project = ${projectKey}`;
-    const allWorkJql = `${baseJql} ORDER BY updated DESC`;
+    const allWorkJql = `${baseJql} ORDER BY priority DESC, duedate ASC`;
     const config = {
       viewType: 'project-insights',
       title: 'Summary & Reports',
@@ -13231,10 +13482,27 @@ async function finalizeDashboardStep(state) {
   }
 
   for (const dashboard of createdDashboards) {
-    if (!dashboard.filterApplied) {
-      addChunkedError(state, `Dashboard ${dashboard.id}: no filter-driven gadget was configured successfully.`);
+    if (!dashboard.filterWiring?.verified) {
+      addChunkedError(state, `Dashboard ${dashboard.id}: no filter-driven gadget wiring could be verified automatically.`);
     }
   }
+}
+
+function buildDashboardFilterWiringSummary(dashboards) {
+  if (dashboards.length === 0) {
+    return 'Not created';
+  }
+
+  const verifiedCount = dashboards.filter(dashboard => dashboard.filterWiring?.verified).length;
+  if (verifiedCount === dashboards.length) {
+    return 'Verified automatically';
+  }
+
+  if (verifiedCount > 0) {
+    return `${verifiedCount}/${dashboards.length} verified automatically`;
+  }
+
+  return 'Not verified';
 }
 
 function addUniqueChunkedError(state, message) {
@@ -13469,7 +13737,7 @@ function buildChunkedSummary(config, state) {
     `- Compass Components: ${compassComponents.length > 0 ? `${compassComponents.length} created, ${visibleJiraCompassComponents.length} visible in Jira Components, ${linkedCompassComponents.length} linked to work items, ${repositoryLinkedCompassComponents.length} repository link(s), ${dependencyLinkedCompassComponents.length} dependency link(s), ${ownedCompassComponents.length} owner assignment(s)` : 'Not created or not configured'}`,
     `- Goal Work Items: ${projectGoals.length > 0 ? `${projectGoals.length} Jira work item(s) created with goal labels` : 'Not created'}`,
     `- Native Atlassian Goals: ${atlassianGoals.length > 0 ? `${atlassianGoals.length} created, ${linkedAtlassianGoals.length} linked through Jira Goals field, ${atlassianGoals.filter(goal => goal.statusUpdated).length} status update(s) applied with varied target progress` : 'Not created or not configured'}`,
-    `- Dashboard Filter Wiring: ${dashboards.length > 0 && dashboards.every(dashboard => dashboard.filterApplied) ? 'Applied automatically' : 'Needs verification'}`,
+    `- Dashboard Filter Wiring: ${buildDashboardFilterWiringSummary(dashboards)}`,
     '',
   ];
 
@@ -13984,7 +14252,7 @@ async function findGeneratedIssuesForCleanup() {
 
   for (let page = 0; page < 10; page += 1) {
     const body = {
-      jql: `issue.property[${TICKET_RETENTION_PROPERTY}].retention.appliesTo = "issue" ORDER BY created ASC`,
+      jql: `issue.property[${TICKET_RETENTION_PROPERTY}].retention.appliesTo = "issue" ORDER BY key ASC`,
       maxResults: 100,
       fields: ['status'],
     };
