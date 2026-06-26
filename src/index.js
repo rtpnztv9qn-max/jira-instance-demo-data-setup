@@ -1,5 +1,6 @@
 import Resolver from '@forge/resolver';
 import api, { assumeTrustedRoute, fetch as forgeFetch, route } from '@forge/api';
+import { kvs } from '@forge/kvs';
 import {
   buildRealisticAssigneeIndex,
   createLifecycleForIssue,
@@ -2330,6 +2331,28 @@ async function createJSMProject(name, leadAccountId, keyPrefix, diagnostics = []
     });
   } catch (err) {
     const message = String(err?.message || '');
+    if (isProjectNameCollisionMessage(message)) {
+      const retryName = `${name} ${createRunLabel()}`;
+      diagnostics.push(`${serviceTypeLabel}: Jira reported that project name "${name}" already exists; retrying with unique name "${retryName}".`);
+      project = await createProjectWithRetries({
+        name: retryName,
+        leadAccountId,
+        keyPrefix,
+        projectTypeKey: 'service_desk',
+        maxAttempts: 10,
+        templateKeys,
+        allowTemplateOmission: false,
+        diagnostics,
+        serviceTypeLabel,
+      });
+      return {
+        ...project,
+        serviceDeskAvailable: true,
+        projectTypeKey: 'service_desk',
+        jsmServiceType,
+      };
+    }
+
     const canUseCompatibilityProject = /invalid project type|project template specified does not exist|template.*does not exist/i.test(message);
     if (!canUseCompatibilityProject) {
       throw err;
@@ -4288,9 +4311,9 @@ async function createProjectWithRetries({ name, leadAccountId, keyPrefix, projec
             sawTemplateError = sawTemplateError || err.message.includes('project template specified does not exist');
             sawKeyCollision = sawKeyCollision
               || err.message.includes('"projectKey"')
+              || isProjectNameCollisionMessage(err.message)
               || lowerMessage.includes('uses this project key')
-              || lowerMessage.includes('project with that name already exists')
-              || lowerMessage.includes('"projectname"');
+              || lowerMessage.includes('"projectkey"');
             sawProjectTypeError = sawProjectTypeError || lowerMessage.includes('invalid project type') || lowerMessage.includes('"projecttype"');
             errors.push(err.message);
             console.warn('Project create attempt failed', JSON.stringify({
@@ -9143,6 +9166,7 @@ function normalisePayload(payload) {
     productDiscoveryProjects,
     productDiscoveryProjectCount: productDiscoveryProjects.length,
     softwareProjects,
+    agentFastMode: Boolean(payload.agentFastMode),
     aiGeneratedContent: payload.aiGeneratedContent || null,
     softwareProjectCount: softwareProjects.length,
     softwareTemplate: softwareProjects[0]?.softwareTemplate || softwareTemplate,
@@ -9156,6 +9180,306 @@ function normalisePayload(payload) {
     ),
     retentionPeriodDays: ACTIVE_TICKET_RETENTION_DAYS,
     filterId: null,
+  };
+}
+
+const AGENT_DOMAIN_ALIASES = [
+  ['Energy & Utilities', ['energy utilities', 'energy and utilities', 'utilities', 'energy']],
+  ['Public Sector', ['public sector', 'government']],
+  ['Banking', ['banking', 'bank', 'finance domain']],
+  ['Healthcare', ['healthcare', 'health care', 'hospital', 'patient']],
+  ['Insurance', ['insurance']],
+  ['Telecom', ['telecom', 'telecommunication', 'telecommunications']],
+  ['Retail', ['retail']],
+  ['Manufacturing', ['manufacturing']],
+  ['SaaS', ['saas', 'software as a service']],
+  ['Education', ['education', 'university', 'school']],
+];
+const AGENT_RUN_KEY_PREFIX = 'agent-demo-run:';
+const AGENT_RUN_STEP_BATCH_LIMIT = 1;
+const AGENT_RUN_TIME_BUDGET_MS = 45000;
+
+function createAgentRunToken() {
+  const randomPart = Math.random().toString(36).slice(2, 10);
+  return `${Date.now().toString(36)}-${randomPart}`;
+}
+
+function getAgentRunStorageKey(runToken) {
+  return `${AGENT_RUN_KEY_PREFIX}${String(runToken || '').trim()}`;
+}
+
+function createAgentProgressMessage(job) {
+  const current = Math.min(job.nextStepIndex || 0, job.totalSteps || 0);
+  return `${job.environmentName} demo environment creation is in progress: ${current} of ${job.totalSteps || 0} steps completed.`;
+}
+
+function createAgentEnvironmentName(domain) {
+  return `${String(domain || 'Demo').trim() || 'Demo'} Demo ${createRunLabel()}`;
+}
+
+function isProjectNameCollisionMessage(message) {
+  const value = String(message || '');
+  const lower = value.toLowerCase();
+  return value.includes('"projectName"')
+    || lower.includes('"projectname"')
+    || lower.includes('project with that name already exists')
+    || lower.includes('project name already exists');
+}
+
+function getAgentRequestText(payload = {}) {
+  return [
+    payload.request,
+    payload.domain,
+    payload.spaceType,
+    payload.softwareTemplate,
+    payload.projectManagement,
+    payload.businessSpaceType,
+    payload.dateRange,
+    payload.volumeProjectKeys,
+  ].filter(Boolean).map(String).join(' ').trim();
+}
+
+function textIncludesAny(text, values) {
+  const normalized = String(text || '').toLowerCase();
+  return values.some(value => normalized.includes(String(value || '').toLowerCase()));
+}
+
+function inferAgentDomain(payload = {}, requestText = '') {
+  const explicit = String(payload.domain || payload.industry || '').trim();
+  if (explicit && !['other', 'others'].includes(explicit.toLowerCase())) {
+    return explicit;
+  }
+
+  const normalized = String(requestText || '').toLowerCase();
+  const match = AGENT_DOMAIN_ALIASES.find(([, aliases]) => aliases.some(alias => normalized.includes(alias)));
+  return match?.[0] || '';
+}
+
+function inferAgentDateRange(payload = {}, requestText = '') {
+  const explicit = String(payload.dateRange || '').trim();
+  if (explicit) {
+    return explicit;
+  }
+
+  if (textIncludesAny(requestText, ['1 year', 'one year', '12 months', 'twelve months'])) {
+    return '1 year';
+  }
+
+  if (textIncludesAny(requestText, ['3 months', 'three months', 'quarter'])) {
+    return '3 months';
+  }
+
+  return '6 months';
+}
+
+function inferAgentProjectManagement(payload = {}, requestText = '') {
+  const explicit = String(payload.projectManagement || payload.softwareProjectStyle || '').trim();
+  if (explicit) {
+    return normaliseProjectManagementStyle(explicit);
+  }
+
+  if (textIncludesAny(requestText, ['company managed', 'company-managed', 'company manager'])) {
+    return 'company-managed';
+  }
+
+  return 'team-managed';
+}
+
+function inferAgentSoftwareTemplate(payload = {}, requestText = '') {
+  const explicit = String(payload.softwareTemplate || '').trim();
+  if (explicit) {
+    return normaliseSoftwareTemplate(explicit);
+  }
+
+  if (textIncludesAny(requestText, ['bug tracking', 'bug-tracking', 'defect tracking'])) {
+    return 'bug-tracking';
+  }
+
+  if (textIncludesAny(requestText, ['kanban'])) {
+    return 'kanban';
+  }
+
+  if (textIncludesAny(requestText, ['scrum', 'sprint'])) {
+    return 'scrum';
+  }
+
+  return '';
+}
+
+function inferAgentJsmServiceType(payload = {}, requestText = '') {
+  const explicit = String(payload.serviceType || payload.spaceType || '').trim().replace(/^jsm:/i, '');
+  if (explicit && JSM_SERVICE_TYPES.some(type => type.toLowerCase() === explicit.toLowerCase())) {
+    return normaliseJsmServiceType(explicit);
+  }
+
+  if (textIncludesAny(requestText, ['hrsm', 'hr service', 'human resource'])) return 'HRSM';
+  if (textIncludesAny(requestText, ['csm', 'customer service'])) return 'CSM';
+  if (textIncludesAny(requestText, ['fsm', 'facilities', 'facility'])) return 'FSM';
+  if (textIncludesAny(requestText, ['lsm', 'legal service'])) return 'LSM';
+  if (textIncludesAny(requestText, ['itsm', 'it service', 'service management', 'incident', 'change request', 'problem request'])) return 'ITSM';
+
+  return '';
+}
+
+function inferAgentBusinessSpaceType(payload = {}, requestText = '') {
+  const explicit = String(payload.businessSpaceType || payload.spaceType || '').trim().toLowerCase().replace(/^business:/, '');
+  if (explicit && BUSINESS_SPACE_TYPES.includes(explicit)) {
+    return normaliseBusinessSpaceType(explicit);
+  }
+
+  if (textIncludesAny(requestText, ['budget planning', 'budget-planning', 'finance planning'])) {
+    return 'budget-planning';
+  }
+
+  if (textIncludesAny(requestText, ['procurement', 'procurement management', 'procurement-management'])) {
+    return 'procurement-management';
+  }
+
+  if (textIncludesAny(requestText, ['task tracking', 'task-tracking', 'work management', 'business project'])) {
+    return 'task-tracking';
+  }
+
+  return '';
+}
+
+function extractAgentProjectKeys(payload = {}) {
+  const explicit = Array.isArray(payload.volumeProjectKeys)
+    ? payload.volumeProjectKeys
+    : String(payload.volumeProjectKeys || payload.request || '').split(/[,\s]+/);
+  return explicit
+    .map(value => String(value || '').trim().toUpperCase())
+    .filter(value => /^[A-Z][A-Z0-9]{1,9}$/.test(value));
+}
+
+function buildAgentDashboardDefaults({ jsmServiceTypes, softwareProjects, businessProjects, productDiscoveryProjects }) {
+  const softwareSelections = softwareProjects.map(project => {
+    const template = normaliseSoftwareTemplate(project.softwareTemplate);
+    return {
+      value: `${template}-software-dashboard`,
+      title: `${getSoftwareTemplateLabel(template)} Dashboard`,
+      prompt: `Project-level dashboard for a Jira Software ${getSoftwareTemplateLabel(template)} project. Show open work, delivery progress, releases, defects, dependencies, and work needing attention.`,
+    };
+  });
+
+  return {
+    opsDashboardSelections: jsmServiceTypes.length > 0
+      ? [{
+          value: 'default',
+          title: 'Service Management Dashboard',
+          prompt: 'Service management dashboard showing open work, priority mix, SLA or aging risk, created vs resolved trend, request queues, and workload.',
+        }]
+      : [],
+    opsDashboardTypes: jsmServiceTypes.length > 0 ? ['default'] : [],
+    opsDashboardPrompt: jsmServiceTypes.length > 0 ? 'Service management dashboard showing operational health and work needing attention.' : '',
+    softwareDashboardSelections: softwareSelections,
+    softwareDashboardTypes: softwareSelections.map(selection => selection.value),
+    softwareDashboardPrompt: softwareSelections.map(selection => selection.prompt).join('\n'),
+    businessDashboardSelections: businessProjects.map(project => getBusinessProjectDashboardSelection(project.businessSpaceType)),
+    businessDashboardTypes: businessProjects.map(project => getBusinessProjectDashboardSelection(project.businessSpaceType).value),
+    businessDashboardPrompt: businessProjects.map(project => getBusinessProjectDashboardSelection(project.businessSpaceType).prompt).join('\n'),
+    productDiscoveryDashboardSelections: productDiscoveryProjects.length > 0 ? [getProductDiscoveryDashboardSelection()] : [],
+    productDiscoveryDashboardTypes: productDiscoveryProjects.length > 0 ? ['product-discovery-dashboard'] : [],
+    productDiscoveryDashboardPrompt: productDiscoveryProjects.length > 0 ? getProductDiscoveryDashboardSelection().prompt : '',
+  };
+}
+
+function buildAgentDemoEnvironmentPayload(payload = {}) {
+  const requestText = getAgentRequestText(payload);
+  const domain = inferAgentDomain(payload, requestText);
+  const addVolume = Boolean(payload.addVolume || textIncludesAny(requestText, ['add volume', 'more volume', 'existing project', 'existing projects']));
+  const volumeProjectKeys = extractAgentProjectKeys(payload);
+
+  if (!domain) {
+    return {
+      ready: false,
+      question: 'Which domain should I use for the demo environment? For example: Banking, Healthcare, Retail, Insurance, Telecom, SaaS, Manufacturing, Public Sector, Education, or Energy & Utilities.',
+      missingFields: ['domain'],
+    };
+  }
+
+  if (addVolume && volumeProjectKeys.length === 0) {
+    return {
+      ready: false,
+      question: 'Which existing Jira project key or keys should receive additional demo volume?',
+      missingFields: ['volumeProjectKeys'],
+    };
+  }
+
+  const projectCount = normalisePositiveInteger(payload.projectCount, 1, 1, 10);
+  const softwareTemplate = inferAgentSoftwareTemplate(payload, requestText);
+  const jsmServiceType = inferAgentJsmServiceType(payload, requestText);
+  const businessSpaceType = inferAgentBusinessSpaceType(payload, requestText);
+  const wantsProductDiscovery = textIncludesAny(requestText, ['product discovery', 'jpd']);
+
+  if (wantsProductDiscovery && !addVolume) {
+    return {
+      ready: false,
+      question: 'Jira Product Discovery spaces must be created in Jira first. Share the existing Product Discovery project key if you want me to add demo ideas as volume.',
+      missingFields: ['volumeProjectKeys'],
+    };
+  }
+
+  if (!softwareTemplate && !jsmServiceType && !businessSpaceType && !addVolume) {
+    return {
+      ready: false,
+      question: 'Which Jira space should I create: ITSM, HRSM, CSM, FSM, LSM, Scrum, Kanban, Bug Tracking, Task Tracking, Budget Planning, or Procurement Management?',
+      missingFields: ['spaceType'],
+    };
+  }
+
+  const softwareProjectStyle = inferAgentProjectManagement(payload, requestText);
+  const jsmServiceTypes = jsmServiceType ? Array.from({ length: projectCount }, () => jsmServiceType) : [];
+  const softwareProjects = softwareTemplate
+    ? Array.from({ length: projectCount }, () => ({
+        softwareTemplate,
+        softwareProjectStyle: softwareTemplate === 'bug-tracking' ? '' : softwareProjectStyle,
+        issuesPerProject: DEFAULT_SOFTWARE_ISSUES_PER_PROJECT,
+      }))
+    : [];
+  const businessProjects = businessSpaceType
+    ? Array.from({ length: projectCount }, () => ({
+        projectKey: '',
+        businessSpaceType,
+        issuesPerProject: DEFAULT_SOFTWARE_ISSUES_PER_PROJECT,
+      }))
+    : [];
+  const productDiscoveryProjects = [];
+  const dashboardDefaults = buildAgentDashboardDefaults({
+    jsmServiceTypes,
+    softwareProjects,
+    businessProjects,
+    productDiscoveryProjects,
+  });
+
+  return {
+    ready: true,
+    config: {
+      industry: domain,
+      customIndustry: '',
+      isCustomIndustry: false,
+      environmentName: createAgentEnvironmentName(domain),
+      reuseExistingDomainData: true,
+      addVolumeToExistingDomainData: addVolume,
+      volumeProjectKeys,
+      ...dashboardDefaults,
+      dateRange: inferAgentDateRange(payload, requestText),
+      jsmProjectCount: jsmServiceTypes.length,
+      jsmServiceTypes,
+      incidentRequestsPerProject: DEFAULT_SOFTWARE_ISSUES_PER_PROJECT,
+      problemRequestsPerProject: DEFAULT_SOFTWARE_ISSUES_PER_PROJECT,
+      changeRequestsPerProject: DEFAULT_SOFTWARE_ISSUES_PER_PROJECT,
+      serviceRequestsPerProject: DEFAULT_SOFTWARE_ISSUES_PER_PROJECT,
+      softwareProjects,
+      businessProjects,
+      productDiscoveryProjects,
+      agentFastMode: false,
+      softwareProjectCount: softwareProjects.length,
+      softwareTemplate: softwareProjects[0]?.softwareTemplate || 'scrum',
+      softwareProjectStyle: softwareProjects[0]?.softwareProjectStyle || 'team-managed',
+      issuesPerProject: DEFAULT_SOFTWARE_ISSUES_PER_PROJECT,
+      sprintsPerProject: 6,
+      retentionPeriodDays: ACTIVE_TICKET_RETENTION_DAYS,
+    },
   };
 }
 
@@ -9220,6 +9544,7 @@ function createChunkedExecutionState(accountId) {
 function buildChunkedExecutionPlan(config) {
   const content = getConfiguredContent(config);
   const runSeed = config.runSeed || Date.now();
+  const projectNameDomain = config.environmentName || config.industry;
   const steps = [{
     type: 'generate-ai-content',
     label: 'Generate AI demo content',
@@ -9233,7 +9558,7 @@ function buildChunkedExecutionPlan(config) {
       type: 'create-business-project',
       projectIndex,
       jsmServiceType,
-      projectName: createDomainProjectName(config.industry, 'business', projectIndex, { serviceType: jsmServiceType }),
+      projectName: createDomainProjectName(projectNameDomain, 'business', projectIndex, { serviceType: jsmServiceType }),
       projectKeyPrefix: deriveRunProjectKeyPrefix({ ...config, runSeed }, config.industry, projectIndex),
       label: `Find or create JSM ${jsmServiceType} project ${projectIndex + 1} of ${config.jsmProjectCount}`,
     });
@@ -9278,7 +9603,7 @@ function buildChunkedExecutionPlan(config) {
     steps.push({
       type: 'create-work-management-project-shell',
       projectIndex,
-      projectName: createDomainProjectName(config.industry, 'business-project', projectIndex, businessProjectConfig),
+      projectName: createDomainProjectName(projectNameDomain, 'business-project', projectIndex, businessProjectConfig),
       projectKeyPrefix: deriveRunProjectKeyPrefix({ ...config, runSeed }, config.industry, globalIndex),
       label: `Find or create ${businessCategoryLabel} ${getBusinessSpaceTypeLabel(businessProjectConfig.businessSpaceType)} space ${projectIndex + 1} of ${config.businessProjectCount}`,
     });
@@ -9316,7 +9641,7 @@ function buildChunkedExecutionPlan(config) {
     steps.push({
       type: 'create-product-discovery-project-shell',
       projectIndex,
-      projectName: createDomainProjectName(config.industry, 'product-discovery', projectIndex, productDiscoveryProjectConfig),
+      projectName: createDomainProjectName(projectNameDomain, 'product-discovery', projectIndex, productDiscoveryProjectConfig),
       projectKeyPrefix: deriveRunProjectKeyPrefix({ ...config, runSeed }, config.industry, globalIndex),
       label: `Use existing Jira Product Discovery space ${projectIndex + 1} of ${config.productDiscoveryProjectCount}`,
     });
@@ -9354,7 +9679,7 @@ function buildChunkedExecutionPlan(config) {
     steps.push({
       type: 'create-software-project-shell',
       projectIndex,
-      projectName: createDomainProjectName(config.industry, 'software', projectIndex, softwareProjectConfig),
+      projectName: createDomainProjectName(projectNameDomain, 'software', projectIndex, softwareProjectConfig),
       projectKeyPrefix: deriveRunProjectKeyPrefix({ ...config, runSeed }, config.industry, projectIndex + config.jsmProjectCount + config.businessProjectCount + config.productDiscoveryProjectCount),
       label: `Find or create software project ${projectIndex + 1} of ${config.softwareProjectCount}`,
     });
@@ -9523,10 +9848,12 @@ function buildChunkedExecutionPlan(config) {
       }
     };
 
-    addGitHubActivitySteps('jsm', config.jsmProjectCount, 'Create GitHub demo activity for JSM project');
-    addGitHubActivitySteps('business', config.businessProjectCount, 'Create GitHub demo activity for business space');
-    addGitHubActivitySteps('product-discovery', config.productDiscoveryProjectCount, 'Create GitHub demo activity for Product Discovery space');
-    addGitHubActivitySteps('software', config.softwareProjectCount, 'Create GitHub demo activity for software project');
+    if (!config.agentFastMode) {
+      addGitHubActivitySteps('jsm', config.jsmProjectCount, 'Create GitHub demo activity for JSM project');
+      addGitHubActivitySteps('business', config.businessProjectCount, 'Create GitHub demo activity for business space');
+      addGitHubActivitySteps('product-discovery', config.productDiscoveryProjectCount, 'Create GitHub demo activity for Product Discovery space');
+      addGitHubActivitySteps('software', config.softwareProjectCount, 'Create GitHub demo activity for software project');
+    }
 
     if (isRestDatePatchMode()) {
       steps.push({
@@ -9682,12 +10009,13 @@ function buildChunkedExecutionPlan(config) {
       label: `Create dashboard shell for ${target.label}`,
     });
 
-    for (let gadgetIndex = 0; gadgetIndex < MANAGED_DASHBOARD_GADGET_SLOT_COUNT; gadgetIndex++) {
+    const dashboardGadgetCount = config.agentFastMode ? 2 : MANAGED_DASHBOARD_GADGET_SLOT_COUNT;
+    for (let gadgetIndex = 0; gadgetIndex < dashboardGadgetCount; gadgetIndex++) {
       steps.push({
         type: 'create-dashboard-gadget',
         ...target,
         gadgetIndex,
-        label: `Configure dashboard gadget ${gadgetIndex + 1} of ${MANAGED_DASHBOARD_GADGET_SLOT_COUNT} for ${target.label}`,
+        label: `Configure dashboard gadget ${gadgetIndex + 1} of ${dashboardGadgetCount} for ${target.label}`,
       });
     }
   }
@@ -9787,7 +10115,7 @@ async function executeBusinessProjectStep(config, state, step) {
     state.results.jsmProjects[step.projectIndex] = {
       id: project.id,
       key: project.key,
-      name: existingProject?.name || projectName,
+      name: existingProject?.name || project.name || projectName,
       serviceDeskAvailable: project.serviceDeskAvailable !== false,
       projectTypeKey: project.projectTypeKey || 'service_desk',
       compatibilityMode: project.compatibilityMode || null,
@@ -10469,7 +10797,7 @@ function chooseWorkManagementComponentNames(project, issueIndex) {
 
 async function executeWorkManagementProjectStep(config, state, step) {
   const projectConfig = getBusinessProjectConfig(config, step.projectIndex);
-  const projectName = step.projectName || createDomainProjectName(config.industry, 'business-project', step.projectIndex, projectConfig);
+  const projectName = step.projectName || createDomainProjectName(config.environmentName || config.industry, 'business-project', step.projectIndex, projectConfig);
   const projectKeyPrefix = step.projectKeyPrefix || deriveRunProjectKeyPrefix(config, config.industry, step.projectIndex + config.jsmProjectCount);
   const businessSpaceType = normaliseBusinessSpaceType(projectConfig.businessSpaceType);
   const businessCategoryLabel = getBusinessSpaceCategoryLabel(businessSpaceType);
@@ -10530,7 +10858,7 @@ async function executeWorkManagementProjectStep(config, state, step) {
 
 async function executeProductDiscoveryProjectStep(config, state, step) {
   const projectConfig = getProductDiscoveryProjectConfig(config, step.projectIndex);
-  const projectName = step.projectName || createDomainProjectName(config.industry, 'product-discovery', step.projectIndex, projectConfig);
+  const projectName = step.projectName || createDomainProjectName(config.environmentName || config.industry, 'product-discovery', step.projectIndex, projectConfig);
 
   try {
     addChunkedDiagnostics(state, ['Product Discovery: using an existing native Jira Product Discovery space selected for volume.']);
@@ -13399,6 +13727,317 @@ resolver.define('repairDevelopmentScreensForProject', async ({ payload }) => {
   }
 });
 
+async function executeDemoEnvironmentStepCore(config, state, step) {
+  switch (step.type) {
+    case 'generate-ai-content':
+      return await executeAiContentGenerationStep(config, state);
+    case 'generate-worker-dataset':
+      await executeWorkerDatasetGenerationStep(config, state);
+      break;
+    case 'generate-worker-date-patch':
+      await executeWorkerDatePatchGenerationStep(config, state);
+      break;
+    case 'create-business-project':
+      await executeBusinessProjectStep(config, state, step);
+      break;
+    case 'configure-business-date-fields':
+      await executeBusinessDateFieldStep(state, step);
+      break;
+    case 'create-business-form':
+      await executeBusinessFormStep(config, state, step);
+      break;
+    case 'configure-itsm-foundation':
+      await executeItsmFoundationStep(config, state, step);
+      break;
+    case 'create-business-incidents-batch':
+      await executeBusinessIncidentBatchStep(config, state, step);
+      break;
+    case 'create-work-management-project-shell':
+      await executeWorkManagementProjectStep(config, state, step);
+      break;
+    case 'configure-work-management-date-fields': {
+      const businessProjectConfig = getBusinessProjectConfig(config, step.projectIndex);
+      await executeGenericProjectDateFieldStep(state, step, 'businessProjects', `${getBusinessSpaceCategoryLabel(businessProjectConfig.businessSpaceType)} space`);
+      break;
+    }
+    case 'create-work-management-components':
+      await executeWorkManagementComponentsStep(config, state, step);
+      break;
+    case 'create-work-management-issues-batch':
+      await executeWorkManagementIssueBatchStep(config, state, step);
+      break;
+    case 'create-product-discovery-project-shell':
+      await executeProductDiscoveryProjectStep(config, state, step);
+      break;
+    case 'configure-product-discovery-date-fields':
+      await executeGenericProjectDateFieldStep(state, step, 'productDiscoveryProjects', 'Product Discovery space');
+      break;
+    case 'create-product-discovery-components':
+      await executeProductDiscoveryComponentsStep(config, state, step);
+      break;
+    case 'create-product-discovery-ideas-batch':
+      await executeProductDiscoveryIdeaBatchStep(config, state, step);
+      break;
+    case 'create-software-project-shell':
+      await executeSoftwareProjectStep(config, state, step);
+      break;
+    case 'configure-software-date-fields':
+      await executeSoftwareDateFieldStep(state, step);
+      break;
+    case 'create-software-form':
+      await executeSoftwareFormStep(config, state, step);
+      break;
+    case 'create-software-versions-batch':
+      await executeSoftwareVersionBatchStep(state, step);
+      break;
+    case 'create-software-components':
+      await executeSoftwareComponentsStep(config, state, step);
+      break;
+    case 'create-compass-components':
+      await executeCompassComponentsStep(config, state, step);
+      break;
+    case 'create-atlassian-goals':
+      await executeAtlassianGoalsStep(config, state, step);
+      break;
+    case 'create-software-epics-batch':
+      await executeSoftwareEpicBatchStep(config, state, step);
+      break;
+    case 'lookup-software-board':
+      await executeSoftwareBoardLookupStep(config, state, step);
+      break;
+    case 'create-software-issues-batch':
+      await executeSoftwareIssueBatchStep(config, state, step);
+      break;
+    case 'create-software-sprint':
+      await executeSoftwareSprintStep(config, state, step);
+      break;
+    case 'populate-kanban-board':
+      await executeKanbanBoardPopulationStep(config, state, step);
+      break;
+    case 'verify-bug-tracking-work':
+      await executeBugTrackingVerificationStep(config, state, step);
+      break;
+    case 'create-dependencies':
+      await executeDependencyStep(state, step);
+      break;
+    case 'create-github-development-activity':
+      await executeGitHubDevelopmentActivityStep(config, state, step);
+      break;
+    case 'create-planning-artifacts':
+      await executePlanningArtifactsStep(config, state);
+      break;
+    case 'prepare-dashboard-catalog':
+      await executeDashboardCatalogStep(config, state);
+      break;
+    case 'create-dashboard-shell':
+      await executeDashboardShellStep(config, state, step);
+      break;
+    case 'create-dashboard-gadget':
+      await executeDashboardGadgetStep(config, state, step);
+      break;
+    case 'finalize-dashboard':
+      await finalizeDashboardStep(state);
+      break;
+    default:
+      throw new Error(`Unknown execution step: ${step.type}`);
+  }
+
+  return config;
+}
+
+async function executeDemoEnvironmentStepCoreWithRetry({ config, state, step }) {
+  const retryableStepTypes = [
+    'create-business-project',
+    'create-software-project-shell',
+    'create-work-management-project-shell',
+    'create-product-discovery-project-shell',
+    'create-business-incidents-batch',
+    'create-software-issues-batch',
+    'create-work-management-issues-batch',
+    'create-product-discovery-ideas-batch',
+    'create-software-sprint',
+    'populate-kanban-board',
+    'create-dependencies',
+    'create-github-development-activity',
+  ];
+  const maxAttempts = retryableStepTypes.includes(step.type) ? 3 : 1;
+  let currentConfig = config;
+
+  for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
+    try {
+      currentConfig = await executeDemoEnvironmentStepCore(currentConfig, state, step);
+      return currentConfig;
+    } catch (err) {
+      const message = String(err?.message || '');
+      const isRetryable = /timed out|timeout|502|503|504|upstream_failure|upstream|temporarily unavailable/i.test(message);
+      if (!isRetryable || attempt >= maxAttempts) {
+        throw new Error(`${step.label || step.type} failed: ${err.message}`);
+      }
+      await wait(6000 * attempt);
+    }
+  }
+
+  return currentConfig;
+}
+
+export async function createDemoEnvironmentFromAgent(payload = {}, context = {}) {
+  console.log('createDemoEnvironmentFromAgent started', JSON.stringify({
+    payload,
+    accountId: context?.accountId || null,
+  }));
+
+  const suppliedRunToken = String(payload.runToken || '').trim();
+  let runToken = suppliedRunToken;
+  let job = null;
+
+  if (runToken) {
+    job = await kvs.get(getAgentRunStorageKey(runToken));
+    if (!job) {
+      return {
+        success: false,
+        needsInput: true,
+        question: 'I could not find that demo creation run anymore. Please send the demo request again so I can start a fresh run.',
+        missingFields: ['request'],
+      };
+    }
+  } else {
+    const request = buildAgentDemoEnvironmentPayload(payload);
+    if (!request.ready) {
+      return {
+        success: false,
+        needsInput: true,
+        question: request.question,
+        missingFields: request.missingFields,
+      };
+    }
+
+    const access = await validateAdminAccess();
+    if (!access.ok) {
+      return {
+        success: false,
+        needsInput: false,
+        summary: access.message,
+      };
+    }
+
+    let config = normalisePayload(request.config);
+    config.runSeed = config.runSeed || Date.now();
+
+    const readinessDiagnostics = [];
+    const productDiscoveryReadiness = await validateProductDiscoveryReadiness(config, readinessDiagnostics);
+    if (!productDiscoveryReadiness.ok) {
+      return {
+        success: false,
+        needsInput: false,
+        summary: [
+          productDiscoveryReadiness.message,
+          '',
+          'No demo resources were created.',
+          ...(readinessDiagnostics.length ? ['', 'Diagnostics:', ...readinessDiagnostics.map(line => `- ${line}`)] : []),
+        ].join('\n'),
+      };
+    }
+
+    const state = createChunkedExecutionState(access.accountId);
+    const plan = buildChunkedExecutionPlan(config);
+    runToken = createAgentRunToken();
+    job = {
+      config,
+      state,
+      plan,
+      nextStepIndex: 0,
+      totalSteps: plan.length,
+      environmentName: config.environmentName,
+      progressLog: [`Prepared ${plan.length} creation step(s) for ${config.environmentName}.`],
+      createdAt: new Date().toISOString(),
+      updatedAt: new Date().toISOString(),
+    };
+  }
+
+  let { config, state } = job;
+  const { plan } = job;
+  const startedAt = Date.now();
+  let stepsRunThisCall = 0;
+
+  try {
+    while (
+      job.nextStepIndex < plan.length
+      && stepsRunThisCall < AGENT_RUN_STEP_BATCH_LIMIT
+      && Date.now() - startedAt < AGENT_RUN_TIME_BUDGET_MS
+    ) {
+      const index = job.nextStepIndex;
+      const step = plan[index];
+      job.progressLog.push(`Step ${index + 1} of ${plan.length}: ${step.label || step.type}`);
+      config = await executeDemoEnvironmentStepCoreWithRetry({
+        config,
+        state,
+        step,
+      });
+      stepsRunThisCall += 1;
+      job.nextStepIndex = index + 1;
+      job.config = config;
+      job.state = state;
+      job.updatedAt = new Date().toISOString();
+      await kvs.set(getAgentRunStorageKey(runToken), job);
+    }
+
+    if (job.nextStepIndex < plan.length) {
+      return {
+        success: false,
+        needsInput: false,
+        needsContinuation: true,
+        runToken,
+        message: createAgentProgressMessage(job),
+        summary: [
+          createAgentProgressMessage(job),
+          'I have saved the run state. Continue by invoking the same action again with the returned runToken.',
+        ].join('\n'),
+        progressLog: job.progressLog.slice(-12),
+        completedSteps: job.nextStepIndex,
+        totalSteps: plan.length,
+      };
+    }
+
+    const result = buildChunkedSummary(config, state);
+    await kvs.delete(getAgentRunStorageKey(runToken));
+    return {
+      success: result.success,
+      needsInput: false,
+      needsContinuation: false,
+      runToken,
+      message: result.success
+        ? `${config.environmentName} demo environment created successfully.`
+        : `${config.environmentName} demo environment creation finished without creating resources.`,
+      summary: result.summary,
+      progressLog: job.progressLog,
+      completedSteps: plan.length,
+      totalSteps: plan.length,
+    };
+  } catch (err) {
+    job.config = config;
+    job.state = state;
+    job.updatedAt = new Date().toISOString();
+    job.lastError = err.message;
+    await kvs.set(getAgentRunStorageKey(runToken), job);
+    return {
+      success: false,
+      needsInput: false,
+      needsContinuation: false,
+      runToken,
+      message: `Demo environment creation failed: ${err.message}`,
+      summary: [
+        `Error: ${err.message}`,
+        '',
+        'Progress completed before the failure:',
+        ...job.progressLog.map(line => `- ${line}`),
+      ].join('\n'),
+      progressLog: job.progressLog,
+      completedSteps: job.nextStepIndex,
+      totalSteps: plan.length,
+    };
+  }
+}
+
 resolver.define('getProjectInsightsData', async ({ payload }) => {
   const projectKey = String(payload?.projectKey || '').trim();
 
@@ -14035,6 +14674,53 @@ resolver.define('prepareDemoEnvironment', async ({ payload }) => {
   };
 });
 
+resolver.define('prepareAgentDemoEnvironment', async ({ payload }) => {
+  console.log('prepareAgentDemoEnvironment started', JSON.stringify(payload));
+
+  const request = buildAgentDemoEnvironmentPayload(payload || {});
+  if (!request.ready) {
+    return {
+      success: false,
+      needsInput: true,
+      question: request.question,
+      missingFields: request.missingFields,
+    };
+  }
+
+  const config = normalisePayload(request.config);
+  config.runSeed = config.runSeed || Date.now();
+
+  const access = await validateAdminAccess();
+  if (!access.ok) {
+    return {
+      success: false,
+      summary: access.message,
+    };
+  }
+
+  const readinessDiagnostics = [];
+  const productDiscoveryReadiness = await validateProductDiscoveryReadiness(config, readinessDiagnostics);
+  if (!productDiscoveryReadiness.ok) {
+    return {
+      success: false,
+      summary: [
+        productDiscoveryReadiness.message,
+        '',
+        'No demo resources were created.',
+        ...(readinessDiagnostics.length ? ['', 'Diagnostics:', ...readinessDiagnostics.map(line => `- ${line}`)] : []),
+      ].join('\n'),
+    };
+  }
+
+  return {
+    success: true,
+    config,
+    plan: buildChunkedExecutionPlan(config),
+    state: createChunkedExecutionState(access.accountId),
+    message: `I understood this as ${config.industry} ${config.jsmServiceTypes?.[0] || config.softwareTemplate || 'demo'} environment. Starting setup now.`,
+  };
+});
+
 resolver.define('executeDemoEnvironmentStep', async ({ payload }) => {
   let config = normalisePayload(payload.config || {});
   const state = payload.state || createChunkedExecutionState(null);
@@ -14058,123 +14744,14 @@ resolver.define('executeDemoEnvironmentStep', async ({ payload }) => {
     gadgetIndex: step.gadgetIndex,
   }));
 
-  switch (step.type) {
-    case 'generate-ai-content':
-      config = await executeAiContentGenerationStep(config, state);
-      break;
-    case 'generate-worker-dataset':
-      await executeWorkerDatasetGenerationStep(config, state);
-      break;
-    case 'generate-worker-date-patch':
-      await executeWorkerDatePatchGenerationStep(config, state);
-      break;
-    case 'create-business-project':
-      await executeBusinessProjectStep(config, state, step);
-      break;
-    case 'configure-business-date-fields':
-      await executeBusinessDateFieldStep(state, step);
-      break;
-    case 'create-business-form':
-      await executeBusinessFormStep(config, state, step);
-      break;
-    case 'configure-itsm-foundation':
-      await executeItsmFoundationStep(config, state, step);
-      break;
-    case 'create-business-incidents-batch':
-      await executeBusinessIncidentBatchStep(config, state, step);
-      break;
-    case 'create-work-management-project-shell':
-      await executeWorkManagementProjectStep(config, state, step);
-      break;
-    case 'configure-work-management-date-fields': {
-      const businessProjectConfig = getBusinessProjectConfig(config, step.projectIndex);
-      await executeGenericProjectDateFieldStep(state, step, 'businessProjects', `${getBusinessSpaceCategoryLabel(businessProjectConfig.businessSpaceType)} space`);
-      break;
-    }
-    case 'create-work-management-components':
-      await executeWorkManagementComponentsStep(config, state, step);
-      break;
-    case 'create-work-management-issues-batch':
-      await executeWorkManagementIssueBatchStep(config, state, step);
-      break;
-    case 'create-product-discovery-project-shell':
-      await executeProductDiscoveryProjectStep(config, state, step);
-      break;
-    case 'configure-product-discovery-date-fields':
-      await executeGenericProjectDateFieldStep(state, step, 'productDiscoveryProjects', 'Product Discovery space');
-      break;
-    case 'create-product-discovery-components':
-      await executeProductDiscoveryComponentsStep(config, state, step);
-      break;
-    case 'create-product-discovery-ideas-batch':
-      await executeProductDiscoveryIdeaBatchStep(config, state, step);
-      break;
-    case 'create-software-project-shell':
-      await executeSoftwareProjectStep(config, state, step);
-      break;
-    case 'configure-software-date-fields':
-      await executeSoftwareDateFieldStep(state, step);
-      break;
-    case 'create-software-form':
-      await executeSoftwareFormStep(config, state, step);
-      break;
-    case 'create-software-versions-batch':
-      await executeSoftwareVersionBatchStep(state, step);
-      break;
-    case 'create-software-components':
-      await executeSoftwareComponentsStep(config, state, step);
-      break;
-    case 'create-compass-components':
-      await executeCompassComponentsStep(config, state, step);
-      break;
-    case 'create-atlassian-goals':
-      await executeAtlassianGoalsStep(config, state, step);
-      break;
-    case 'create-software-epics-batch':
-      await executeSoftwareEpicBatchStep(config, state, step);
-      break;
-    case 'lookup-software-board':
-      await executeSoftwareBoardLookupStep(config, state, step);
-      break;
-    case 'create-software-issues-batch':
-      await executeSoftwareIssueBatchStep(config, state, step);
-      break;
-    case 'create-software-sprint':
-      await executeSoftwareSprintStep(config, state, step);
-      break;
-    case 'populate-kanban-board':
-      await executeKanbanBoardPopulationStep(config, state, step);
-      break;
-    case 'verify-bug-tracking-work':
-      await executeBugTrackingVerificationStep(config, state, step);
-      break;
-    case 'create-dependencies':
-      await executeDependencyStep(state, step);
-      break;
-    case 'create-github-development-activity':
-      await executeGitHubDevelopmentActivityStep(config, state, step);
-      break;
-    case 'create-planning-artifacts':
-      await executePlanningArtifactsStep(config, state);
-      break;
-    case 'prepare-dashboard-catalog':
-      await executeDashboardCatalogStep(config, state);
-      break;
-    case 'create-dashboard-shell':
-      await executeDashboardShellStep(config, state, step);
-      break;
-    case 'create-dashboard-gadget':
-      await executeDashboardGadgetStep(config, state, step);
-      break;
-    case 'finalize-dashboard':
-      await finalizeDashboardStep(state);
-      break;
-    default:
-      return {
-        success: false,
-        message: `Unknown execution step: ${step.type}`,
-        state,
-      };
+  try {
+    config = await executeDemoEnvironmentStepCore(config, state, step);
+  } catch (err) {
+    return {
+      success: false,
+      message: err.message,
+      state,
+    };
   }
 
   console.log('executeDemoEnvironmentStep completed', JSON.stringify({

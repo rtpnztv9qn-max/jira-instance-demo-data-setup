@@ -35,6 +35,26 @@ const groupedSpaceTypeOptions = spaceTypeOptions.reduce((groups, option) => {
 }, {});
 const DEFAULT_DEMO_ISSUE_COUNT = 60;
 const PRODUCT_DISCOVERY_VOLUME_ONLY_MESSAGE = 'Jira Product Discovery spaces must be created from Jira UI on this site. The Forge app can add demo ideas to an existing native Product Discovery space selected with Volume, but it will not create a new Product Discovery space through REST because Jira can create an incomplete Polaris shell.';
+const agentActionOptions = [
+  { value: 'create', label: 'Create new space' },
+  { value: 'volume', label: 'Add volume' },
+  { value: 'delete', label: 'Delete demo space' },
+];
+const agentSpaceCategoryOptions = [
+  { value: 'jpd', label: 'Product Management' },
+  { value: 'business', label: 'Work Management' },
+  { value: 'jsm', label: 'Jira Service Management' },
+  { value: 'software', label: 'Jira Software Projects' },
+];
+const agentManagementOptions = [
+  { value: 'team-managed', label: 'Team-managed' },
+  { value: 'company-managed', label: 'Company-managed' },
+];
+const agentReviewOptions = [
+  { value: 'create-now', label: 'Create now' },
+  { value: 'add-another', label: 'Add another domain / space type' },
+  { value: 'start-over', label: 'Start over' },
+];
 
 const opsDashboardOptions = [
   {
@@ -2808,6 +2828,15 @@ function App() {
   const [result, setResult] = useState('');
   const [isSuccess, setIsSuccess] = useState(false);
   const [progress, setProgress] = useState('');
+  const [agentRequest, setAgentRequest] = useState('Create an ITSM demo environment for retail banking');
+  const [agentMessages, setAgentMessages] = useState([
+    {
+      role: 'agent',
+      text: 'Tell me what demo environment you want, or start with "create demo environment" and I will guide you.',
+    },
+  ]);
+  const [agentDraft, setAgentDraft] = useState({});
+  const [agentLoading, setAgentLoading] = useState(false);
   const [openDashboardPicker, setOpenDashboardPicker] = useState(null);
   const [domainInventory, setDomainInventory] = useState(null);
   const [domainInventoryLoading, setDomainInventoryLoading] = useState(false);
@@ -2971,6 +3000,420 @@ function App() {
     }
 
     throw new Error(`${step.label || step.type} failed: ${lastError?.message || 'Unknown error'}`);
+  };
+
+  const appendAgentMessage = (message) => {
+    setAgentMessages(messages => [...messages, message]);
+  };
+
+  const normalizeAgentText = (value) => String(value || '').trim().toLowerCase();
+
+  const inferAgentDomain = (text) => {
+    const normalized = normalizeAgentText(text);
+    return industries.find(industry => normalized.includes(industry.toLowerCase()))
+      || (normalized.includes('retail banking') ? 'Banking' : '')
+      || (normalized.includes('bank') ? 'Banking' : '')
+      || (normalized.includes('health') ? 'Healthcare' : '')
+      || (normalized.includes('insur') ? 'Insurance' : '')
+      || (normalized.includes('telecom') ? 'Telecom' : '')
+      || (normalized.includes('retail') ? 'Retail' : '')
+      || (normalized.includes('manufactur') ? 'Manufacturing' : '')
+      || (normalized.includes('saas') ? 'SaaS' : '')
+      || (normalized.includes('education') ? 'Education' : '')
+      || (normalized.includes('energy') || normalized.includes('utilities') ? 'Energy & Utilities' : '');
+  };
+
+  const inferAgentAction = (text) => {
+    const normalized = normalizeAgentText(text);
+    if (/delete|remove|clean/.test(normalized)) return 'delete';
+    if (/add volume|volume|more data|existing/.test(normalized)) return 'volume';
+    if (/create|new|demo environment|setup|set up/.test(normalized)) return 'create';
+    return '';
+  };
+
+  const inferAgentSpaceType = (text) => {
+    const normalized = normalizeAgentText(text);
+    if (normalized.includes('hrsm') || normalized.includes('hr service')) return 'jsm:HRSM';
+    if (normalized.includes('csm') || normalized.includes('customer service')) return 'jsm:CSM';
+    if (normalized.includes('fsm') || normalized.includes('facilit')) return 'jsm:FSM';
+    if (normalized.includes('lsm') || normalized.includes('legal')) return 'jsm:LSM';
+    if (normalized.includes('itsm') || normalized.includes('it service')) return 'jsm:ITSM';
+    if (normalized.includes('scrum')) return 'software:scrum';
+    if (normalized.includes('kanban')) return 'software:kanban';
+    if (normalized.includes('bug')) return 'software:bug-tracking';
+    if (normalized.includes('budget')) return 'business:budget-planning';
+    if (normalized.includes('procurement')) return 'business:procurement-management';
+    if (normalized.includes('task') || normalized.includes('work management')) return 'business:task-tracking';
+    if (normalized.includes('product discovery') || normalized.includes('jpd')) return 'jpd:product-discovery';
+    return '';
+  };
+
+  const inferAgentManagement = (text) => {
+    const normalized = normalizeAgentText(text);
+    if (normalized.includes('company')) return 'company-managed';
+    if (normalized.includes('team')) return 'team-managed';
+    return '';
+  };
+
+  const extractAgentProjectKeys = (text) => (
+    String(text || '')
+      .toUpperCase()
+      .split(/[\s,]+/)
+      .map(value => value.trim())
+      .filter(value => /^[A-Z][A-Z0-9]{1,9}$/.test(value))
+      .join(', ')
+  );
+
+  const getAgentSpaceCategory = (spaceType) => String(spaceType || '').split(':')[0] || '';
+
+  const getAgentOptionsForCategory = (category) => spaceTypeOptions
+    .filter(option => option.value.startsWith(`${category}:`))
+    .map(option => ({ value: option.value, label: option.label }));
+
+  const buildAgentRequestFromDraft = (draft) => {
+    const option = spaceTypeOptions.find(item => item.value === draft.spaceType);
+    return [
+      draft.action === 'volume' ? 'Add demo volume to' : draft.action === 'delete' ? 'Delete demo spaces for' : 'Create',
+      option?.label || draft.spaceType || 'demo environment',
+      'demo environment for',
+      draft.domain,
+      draft.management ? `using ${draft.management}` : '',
+      draft.volumeProjectKeys ? `project keys ${draft.volumeProjectKeys}` : '',
+    ].filter(Boolean).join(' ');
+  };
+
+  const describeAgentSelection = (draft, index = null) => {
+    const option = spaceTypeOptions.find(item => item.value === draft.spaceType);
+    const action = agentActionOptions.find(item => item.value === draft.action)?.label || 'Create new space';
+    const management = draft.management ? `, ${draft.management}` : '';
+    const keys = draft.volumeProjectKeys ? `, keys: ${draft.volumeProjectKeys}` : '';
+    return `${index === null ? '' : `${index + 1}. `}${draft.domain} - ${option?.group || 'Space'} - ${option?.label || draft.spaceType} - ${action}${management}${keys}`;
+  };
+
+  const getAgentReviewText = (selections = []) => [
+    'Please review what I understood:',
+    ...selections.map((selection, index) => describeAgentSelection(selection, index)),
+    '',
+    'Shall I create this now, or do you want to add another domain / space type?',
+  ].join('\n');
+
+  const inferAgentReviewAction = (text) => {
+    const normalized = normalizeAgentText(text);
+    if (/start over|restart|reset|clear/.test(normalized)) return 'start-over';
+    if (/add another|another|add more|one more|more space|more domain/.test(normalized)) return 'add-another';
+    if (/create now|proceed|continue|confirm|yes|run|start|create it|go ahead/.test(normalized)) return 'create-now';
+    return '';
+  };
+
+  const getNextAgentQuestion = (draft) => {
+    if (!draft.domain) {
+      return {
+        text: 'Which business domain should I use?',
+        options: industries.map(value => ({ value, label: value })),
+        field: 'domain',
+      };
+    }
+
+    if (!draft.spaceCategory && !draft.spaceType) {
+      return {
+        text: 'Select space type:',
+        options: agentSpaceCategoryOptions,
+        field: 'spaceCategory',
+      };
+    }
+
+    const category = draft.spaceCategory || getAgentSpaceCategory(draft.spaceType);
+    if (!draft.spaceType) {
+      const selectedGroupLabel = agentSpaceCategoryOptions.find(option => option.value === category)?.label || 'selected group';
+      return {
+        text: `Select the space type under ${selectedGroupLabel}:`,
+        options: getAgentOptionsForCategory(category),
+        field: 'spaceType',
+      };
+    }
+
+    if (!draft.action) {
+      return {
+        text: 'What do you want to do with this space?',
+        options: agentActionOptions,
+        field: 'action',
+      };
+    }
+
+    if ((draft.action === 'volume' || draft.action === 'delete') && !draft.volumeProjectKeys) {
+      return {
+        text: draft.action === 'delete'
+          ? 'Please enter the existing Jira project key or keys to delete.'
+          : 'Please enter the existing Jira project key or keys to add volume to.',
+        options: [],
+        field: 'volumeProjectKeys',
+      };
+    }
+
+    if (draft.spaceType === 'software:scrum' || draft.spaceType === 'software:kanban') {
+      if (!draft.management) {
+        return {
+          text: 'Should the Jira Software project be team-managed or company-managed?',
+          options: agentManagementOptions,
+          field: 'management',
+        };
+      }
+    }
+
+    return null;
+  };
+
+  const runAgentRequest = async (request) => {
+    appendAgentMessage({ role: 'agent', text: 'Understood. I am preparing the demo environment plan now.' });
+
+    const preparation = await invoke('prepareAgentDemoEnvironment', {
+      request,
+    });
+
+    if (preparation.needsInput) {
+      appendAgentMessage({ role: 'agent', text: preparation.question || 'I need one more detail before I can start.' });
+      return;
+    }
+
+    if (!preparation.success) {
+      appendAgentMessage({ role: 'agent', text: preparation.summary || 'I could not prepare the demo environment.' });
+      setResult(preparation.summary || 'Unable to prepare the demo environment.');
+      setIsSuccess(false);
+      return;
+    }
+
+    let currentConfig = preparation.config;
+    let currentState = preparation.state;
+    const totalSteps = preparation.plan.length;
+    appendAgentMessage({
+      role: 'agent',
+      text: `${preparation.message || 'Plan ready.'} I will run ${totalSteps} backend step${totalSteps === 1 ? '' : 's'} and show progress here.`,
+    });
+
+    for (let index = 0; index < totalSteps; index += 1) {
+      const step = preparation.plan[index];
+      const progressText = `Step ${index + 1} of ${totalSteps}: ${step.label}`;
+      setProgress(progressText);
+      appendAgentMessage({ role: 'agent', text: progressText });
+
+      const stepResult = await invokeDemoStepWithRetry({
+        currentConfig,
+        currentState,
+        step,
+      });
+
+      if (!stepResult.success) {
+        throw new Error(stepResult.message || 'A step failed during environment creation.');
+      }
+
+      currentConfig = stepResult.config || currentConfig;
+      currentState = stepResult.state;
+    }
+
+    setProgress('Finalizing summary...');
+    appendAgentMessage({ role: 'agent', text: 'Finalizing the environment summary and dashboard links.' });
+
+    const res = await invoke('finalizeDemoEnvironment', {
+      config: currentConfig,
+      state: currentState,
+    });
+
+    setProgress('');
+    setResult(res.summary);
+    setIsSuccess(res.success);
+    setAgentDraft({});
+    appendAgentMessage({
+      role: 'agent',
+      text: res.success
+        ? `Demo environment created successfully.\n\n${res.summary}`
+        : `The demo environment run finished, but Jira reported issues.\n\n${res.summary}`,
+    });
+  };
+
+  const runAgentSelections = async (selections = []) => {
+    for (let index = 0; index < selections.length; index += 1) {
+      const selection = selections[index];
+      appendAgentMessage({ role: 'agent', text: `Starting request ${index + 1} of ${selections.length}: ${describeAgentSelection(selection)}` });
+
+      if (selection.action === 'delete') {
+        const projectKeys = extractAgentProjectKeys(selection.volumeProjectKeys);
+        if (!projectKeys) {
+          appendAgentMessage({ role: 'agent', text: 'I could not find valid project keys to delete. Please start again with the project key.' });
+          continue;
+        }
+        const response = await invoke('deleteBusinessDomainProjects', {
+          projectKeys: projectKeys.split(/,\s*/).filter(Boolean),
+        });
+        setResult(response.summary || 'Delete request completed.');
+        setIsSuccess(Boolean(response.success));
+        appendAgentMessage({ role: 'agent', text: response.summary || 'Delete request completed.' });
+        continue;
+      }
+
+      await runAgentRequest(buildAgentRequestFromDraft(selection));
+    }
+    setAgentDraft({});
+  };
+
+  const continueAgentConversation = async (draft) => {
+    const nextQuestion = getNextAgentQuestion(draft);
+    if (nextQuestion) {
+      appendAgentMessage({
+        role: 'agent',
+        text: nextQuestion.text,
+        options: nextQuestion.options,
+        field: nextQuestion.field,
+      });
+      return;
+    }
+
+    const completedSelection = {
+      domain: draft.domain,
+      spaceCategory: draft.spaceCategory || getAgentSpaceCategory(draft.spaceType),
+      spaceType: draft.spaceType,
+      action: draft.action,
+      management: draft.management,
+      volumeProjectKeys: draft.volumeProjectKeys,
+    };
+    const selections = [...(draft.selections || []), completedSelection];
+    setAgentDraft({ selections });
+    appendAgentMessage({
+      role: 'agent',
+      text: getAgentReviewText(selections),
+      options: agentReviewOptions,
+      field: 'reviewAction',
+    });
+  };
+
+  const handleAgentOptionSelect = async (field, value, label) => {
+    if (agentLoading || loading) return;
+    setAgentLoading(true);
+    appendAgentMessage({ role: 'user', text: label || value });
+
+    if (field === 'reviewAction') {
+      try {
+        if (value === 'start-over') {
+          setAgentDraft({});
+          appendAgentMessage({
+            role: 'agent',
+            text: 'No problem. Let us start again. Which business domain should I use?',
+            options: industries.map(industry => ({ value: industry, label: industry })),
+            field: 'domain',
+          });
+        } else if (value === 'add-another') {
+          const selections = agentDraft.selections || [];
+          const nextDraft = { selections };
+          setAgentDraft(nextDraft);
+          appendAgentMessage({
+            role: 'agent',
+            text: 'Sure. Let us add another domain / space type. Which business domain should I use?',
+            options: industries.map(industry => ({ value: industry, label: industry })),
+            field: 'domain',
+          });
+        } else {
+          await runAgentSelections(agentDraft.selections || []);
+        }
+      } catch (err) {
+        const message = `Error: ${err.message}`;
+        setProgress('');
+        setResult(message);
+        setIsSuccess(false);
+        appendAgentMessage({ role: 'agent', text: message });
+      }
+      setAgentLoading(false);
+      return;
+    }
+
+    const nextDraft = {
+      ...agentDraft,
+      [field]: value,
+      ...(field === 'spaceType' ? { spaceCategory: getAgentSpaceCategory(value) } : {}),
+    };
+    setAgentDraft(nextDraft);
+    try {
+      await continueAgentConversation(nextDraft);
+    } catch (err) {
+      const message = `Error: ${err.message}`;
+      setProgress('');
+      setResult(message);
+      setIsSuccess(false);
+      appendAgentMessage({ role: 'agent', text: message });
+    }
+    setAgentLoading(false);
+  };
+
+  const handleAgentSubmit = async () => {
+    const request = agentRequest.trim();
+    if (!request || agentLoading || loading) {
+      return;
+    }
+
+    setAgentLoading(true);
+    setResult('');
+    setIsSuccess(false);
+    setProgress('');
+    appendAgentMessage({ role: 'user', text: request });
+
+    const pendingSelections = agentDraft.selections || [];
+    const reviewAction = pendingSelections.length > 0 ? inferAgentReviewAction(request) : '';
+    if (reviewAction) {
+      try {
+        if (reviewAction === 'start-over') {
+          setAgentDraft({});
+          appendAgentMessage({
+            role: 'agent',
+            text: 'No problem. Let us start again. Which business domain should I use?',
+            options: industries.map(industry => ({ value: industry, label: industry })),
+            field: 'domain',
+          });
+        } else if (reviewAction === 'add-another') {
+          const nextDraft = { selections: pendingSelections };
+          setAgentDraft(nextDraft);
+          appendAgentMessage({
+            role: 'agent',
+            text: 'Sure. Let us add another domain / space type. Which business domain should I use?',
+            options: industries.map(industry => ({ value: industry, label: industry })),
+            field: 'domain',
+          });
+        } else {
+          await runAgentSelections(pendingSelections);
+        }
+      } catch (err) {
+        const message = `Error: ${err.message}`;
+        setProgress('');
+        setResult(message);
+        setIsSuccess(false);
+        appendAgentMessage({ role: 'agent', text: message });
+      }
+      setAgentLoading(false);
+      return;
+    }
+
+    const inferredDraft = {
+      ...agentDraft,
+      domain: agentDraft.domain || inferAgentDomain(request),
+      action: agentDraft.action || inferAgentAction(request),
+      spaceType: agentDraft.spaceType || inferAgentSpaceType(request),
+      management: agentDraft.management || inferAgentManagement(request),
+      volumeProjectKeys: agentDraft.volumeProjectKeys
+        || ((agentDraft.action === 'volume' || agentDraft.action === 'delete') ? extractAgentProjectKeys(request) : ''),
+    };
+    if (inferredDraft.spaceType && !inferredDraft.spaceCategory) {
+      inferredDraft.spaceCategory = getAgentSpaceCategory(inferredDraft.spaceType);
+    }
+
+    try {
+      setAgentDraft(inferredDraft);
+      await continueAgentConversation(inferredDraft);
+    } catch (err) {
+      const message = `Error: ${err.message}`;
+      setProgress('');
+      setResult(message);
+      setIsSuccess(false);
+      appendAgentMessage({ role: 'agent', text: message });
+    }
+
+    setAgentLoading(false);
   };
 
   const handleSubmit = async ({ volumeOnly = false } = {}) => {
@@ -3830,6 +4273,87 @@ function App() {
         <div style={headerStyle}>
           <h1 style={titleStyle}>Jira Instance - Demo Data Setup</h1>
           <p style={{ ...subtitleStyle, fontStyle: 'italic' }}>Create the demo environment in minutes</p>
+        </div>
+        <div style={{ ...sectionStyle, marginTop: 0, borderColor: '#0052cc', backgroundColor: '#f4f8ff' }}>
+          <div style={sectionTitleStyle}>Demo Agent</div>
+          <div style={{ color: '#42526e', fontSize: '13px', marginBottom: '12px' }}>
+            Ask for the environment in plain English. The agent will ask for missing details, then run the full backend setup flow and show live progress.
+          </div>
+          <div style={{ display: 'grid', gap: '10px', marginBottom: '12px', maxHeight: '260px', overflowY: 'auto', paddingRight: '4px' }}>
+            {agentMessages.map((message, index) => (
+              <div
+                key={`agent-message-${index}`}
+                style={{
+                  justifySelf: message.role === 'user' ? 'end' : 'start',
+                  maxWidth: '86%',
+                  padding: '10px 12px',
+                  borderRadius: '8px',
+                  whiteSpace: 'pre-wrap',
+                  fontSize: '13px',
+                  lineHeight: '18px',
+                  color: message.role === 'user' ? '#ffffff' : '#172b4d',
+                  backgroundColor: message.role === 'user' ? '#0052cc' : '#ffffff',
+                  border: message.role === 'user' ? '1px solid #0052cc' : '1px solid #dfe1e6',
+                }}
+              >
+                {message.text}
+                {message.options?.length > 0 && (
+                  <div style={{ display: 'flex', gap: '8px', flexWrap: 'wrap', marginTop: '10px' }}>
+                    {message.options.map(option => (
+                      <button
+                        key={`${message.field}-${option.value}`}
+                        type="button"
+                        disabled={agentLoading || loading}
+                        onClick={() => handleAgentOptionSelect(message.field, option.value, option.label)}
+                        style={{
+                          border: '1px solid #0052cc',
+                          backgroundColor: '#ffffff',
+                          color: '#0052cc',
+                          borderRadius: '4px',
+                          padding: '7px 10px',
+                          fontSize: '12px',
+                          fontWeight: 700,
+                          cursor: agentLoading || loading ? 'not-allowed' : 'pointer',
+                          opacity: agentLoading || loading ? 0.6 : 1,
+                        }}
+                      >
+                        {option.label}
+                      </button>
+                    ))}
+                  </div>
+                )}
+              </div>
+            ))}
+          </div>
+          <div style={{ display: 'grid', gridTemplateColumns: 'minmax(0, 1fr) 150px', gap: '10px', alignItems: 'start' }}>
+            <textarea
+              value={agentRequest}
+              onChange={(event) => setAgentRequest(event.target.value)}
+              placeholder="Create an ITSM demo environment for retail banking"
+              rows={3}
+              disabled={agentLoading || loading}
+              style={{
+                ...inputStyle,
+                resize: 'vertical',
+                minHeight: '72px',
+                fontFamily: 'inherit',
+              }}
+            />
+            <button
+              type="button"
+              onClick={handleAgentSubmit}
+              disabled={agentLoading || loading || !agentRequest.trim()}
+              style={{
+                ...buttonStyle,
+                width: '150px',
+                padding: '12px 14px',
+                fontSize: '14px',
+                opacity: agentLoading || loading || !agentRequest.trim() ? 0.65 : 1,
+              }}
+            >
+              {agentLoading ? 'Running...' : 'Run agent'}
+            </button>
+          </div>
         </div>
         <div style={{ ...fieldStyle, display: 'grid', gridTemplateColumns: form.industry === 'Other' ? 'repeat(3, minmax(0, 1fr))' : 'repeat(2, minmax(0, 1fr))', gap: '16px', alignItems: 'end' }}>
           <div>

@@ -1,4 +1,84 @@
 modules:
+  rovo:agent:
+    - key: cprime-demo-environment-agent
+      name: Cprime Demo Agent
+      description: Creates Jira demo environments by asking for only the missing details.
+      prompt: resource:agent;prompts/demo-environment-agent.txt
+      conversationStarters:
+        - Create a healthcare scrum demo environment
+        - Create an ITSM demo environment for banking
+        - Add demo volume to existing projects
+      actions:
+        - create-demo-environment-from-chat
+        - continue-demo-environment-run
+  action:
+    - key: create-demo-environment-from-chat
+      name: Create demo environment
+      function: agent-create-demo
+      actionVerb: CREATE
+      description: Creates a Jira demo environment using the same backend flow as the Cprime demo data setup form.
+      inputs:
+        request:
+          title: User request
+          type: string
+          required: false
+          description: The user's natural-language request, including domain, space type, project type, management style, and any dashboard or volume instructions.
+        domain:
+          title: Domain
+          type: string
+          required: false
+          description: Business domain or industry, such as Banking, Healthcare, Retail, SaaS, Insurance, Telecom, Manufacturing, Public Sector, Education, or Energy & Utilities.
+        spaceType:
+          title: Space type
+          type: string
+          required: false
+          description: Requested Jira space type, such as ITSM, HRSM, CSM, FSM, LSM, scrum, kanban, bug-tracking, task-tracking, budget-planning, or procurement-management.
+        softwareTemplate:
+          title: Software template
+          type: string
+          required: false
+          description: Software template when creating a Jira Software project. Valid values are scrum, kanban, or bug-tracking.
+        projectManagement:
+          title: Project management
+          type: string
+          required: false
+          description: Team-managed or company-managed for scrum and kanban software projects.
+        businessSpaceType:
+          title: Business space type
+          type: string
+          required: false
+          description: Business project type, such as task-tracking, budget-planning, or procurement-management.
+        dateRange:
+          title: Ticket data duration
+          type: string
+          required: false
+          description: Historical data duration, such as 3 months, 6 months, or 1 year.
+        addVolume:
+          title: Add volume
+          type: boolean
+          required: false
+          description: True when the user wants to add demo volume to existing domain projects.
+        volumeProjectKeys:
+          title: Volume project keys
+          type: string
+          required: false
+          description: Comma-separated Jira project keys to receive additional demo volume.
+        runToken:
+          title: Run token
+          type: string
+          required: false
+          description: Internal continuation token returned by the action when the demo environment creation is still running.
+    - key: continue-demo-environment-run
+      name: Continue demo environment run
+      function: agent-create-demo
+      actionVerb: GET
+      description: Continues a demo environment creation run that was already approved and started.
+      inputs:
+        runToken:
+          title: Run token
+          type: string
+          required: true
+          description: Continuation token returned by the Create demo environment action.
   jira:globalPage:
     - key: cprime-demo-agent-page
       resource: main
@@ -34,6 +114,8 @@ modules:
   function:
     - key: resolver
       handler: index.handler
+    - key: agent-create-demo
+      handler: index.createDemoEnvironmentFromAgent
     - key: environment-cleanup
       handler: index.scheduledCleanup
   scheduledTrigger:
@@ -43,6 +125,8 @@ modules:
 resources:
   - key: main
     path: static/hello-world/build-itsm-required
+  - key: agent
+    path: resource/agent
 app:
   runtime:
     name: nodejs24.x
@@ -71,6 +155,7 @@ permissions:
     - write:component:compass
     - write:dev-info:jira
     - write:deployment-info:jira
+    - read:chat:rovo
     - storage:app
   external:
     fetch:
