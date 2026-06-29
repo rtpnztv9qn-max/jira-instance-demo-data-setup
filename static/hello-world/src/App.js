@@ -1,7 +1,7 @@
 import React, { useEffect, useState } from 'react';
 import { invoke, router, view } from '@forge/bridge';
 
-const industries = ['Banking', 'Healthcare', 'Insurance', 'Telecom', 'Retail', 'Manufacturing', 'SaaS', 'Public Sector', 'Education', 'Energy & Utilities'];
+const industries = ['Banking & Insurance', 'Healthcare', 'Telecom', 'Retail & E-commerce', 'Manufacturing & Energy Utilities', 'SaaS', 'Public Sector', 'Education'];
 const jsmServiceTypeOptions = ['ITSM', 'HRSM', 'CSM', 'FSM', 'LSM'];
 const jsmServiceTypeLabels = {
   ITSM: 'IT Service Management',
@@ -14,8 +14,10 @@ const jsmServiceTypeLabels = {
 };
 const spaceTypeOptions = [
   { value: 'jpd:product-discovery', label: 'Jira Product Discovery', group: 'Product Management' },
+  { value: 'business:project-management', label: 'Project Management', group: 'Work Management' },
   { value: 'business:task-tracking', label: 'Task Tracking', group: 'Work Management' },
   { value: 'business:budget-planning', label: 'Budget Planning', group: 'Work Management' },
+  { value: 'business:recruitment-tracking', label: 'Recruitment Tracking', group: 'Work Management' },
   { value: 'business:procurement-management', label: 'Procurement Management', group: 'Work Management' },
   { value: 'jsm:ITSM', label: 'IT Service Management', group: 'Jira Service Management' },
   { value: 'jsm:HRSM', label: 'HR Service Management', group: 'Jira Service Management' },
@@ -36,9 +38,9 @@ const groupedSpaceTypeOptions = spaceTypeOptions.reduce((groups, option) => {
 const DEFAULT_DEMO_ISSUE_COUNT = 60;
 const PRODUCT_DISCOVERY_VOLUME_ONLY_MESSAGE = 'Jira Product Discovery spaces must be created from Jira UI on this site. The Forge app can add demo ideas to an existing native Product Discovery space selected with Volume, but it will not create a new Product Discovery space through REST because Jira can create an incomplete Polaris shell.';
 const agentActionOptions = [
-  { value: 'create', label: 'Create new space' },
-  { value: 'volume', label: 'Add volume' },
+  { value: 'volume', label: 'Add volume to existing space' },
   { value: 'delete', label: 'Delete demo space' },
+  { value: 'create', label: 'Create new only if existing cannot fit' },
 ];
 const agentSpaceCategoryOptions = [
   { value: 'jpd', label: 'Product Management' },
@@ -3011,16 +3013,15 @@ function App() {
   const inferAgentDomain = (text) => {
     const normalized = normalizeAgentText(text);
     return industries.find(industry => normalized.includes(industry.toLowerCase()))
-      || (normalized.includes('retail banking') ? 'Banking' : '')
-      || (normalized.includes('bank') ? 'Banking' : '')
+      || (normalized.includes('retail banking') ? 'Banking & Insurance' : '')
+      || (normalized.includes('bank') || normalized.includes('insur') || normalized.includes('claims') ? 'Banking & Insurance' : '')
       || (normalized.includes('health') ? 'Healthcare' : '')
-      || (normalized.includes('insur') ? 'Insurance' : '')
       || (normalized.includes('telecom') ? 'Telecom' : '')
-      || (normalized.includes('retail') ? 'Retail' : '')
-      || (normalized.includes('manufactur') ? 'Manufacturing' : '')
+      || (normalized.includes('retail') || normalized.includes('commerce') ? 'Retail & E-commerce' : '')
+      || (normalized.includes('manufactur') || normalized.includes('energy') || normalized.includes('utilities') ? 'Manufacturing & Energy Utilities' : '')
       || (normalized.includes('saas') ? 'SaaS' : '')
       || (normalized.includes('education') ? 'Education' : '')
-      || (normalized.includes('energy') || normalized.includes('utilities') ? 'Energy & Utilities' : '');
+      || '';
   };
 
   const inferAgentAction = (text) => {
@@ -3041,7 +3042,9 @@ function App() {
     if (normalized.includes('scrum')) return 'software:scrum';
     if (normalized.includes('kanban')) return 'software:kanban';
     if (normalized.includes('bug')) return 'software:bug-tracking';
+    if (normalized.includes('project management')) return 'business:project-management';
     if (normalized.includes('budget')) return 'business:budget-planning';
+    if (normalized.includes('recruit')) return 'business:recruitment-tracking';
     if (normalized.includes('procurement')) return 'business:procurement-management';
     if (normalized.includes('task') || normalized.includes('work management')) return 'business:task-tracking';
     if (normalized.includes('product discovery') || normalized.includes('jpd')) return 'jpd:product-discovery';
@@ -3084,7 +3087,7 @@ function App() {
 
   const describeAgentSelection = (draft, index = null) => {
     const option = spaceTypeOptions.find(item => item.value === draft.spaceType);
-    const action = agentActionOptions.find(item => item.value === draft.action)?.label || 'Create new space';
+    const action = agentActionOptions.find(item => item.value === draft.action)?.label || 'Create new only if existing cannot fit';
     const management = draft.management ? `, ${draft.management}` : '';
     const keys = draft.volumeProjectKeys ? `, keys: ${draft.volumeProjectKeys}` : '';
     return `${index === null ? '' : `${index + 1}. `}${draft.domain} - ${option?.group || 'Space'} - ${option?.label || draft.spaceType} - ${action}${management}${keys}`;
@@ -3134,7 +3137,7 @@ function App() {
 
     if (!draft.action) {
       return {
-        text: 'What do you want to do with this space?',
+        text: 'What should I do first? I will prefer existing matching spaces; create new only when the current spaces cannot meet the need.',
         options: agentActionOptions,
         field: 'action',
       };
@@ -4329,7 +4332,7 @@ function App() {
             <textarea
               value={agentRequest}
               onChange={(event) => setAgentRequest(event.target.value)}
-              placeholder="Create an ITSM demo environment for retail banking"
+              placeholder="Create an ITSM demo for Banking & Insurance, reusing existing spaces first"
               rows={3}
               disabled={agentLoading || loading}
               style={{

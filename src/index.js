@@ -453,14 +453,20 @@ function buildDomainTerms(industry) {
   const normalised = label.toLowerCase();
   const termMap = {
     banking: ['core banking', 'payments', 'customer onboarding', 'fraud monitoring', 'regulatory reporting'],
+    'banking & insurance': ['core banking', 'claims intake', 'policy administration', 'payments', 'fraud monitoring'],
+    'banking insurance': ['core banking', 'claims intake', 'policy administration', 'payments', 'fraud monitoring'],
     healthcare: ['patient records', 'clinical workflow', 'lab integration', 'telehealth', 'pharmacy operations'],
     retail: ['checkout', 'inventory', 'order fulfilment', 'loyalty platform', 'returns processing'],
+    'retail & e commerce': ['checkout', 'inventory', 'order fulfilment', 'loyalty platform', 'returns processing'],
+    'retail e commerce': ['checkout', 'inventory', 'order fulfilment', 'loyalty platform', 'returns processing'],
     insurance: ['policy administration', 'claims intake', 'underwriting', 'premium billing', 'agent portal'],
     telecom: ['network provisioning', 'subscriber billing', 'service activation', 'outage monitoring', 'field operations'],
     'e commerce': ['cart checkout', 'catalog search', 'seller onboarding', 'warehouse fulfilment', 'payment capture'],
     ecommerce: ['cart checkout', 'catalog search', 'seller onboarding', 'warehouse fulfilment', 'payment capture'],
     saas: ['tenant provisioning', 'authentication', 'subscription billing', 'API gateway', 'usage analytics'],
     manufacturing: ['production line', 'quality inspection', 'supplier integration', 'inventory planning', 'maintenance alerts'],
+    'manufacturing & energy utilities': ['production line', 'energy monitoring', 'supplier integration', 'grid maintenance', 'predictive maintenance'],
+    'manufacturing energy utilities': ['production line', 'energy monitoring', 'supplier integration', 'grid maintenance', 'predictive maintenance'],
   };
   const terms = termMap[normalised] || [
     `${normalised} operations`,
@@ -2440,10 +2446,37 @@ async function saveProjectDemoDomainMetadata(project, metadata, diagnostics = []
   }
 }
 
+function getDomainSearchAliases(domain) {
+  const normalizedDomain = String(domain || '').trim().toLowerCase();
+  const aliasMap = {
+    'banking & insurance': ['Banking', 'Insurance', 'Bank', 'Claims', 'Policy'],
+    'banking insurance': ['Banking', 'Insurance', 'Bank', 'Claims', 'Policy'],
+    banking: ['Banking', 'Bank'],
+    insurance: ['Insurance', 'Claims', 'Policy'],
+    'manufacturing & energy utilities': ['Manufacturing', 'Energy', 'Utilities', 'Grid'],
+    'manufacturing energy utilities': ['Manufacturing', 'Energy', 'Utilities', 'Grid'],
+    manufacturing: ['Manufacturing'],
+    'energy & utilities': ['Energy', 'Utilities', 'Grid'],
+    'energy utilities': ['Energy', 'Utilities', 'Grid'],
+    'retail & e-commerce': ['Retail', 'E-commerce', 'Ecommerce', 'Commerce'],
+    'retail & e commerce': ['Retail', 'E-commerce', 'Ecommerce', 'Commerce'],
+    'retail e commerce': ['Retail', 'E-commerce', 'Ecommerce', 'Commerce'],
+    retail: ['Retail'],
+    ecommerce: ['E-commerce', 'Ecommerce', 'Commerce'],
+    'e commerce': ['E-commerce', 'Ecommerce', 'Commerce'],
+  };
+  const aliases = aliasMap[normalizedDomain] || [domain];
+  return Array.from(new Set(
+    aliases
+      .concat(domain)
+      .map(value => String(value || '').trim())
+      .filter(Boolean)
+  ));
+}
+
 function projectNameMatchesDomain(projectName, domain) {
   const normalizedName = String(projectName || '').toLowerCase();
-  const normalizedDomain = String(domain || '').trim().toLowerCase();
-  return Boolean(normalizedDomain && normalizedName.includes(normalizedDomain));
+  return getDomainSearchAliases(domain).some(alias => normalizedName.includes(alias.toLowerCase()));
 }
 
 function quoteJqlValue(value) {
@@ -2546,16 +2579,23 @@ function classifyDomainProject(project, metadata = null) {
 
 async function searchDomainProjects(domain, options = {}) {
   const requestedSpaceType = String(options.spaceType || '').trim();
-  const values = [];
+  const includeIssueCounts = options.includeIssueCounts !== false;
+  const valuesByKey = new Map();
   const maxResults = 50;
 
-  const response = await jiraGet(`/rest/api/3/project/search?query=${encodeURIComponent(domain)}&startAt=0&maxResults=${maxResults}&expand=insight`);
-  const pageValues = Array.isArray(response?.values) ? response.values : [];
-  values.push(...pageValues);
+  for (const query of getDomainSearchAliases(domain).slice(0, 4)) {
+    const response = await jiraGet(`/rest/api/3/project/search?query=${encodeURIComponent(query)}&startAt=0&maxResults=${maxResults}&expand=insight`);
+    const pageValues = Array.isArray(response?.values) ? response.values : [];
+    pageValues.forEach(project => {
+      if (project?.key && !valuesByKey.has(project.key)) {
+        valuesByKey.set(project.key, project);
+      }
+    });
+  }
 
   const projects = [];
 
-  for (const project of values) {
+  for (const project of valuesByKey.values()) {
     if (!projectNameMatchesDomain(project.name, domain)) {
       continue;
     }
@@ -2571,7 +2611,7 @@ async function searchDomainProjects(domain, options = {}) {
       continue;
     }
 
-    const liveIssueCount = await getIssueCountForProject(project.key);
+    const liveIssueCount = includeIssueCounts ? await getIssueCountForProject(project.key) : null;
     const issueCount = liveIssueCount ?? getProjectInsightIssueCount(project);
     projects.push({
       id: project.id,
@@ -8786,8 +8826,10 @@ const DEFAULT_SOFTWARE_ISSUES_PER_PROJECT = 60;
 const DEMO_DOMAIN_PROJECT_PROPERTY_KEY = 'cprimeDemoDomainSetup';
 const JSM_SERVICE_TYPES = ['ITSM', 'HRSM', 'CSM', 'FSM', 'LSM'];
 const BUSINESS_SPACE_TYPES = [
+  'project-management',
   'task-tracking',
   'budget-planning',
+  'recruitment-tracking',
   'procurement-management',
 ];
 
@@ -9184,14 +9226,12 @@ function normalisePayload(payload) {
 }
 
 const AGENT_DOMAIN_ALIASES = [
-  ['Energy & Utilities', ['energy utilities', 'energy and utilities', 'utilities', 'energy']],
+  ['Manufacturing & Energy Utilities', ['manufacturing energy utilities', 'manufacturing and energy', 'energy utilities', 'energy and utilities', 'utilities', 'energy', 'manufacturing']],
   ['Public Sector', ['public sector', 'government']],
-  ['Banking', ['banking', 'bank', 'finance domain']],
+  ['Banking & Insurance', ['banking insurance', 'banking and insurance', 'banking', 'bank', 'finance domain', 'insurance', 'claims', 'policy']],
   ['Healthcare', ['healthcare', 'health care', 'hospital', 'patient']],
-  ['Insurance', ['insurance']],
   ['Telecom', ['telecom', 'telecommunication', 'telecommunications']],
-  ['Retail', ['retail']],
-  ['Manufacturing', ['manufacturing']],
+  ['Retail & E-commerce', ['retail ecommerce', 'retail and ecommerce', 'retail', 'e-commerce', 'ecommerce', 'commerce']],
   ['SaaS', ['saas', 'software as a service']],
   ['Education', ['education', 'university', 'school']],
 ];
@@ -9331,8 +9371,16 @@ function inferAgentBusinessSpaceType(payload = {}, requestText = '') {
     return 'budget-planning';
   }
 
+  if (textIncludesAny(requestText, ['recruitment', 'recruitment tracking', 'recruitment-tracking', 'hiring'])) {
+    return 'recruitment-tracking';
+  }
+
   if (textIncludesAny(requestText, ['procurement', 'procurement management', 'procurement-management'])) {
     return 'procurement-management';
+  }
+
+  if (textIncludesAny(requestText, ['project management', 'project-management'])) {
+    return 'project-management';
   }
 
   if (textIncludesAny(requestText, ['task tracking', 'task-tracking', 'work management', 'business project'])) {
@@ -9349,6 +9397,64 @@ function extractAgentProjectKeys(payload = {}) {
   return explicit
     .map(value => String(value || '').trim().toUpperCase())
     .filter(value => /^[A-Z][A-Z0-9]{1,9}$/.test(value));
+}
+
+function agentRequestExplicitlyNeedsNewSpace(requestText) {
+  return textIncludesAny(requestText, [
+    'create new',
+    'new space',
+    'new project',
+    'fresh space',
+    'fresh project',
+    'separate space',
+    'separate project',
+    'existing cannot',
+    'existing can not',
+    'existing can\'t',
+    'cannot accommodate',
+    'can not accommodate',
+    'can\'t accommodate',
+    'do not reuse',
+    'don\'t reuse',
+  ]);
+}
+
+function getRequestedAgentSpaceTypeFromConfig(config = {}) {
+  if (Array.isArray(config.jsmServiceTypes) && config.jsmServiceTypes.length > 0) {
+    return `jsm:${normaliseJsmServiceType(config.jsmServiceTypes[0])}`;
+  }
+
+  if (Array.isArray(config.softwareProjects) && config.softwareProjects.length > 0) {
+    return `software:${normaliseSoftwareTemplate(config.softwareProjects[0].softwareTemplate)}`;
+  }
+
+  if (Array.isArray(config.businessProjects) && config.businessProjects.length > 0) {
+    return `business:${normaliseBusinessSpaceType(config.businessProjects[0].businessSpaceType)}`;
+  }
+
+  if (Array.isArray(config.productDiscoveryProjects) && config.productDiscoveryProjects.length > 0) {
+    return 'jpd:product-discovery';
+  }
+
+  return '';
+}
+
+function formatAgentExistingSpacePrompt(domain, spaceType, projects) {
+  const rows = projects.slice(0, 8).map(project => {
+    const detail = project.detailLabel || project.categoryLabel || project.projectTypeKey || 'Project';
+    return `- ${project.key}: ${project.name} (${detail}, ${project.issueCount || 0} items)`;
+  });
+  const extra = projects.length > rows.length ? [`- ...and ${projects.length - rows.length} more matching space(s).`] : [];
+  return [
+    `I found existing ${domain} spaces that match ${spaceType || 'your request'}.`,
+    ...rows,
+    ...extra,
+    '',
+    'Reply with one of these:',
+    '- add volume KEY',
+    '- delete KEY',
+    '- create new because existing spaces cannot accommodate this demo',
+  ].join('\n');
 }
 
 function buildAgentDashboardDefaults({ jsmServiceTypes, softwareProjects, businessProjects, productDiscoveryProjects }) {
@@ -9392,7 +9498,7 @@ function buildAgentDemoEnvironmentPayload(payload = {}) {
   if (!domain) {
     return {
       ready: false,
-      question: 'Which domain should I use for the demo environment? For example: Banking, Healthcare, Retail, Insurance, Telecom, SaaS, Manufacturing, Public Sector, Education, or Energy & Utilities.',
+      question: 'Which domain should I use for the demo environment? For example: Banking & Insurance, Healthcare, Telecom, Retail & E-commerce, Manufacturing & Energy Utilities, SaaS, Public Sector, or Education.',
       missingFields: ['domain'],
     };
   }
@@ -9422,7 +9528,7 @@ function buildAgentDemoEnvironmentPayload(payload = {}) {
   if (!softwareTemplate && !jsmServiceType && !businessSpaceType && !addVolume) {
     return {
       ready: false,
-      question: 'Which Jira space should I create: ITSM, HRSM, CSM, FSM, LSM, Scrum, Kanban, Bug Tracking, Task Tracking, Budget Planning, or Procurement Management?',
+      question: 'Which Jira space should I use: ITSM, HRSM, CSM, FSM, LSM, Scrum, Kanban, Bug Tracking, Project Management, Task Tracking, Budget Planning, Recruitment Tracking, or Procurement Management?',
       missingFields: ['spaceType'],
     };
   }
@@ -9455,6 +9561,8 @@ function buildAgentDemoEnvironmentPayload(payload = {}) {
     ready: true,
     config: {
       industry: domain,
+      agentRequestText: requestText,
+      agentExplicitCreateNew: agentRequestExplicitlyNeedsNewSpace(requestText),
       customIndustry: '',
       isCustomIndustry: false,
       environmentName: createAgentEnvironmentName(domain),
@@ -14696,6 +14804,27 @@ resolver.define('prepareAgentDemoEnvironment', async ({ payload }) => {
       success: false,
       summary: access.message,
     };
+  }
+
+  const requestedSpaceType = getRequestedAgentSpaceTypeFromConfig(config);
+  if (
+    requestedSpaceType
+    && !config.addVolumeToExistingDomainData
+    && !config.agentExplicitCreateNew
+  ) {
+    const existingMatches = await searchDomainProjects(config.industry, {
+      spaceType: requestedSpaceType,
+      includeIssueCounts: false,
+    });
+    if (existingMatches.length > 0) {
+      return {
+        success: false,
+        needsInput: true,
+        question: formatAgentExistingSpacePrompt(config.industry, requestedSpaceType, existingMatches),
+        missingFields: ['reuseExistingProjectDecision'],
+        matches: existingMatches,
+      };
+    }
   }
 
   const readinessDiagnostics = [];
