@@ -9237,7 +9237,8 @@ const AGENT_DOMAIN_ALIASES = [
 ];
 const AGENT_RUN_KEY_PREFIX = 'agent-demo-run:';
 const AGENT_RUN_STEP_BATCH_LIMIT = 1;
-const AGENT_RUN_TIME_BUDGET_MS = 45000;
+const AGENT_RUN_TIME_BUDGET_MS = 18000;
+const AGENT_RUN_LOCK_TTL_MS = 30000;
 
 function createAgentRunToken() {
   const randomPart = Math.random().toString(36).slice(2, 10);
@@ -9246,6 +9247,10 @@ function createAgentRunToken() {
 
 function getAgentRunStorageKey(runToken) {
   return `${AGENT_RUN_KEY_PREFIX}${String(runToken || '').trim()}`;
+}
+
+function getAgentRunLockStorageKey(runToken) {
+  return `${getAgentRunStorageKey(runToken)}:lock`;
 }
 
 function createAgentProgressMessage(job) {
@@ -9401,9 +9406,9 @@ function extractAgentProjectKeys(payload = {}) {
 
 function agentRequestExplicitlyNeedsNewSpace(requestText) {
   return textIncludesAny(requestText, [
-    'create new',
-    'new space',
-    'new project',
+    'create new because',
+    'create a new because',
+    'create the new because',
     'fresh space',
     'fresh project',
     'separate space',
@@ -9417,6 +9422,73 @@ function agentRequestExplicitlyNeedsNewSpace(requestText) {
     'do not reuse',
     'don\'t reuse',
   ]);
+}
+
+function agentRequestExplicitlyConfirmsCreation(payload = {}, requestText = '') {
+  if (payload.confirmCreate === true || payload.confirmCreation === true) {
+    return true;
+  }
+
+  return textIncludesAny(requestText, [
+    'yes create',
+    'yes, create',
+    'yes please create',
+    'yes create new',
+    'yes, create new',
+    'yes please create new',
+    'go ahead and create',
+    'proceed with creation',
+    'proceed to create',
+    'start creating',
+    'start setup',
+    'run setup',
+  ]);
+}
+
+async function buildAgentPreflightDecision(config = {}) {
+  const requestedSpaceType = getRequestedAgentSpaceTypeFromConfig(config);
+  if (!requestedSpaceType || config.addVolumeToExistingDomainData || config.agentConfirmedCreate) {
+    return null;
+  }
+
+  if (config.agentExplicitCreateNew) {
+    const confirmationQuestion = [
+      `I understand you want a new ${config.industry} ${requestedSpaceType} demo space.`,
+      'Please confirm with: "yes create new" and I will prepare the setup run.',
+    ].join('\n');
+
+    return {
+      success: false,
+      needsInput: true,
+      question: confirmationQuestion,
+      summary: confirmationQuestion,
+      missingFields: ['createConfirmation'],
+    };
+  }
+
+  const existingMatches = await searchDomainProjects(config.industry, {
+    spaceType: requestedSpaceType,
+    includeIssueCounts: false,
+  });
+  const question = existingMatches.length > 0
+    ? formatAgentExistingSpacePrompt(config.industry, requestedSpaceType, existingMatches)
+    : [
+        `I did not find an existing ${config.industry} space matching ${requestedSpaceType}.`,
+        '',
+        'Before I create anything, confirm one of these:',
+        '- choose a different domain or space type',
+        '- add volume KEY if you know an existing project key',
+        '- create new because existing spaces cannot accommodate this demo',
+      ].join('\n');
+
+  return {
+    success: false,
+    needsInput: true,
+    question,
+    summary: question,
+    missingFields: existingMatches.length > 0 ? ['reuseExistingProjectDecision'] : ['createConfirmation'],
+    matches: existingMatches.slice(0, 12),
+  };
 }
 
 function getRequestedAgentSpaceTypeFromConfig(config = {}) {
@@ -9563,6 +9635,7 @@ function buildAgentDemoEnvironmentPayload(payload = {}) {
       industry: domain,
       agentRequestText: requestText,
       agentExplicitCreateNew: agentRequestExplicitlyNeedsNewSpace(requestText),
+      agentConfirmedCreate: agentRequestExplicitlyConfirmsCreation(payload, requestText),
       customIndustry: '',
       isCustomIndustry: false,
       environmentName: createAgentEnvironmentName(domain),
@@ -10228,6 +10301,7 @@ async function executeBusinessProjectStep(config, state, step) {
       projectTypeKey: project.projectTypeKey || 'service_desk',
       compatibilityMode: project.compatibilityMode || null,
       compatibilityReason: project.compatibilityReason || null,
+      createdByThisRun: !existingProject,
       reusedExistingDomainData: Boolean(existingProject && existingIssueCount > 0),
       addVolumeToExistingDomainData: addVolumeToExistingProject,
       existingIssueCount,
@@ -10939,6 +11013,7 @@ async function executeWorkManagementProjectStep(config, state, step) {
       name: existingProject?.name || projectName,
       projectTypeKey: project.projectTypeKey || 'business',
       businessSpaceType,
+      createdByThisRun: !existingProject,
       reusedExistingDomainData: Boolean(existingProject && existingIssueCount > 0),
       addVolumeToExistingDomainData: addVolumeToExistingProject,
       existingIssueCount,
@@ -10999,6 +11074,7 @@ async function executeProductDiscoveryProjectStep(config, state, step) {
       name: project.name || projectName,
       projectTypeKey: project.projectTypeKey || 'product_discovery',
       productDiscoveryType: 'product-discovery',
+      createdByThisRun: false,
       reusedExistingDomainData: existingIssueCount > 0,
       addVolumeToExistingDomainData: addVolumeToExistingProject,
       existingIssueCount,
@@ -11278,6 +11354,7 @@ async function executeSoftwareProjectStep(config, state, step) {
       id: project.id,
       key: project.key,
       name: existingProject?.name || projectName,
+      createdByThisRun: !existingProject,
       reusedExistingDomainData: Boolean(existingProject && existingIssueCount > 0),
       addVolumeToExistingDomainData: addVolumeToExistingProject,
       existingIssueCount,
@@ -13988,6 +14065,196 @@ async function executeDemoEnvironmentStepCoreWithRetry({ config, state, step }) 
   return currentConfig;
 }
 
+function collectAgentRunProjectCleanupTargets(state = {}) {
+  const resultGroups = [
+    state.results?.jsmProjects,
+    state.results?.softwareProjects,
+    state.results?.businessProjects,
+    state.results?.productDiscoveryProjects,
+  ];
+  const keys = [];
+
+  for (const group of resultGroups) {
+    for (const project of Array.isArray(group) ? group : []) {
+      if (project?.key && project.createdByThisRun === true) {
+        keys.push(project.key);
+      }
+    }
+  }
+
+  return [...new Set(keys)];
+}
+
+function collectAgentRunDashboardCleanupTargets(state = {}) {
+  const dashboards = Array.isArray(state.results?.dashboards) ? state.results.dashboards : [];
+  const dashboardIds = dashboards
+    .map(dashboard => String(dashboard?.id || '').trim())
+    .filter(Boolean);
+  if (state.results?.dashboardId) {
+    dashboardIds.push(String(state.results.dashboardId));
+  }
+  return [...new Set(dashboardIds)];
+}
+
+function collectAgentRunFilterCleanupTargets(state = {}) {
+  const filters = Array.isArray(state.results?.savedFilters) ? state.results.savedFilters : [];
+  const filterIds = filters
+    .map(filter => String(filter?.id || '').trim())
+    .filter(Boolean);
+  if (state.results?.savedFilter?.id) {
+    filterIds.push(String(state.results.savedFilter.id));
+  }
+  return [...new Set(filterIds)];
+}
+
+async function deleteRecordedJiraResources({ projectKeys = [], dashboardIds = [], filterIds = [] }) {
+  const deleted = [];
+  const errors = [];
+
+  for (const dashboardId of dashboardIds) {
+    try {
+      await jiraDelete(`/rest/api/3/dashboard/${encodeURIComponent(dashboardId)}`);
+      deleted.push(`dashboard ${dashboardId}`);
+    } catch (err) {
+      errors.push(`dashboard ${dashboardId}: ${err.message}`);
+    }
+  }
+
+  for (const filterId of filterIds) {
+    try {
+      await jiraDelete(`/rest/api/3/filter/${encodeURIComponent(filterId)}`);
+      deleted.push(`filter ${filterId}`);
+    } catch (err) {
+      errors.push(`filter ${filterId}: ${err.message}`);
+    }
+  }
+
+  for (const projectKey of projectKeys) {
+    try {
+      await jiraDelete(`/rest/api/3/project/${encodeURIComponent(projectKey)}`);
+      deleted.push(`project ${projectKey}`);
+    } catch (err) {
+      errors.push(`project ${projectKey}: ${err.message}`);
+    }
+  }
+
+  return { deleted, errors };
+}
+
+function collectAgentRunSkippedExistingProjects(state = {}) {
+  const resultGroups = [
+    state.results?.jsmProjects,
+    state.results?.softwareProjects,
+    state.results?.businessProjects,
+    state.results?.productDiscoveryProjects,
+  ];
+  const keys = [];
+
+  for (const group of resultGroups) {
+    for (const project of Array.isArray(group) ? group : []) {
+      if (project?.key && project.createdByThisRun !== true) {
+        keys.push(project.key);
+      }
+    }
+  }
+
+  return [...new Set(keys)];
+}
+
+export async function cancelDemoEnvironmentFromAgent(payload = {}) {
+  console.log('cancelDemoEnvironmentFromAgent started', JSON.stringify({ payload }));
+
+  const runToken = String(payload.runToken || '').trim();
+  const fallbackProjectKeys = extractAgentProjectKeys({
+    volumeProjectKeys: payload.projectKeys || payload.projectKey || payload.request || '',
+  });
+
+  const access = await validateAdminAccess();
+  if (!access.ok) {
+    return {
+      success: false,
+      needsInput: false,
+      message: access.message,
+      summary: access.message,
+    };
+  }
+
+  if (!runToken && fallbackProjectKeys.length === 0) {
+    return {
+      success: false,
+      needsInput: true,
+      question: 'Which run should I cancel? Send the run token, or provide the Jira project key or keys to delete.',
+      missingFields: ['runToken', 'projectKeys'],
+    };
+  }
+
+  let job = null;
+  if (runToken) {
+    job = await kvs.get(getAgentRunStorageKey(runToken));
+    if (!job && fallbackProjectKeys.length === 0) {
+      return {
+        success: false,
+        needsInput: true,
+        question: 'I could not find that saved run. Send the Jira project key or keys if you want me to delete them directly.',
+        missingFields: ['projectKeys'],
+      };
+    }
+
+    if (job) {
+      job.cancelRequested = true;
+      job.updatedAt = new Date().toISOString();
+      await kvs.set(getAgentRunStorageKey(runToken), job);
+
+      const lock = await kvs.get(getAgentRunLockStorageKey(runToken));
+      const lockAge = lock?.lockedAt
+        ? Date.now() - new Date(lock.lockedAt).getTime()
+        : Number.POSITIVE_INFINITY;
+      if (lock && lockAge < AGENT_RUN_LOCK_TTL_MS) {
+        return {
+          success: false,
+          needsInput: false,
+          needsContinuation: false,
+          runToken,
+          message: 'I marked the run as cancelled. A setup step is still finishing, so wait about 30 seconds and ask me to cancel/delete again with the same run token.',
+          summary: 'Cancellation requested. Cleanup is waiting for the active setup step lock to clear.',
+        };
+      }
+    }
+  }
+
+  const state = job?.state || {};
+  const projectKeys = job ? collectAgentRunProjectCleanupTargets(state) : fallbackProjectKeys;
+  const dashboardIds = job ? collectAgentRunDashboardCleanupTargets(state) : [];
+  const filterIds = job ? collectAgentRunFilterCleanupTargets(state) : [];
+  const cleanup = await deleteRecordedJiraResources({ projectKeys, dashboardIds, filterIds });
+
+  if (runToken) {
+    await kvs.delete(getAgentRunStorageKey(runToken));
+    await kvs.delete(getAgentRunLockStorageKey(runToken));
+  }
+
+  const skippedExisting = job ? collectAgentRunSkippedExistingProjects(state) : [];
+
+  return {
+    success: cleanup.errors.length === 0,
+    needsInput: false,
+    needsContinuation: false,
+    runToken,
+    message: cleanup.errors.length === 0
+      ? 'Cancelled the demo run and deleted the newly created Jira resources I could identify.'
+      : 'Cancelled the demo run, but some cleanup actions need review.',
+    summary: [
+      'Demo run cancellation and cleanup:',
+      cleanup.deleted.length ? `- Deleted: ${cleanup.deleted.join(', ')}` : '- Deleted: none',
+      skippedExisting.length ? `- Skipped existing/reused spaces: ${skippedExisting.join(', ')}` : '',
+      cleanup.errors.length ? `- Cleanup warnings: ${cleanup.errors.join('; ')}` : '- Cleanup warnings: none',
+    ].filter(Boolean).join('\n'),
+    deleted: cleanup.deleted,
+    skippedExisting,
+    errors: cleanup.errors,
+  };
+}
+
 export async function createDemoEnvironmentFromAgent(payload = {}, context = {}) {
   console.log('createDemoEnvironmentFromAgent started', JSON.stringify({
     payload,
@@ -14031,6 +14298,11 @@ export async function createDemoEnvironmentFromAgent(payload = {}, context = {})
     let config = normalisePayload(request.config);
     config.runSeed = config.runSeed || Date.now();
 
+    const preflightDecision = await buildAgentPreflightDecision(config);
+    if (preflightDecision) {
+      return preflightDecision;
+    }
+
     const readinessDiagnostics = [];
     const productDiscoveryReadiness = await validateProductDiscoveryReadiness(config, readinessDiagnostics);
     if (!productDiscoveryReadiness.ok) {
@@ -14060,14 +14332,71 @@ export async function createDemoEnvironmentFromAgent(payload = {}, context = {})
       createdAt: new Date().toISOString(),
       updatedAt: new Date().toISOString(),
     };
+    await kvs.set(getAgentRunStorageKey(runToken), job);
+    return {
+      success: false,
+      needsInput: false,
+      needsContinuation: true,
+      runToken,
+      message: [
+        `I prepared ${plan.length} setup step(s) for ${config.environmentName}.`,
+        'Reply "continue" and I will run the next setup step with the saved run token.',
+      ].join(' '),
+      summary: [
+        `Prepared ${plan.length} setup step(s) for ${config.environmentName}.`,
+        '',
+        'No Jira resources have been created yet. Reply "continue" to run the first setup step.',
+      ].join('\n'),
+      progressLog: job.progressLog.slice(-12),
+      completedSteps: 0,
+      totalSteps: plan.length,
+    };
   }
 
   let { config, state } = job;
   const { plan } = job;
   const startedAt = Date.now();
   let stepsRunThisCall = 0;
+  const lockKey = getAgentRunLockStorageKey(runToken);
 
   try {
+    if (job.cancelRequested) {
+      await kvs.delete(lockKey);
+      return {
+        success: false,
+        needsInput: false,
+        needsContinuation: false,
+        runToken,
+        message: 'This demo creation run has been cancelled. No further setup steps will run.',
+        summary: 'This demo creation run has been cancelled. Use the cancel/delete action with the same run token if cleanup is still needed.',
+        progressLog: job.progressLog.slice(-12),
+        completedSteps: job.nextStepIndex,
+        totalSteps: plan.length,
+      };
+    }
+
+    const existingLock = await kvs.get(lockKey);
+    const existingLockAge = existingLock?.lockedAt
+      ? Date.now() - new Date(existingLock.lockedAt).getTime()
+      : Number.POSITIVE_INFINITY;
+    if (existingLock && existingLockAge < AGENT_RUN_LOCK_TTL_MS) {
+      return {
+        success: false,
+        needsInput: false,
+        needsContinuation: true,
+        runToken,
+        message: 'A setup step is already running for this demo environment. Wait a moment, then reply "continue" again.',
+        summary: [
+          createAgentProgressMessage(job),
+          'A previous continuation call is still running or recently finished. Wait a moment, then continue with the same run token.',
+        ].join('\n'),
+        progressLog: job.progressLog.slice(-12),
+        completedSteps: job.nextStepIndex,
+        totalSteps: plan.length,
+      };
+    }
+    await kvs.set(lockKey, { lockedAt: new Date().toISOString() });
+
     while (
       job.nextStepIndex < plan.length
       && stepsRunThisCall < AGENT_RUN_STEP_BATCH_LIMIT
@@ -14090,6 +14419,7 @@ export async function createDemoEnvironmentFromAgent(payload = {}, context = {})
     }
 
     if (job.nextStepIndex < plan.length) {
+      await kvs.delete(lockKey);
       return {
         success: false,
         needsInput: false,
@@ -14108,6 +14438,7 @@ export async function createDemoEnvironmentFromAgent(payload = {}, context = {})
 
     const result = buildChunkedSummary(config, state);
     await kvs.delete(getAgentRunStorageKey(runToken));
+    await kvs.delete(lockKey);
     return {
       success: result.success,
       needsInput: false,
@@ -14127,6 +14458,7 @@ export async function createDemoEnvironmentFromAgent(payload = {}, context = {})
     job.updatedAt = new Date().toISOString();
     job.lastError = err.message;
     await kvs.set(getAgentRunStorageKey(runToken), job);
+    await kvs.delete(lockKey);
     return {
       success: false,
       needsInput: false,
@@ -14806,25 +15138,9 @@ resolver.define('prepareAgentDemoEnvironment', async ({ payload }) => {
     };
   }
 
-  const requestedSpaceType = getRequestedAgentSpaceTypeFromConfig(config);
-  if (
-    requestedSpaceType
-    && !config.addVolumeToExistingDomainData
-    && !config.agentExplicitCreateNew
-  ) {
-    const existingMatches = await searchDomainProjects(config.industry, {
-      spaceType: requestedSpaceType,
-      includeIssueCounts: false,
-    });
-    if (existingMatches.length > 0) {
-      return {
-        success: false,
-        needsInput: true,
-        question: formatAgentExistingSpacePrompt(config.industry, requestedSpaceType, existingMatches),
-        missingFields: ['reuseExistingProjectDecision'],
-        matches: existingMatches,
-      };
-    }
+  const preflightDecision = await buildAgentPreflightDecision(config);
+  if (preflightDecision) {
+    return preflightDecision;
   }
 
   const readinessDiagnostics = [];

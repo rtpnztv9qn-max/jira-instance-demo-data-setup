@@ -2,21 +2,22 @@ modules:
   rovo:agent:
     - key: cprime-demo-environment-agent
       name: Cprime Demo Agent
-      description: Creates Jira demo environments by asking for only the missing details.
+      description: Finds existing Jira demo spaces first, then helps add volume, delete old demo spaces, or create a new domain demo only when needed.
       prompt: resource:agent;prompts/demo-environment-agent.txt
       conversationStarters:
-        - Create a healthcare scrum demo environment
-        - Create an ITSM demo environment for banking
-        - Add demo volume to existing projects
+        - Find existing Banking ITSM demo spaces first
+        - Add demo volume to existing Healthcare Scrum projects
+        - Create a new SaaS Kanban demo only if no matching space exists
       actions:
-        - create-demo-environment-from-chat
+        - review-demo-environment-request
         - continue-demo-environment-run
+        - cancel-demo-environment-run
   action:
-    - key: create-demo-environment-from-chat
-      name: Create demo environment
+    - key: review-demo-environment-request
+      name: Review demo environment request
       function: agent-create-demo
-      actionVerb: CREATE
-      description: Creates a Jira demo environment using the same backend flow as the Cprime demo data setup form.
+      actionVerb: GET
+      description: Reviews the user's demo request, checks matching existing Jira spaces first, and only prepares creation after the user explicitly chooses add volume, delete, or yes create new.
       inputs:
         request:
           title: User request
@@ -79,6 +80,22 @@ modules:
           type: string
           required: true
           description: Continuation token returned by the Create demo environment action.
+    - key: cancel-demo-environment-run
+      name: Cancel and delete demo run
+      function: agent-cancel-demo
+      actionVerb: DELETE
+      description: Cancels a saved Rovo demo creation run and deletes newly created Jira resources that were recorded in that run.
+      inputs:
+        runToken:
+          title: Run token
+          type: string
+          required: false
+          description: Continuation token returned by the Create demo environment action.
+        projectKeys:
+          title: Project keys
+          type: string
+          required: false
+          description: Comma-separated Jira project keys to delete when a run token is not available.
   jira:globalPage:
     - key: cprime-demo-agent-page
       resource: main
@@ -116,6 +133,8 @@ modules:
       handler: index.handler
     - key: agent-create-demo
       handler: index.createDemoEnvironmentFromAgent
+    - key: agent-cancel-demo
+      handler: index.cancelDemoEnvironmentFromAgent
     - key: environment-cleanup
       handler: index.scheduledCleanup
   scheduledTrigger:
