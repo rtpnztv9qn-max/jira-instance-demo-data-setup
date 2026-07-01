@@ -9226,19 +9226,43 @@ function normalisePayload(payload) {
 }
 
 const AGENT_DOMAIN_ALIASES = [
-  ['Manufacturing & Energy Utilities', ['manufacturing energy utilities', 'manufacturing and energy', 'energy utilities', 'energy and utilities', 'utilities', 'energy', 'manufacturing']],
+  ['Manufacturing', ['manufacturing']],
+  ['Energy & Utilities', ['energy utilities', 'energy and utilities', 'utilities', 'energy']],
   ['Public Sector', ['public sector', 'government']],
   ['Banking & Insurance', ['banking insurance', 'banking and insurance', 'banking', 'bank', 'finance domain', 'insurance', 'claims', 'policy']],
   ['Healthcare', ['healthcare', 'health care', 'hospital', 'patient']],
   ['Telecom', ['telecom', 'telecommunication', 'telecommunications']],
-  ['Retail & E-commerce', ['retail ecommerce', 'retail and ecommerce', 'retail', 'e-commerce', 'ecommerce', 'commerce']],
+  ['Retail & E-Commerce', ['retail ecommerce', 'retail and ecommerce', 'retail', 'e-commerce', 'ecommerce', 'commerce']],
   ['SaaS', ['saas', 'software as a service']],
   ['Education', ['education', 'university', 'school']],
 ];
+const AGENT_SUPPORTED_DOMAIN_NAMES = AGENT_DOMAIN_ALIASES.map(([domain]) => domain);
 const AGENT_RUN_KEY_PREFIX = 'agent-demo-run:';
 const AGENT_RUN_STEP_BATCH_LIMIT = 1;
 const AGENT_RUN_TIME_BUDGET_MS = 18000;
 const AGENT_RUN_LOCK_TTL_MS = 30000;
+const AGENT_FULL_COVERAGE_SOFTWARE_PROJECTS = [
+  { softwareTemplate: 'scrum', softwareProjectStyle: 'team-managed', issuesPerProject: DEFAULT_SOFTWARE_ISSUES_PER_PROJECT },
+  { softwareTemplate: 'kanban', softwareProjectStyle: 'team-managed', issuesPerProject: DEFAULT_SOFTWARE_ISSUES_PER_PROJECT },
+  { softwareTemplate: 'bug-tracking', softwareProjectStyle: '', issuesPerProject: DEFAULT_SOFTWARE_ISSUES_PER_PROJECT },
+];
+
+function agentRequestWantsFullCoverage(payload = {}, requestText = '') {
+  return payload.fullCoverage === true || textIncludesAny(requestText, [
+    'full coverage',
+    'complete coverage',
+    'all spaces',
+    'all space types',
+    'all project types',
+    'every space',
+    'every project type',
+    'dedicated space for each',
+    'dedicated spaces for each',
+    'one space for each',
+    'one project for each',
+    'baseline coverage',
+  ]);
+}
 
 function createAgentRunToken() {
   const randomPart = Math.random().toString(36).slice(2, 10);
@@ -9273,6 +9297,7 @@ function isProjectNameCollisionMessage(message) {
 
 function getAgentRequestText(payload = {}) {
   return [
+    payload.operation,
     payload.request,
     payload.domain,
     payload.spaceType,
@@ -9280,6 +9305,11 @@ function getAgentRequestText(payload = {}) {
     payload.projectManagement,
     payload.businessSpaceType,
     payload.dateRange,
+    payload.volume,
+    payload.fullCoverage === true ? 'full coverage' : '',
+    payload.purpose,
+    payload.owner,
+    payload.expiryDate,
     payload.volumeProjectKeys,
   ].filter(Boolean).map(String).join(' ').trim();
 }
@@ -9292,7 +9322,12 @@ function textIncludesAny(text, values) {
 function inferAgentDomain(payload = {}, requestText = '') {
   const explicit = String(payload.domain || payload.industry || '').trim();
   if (explicit && !['other', 'others'].includes(explicit.toLowerCase())) {
-    return explicit;
+    const explicitNormalized = explicit.toLowerCase();
+    const explicitMatch = AGENT_DOMAIN_ALIASES.find(([domain, aliases]) => (
+      domain.toLowerCase() === explicitNormalized
+      || aliases.some(alias => alias === explicitNormalized || explicitNormalized.includes(alias))
+    ));
+    return explicitMatch?.[0] || '';
   }
 
   const normalized = String(requestText || '').toLowerCase();
@@ -9446,6 +9481,41 @@ function agentRequestExplicitlyConfirmsCreation(payload = {}, requestText = '') 
 }
 
 async function buildAgentPreflightDecision(config = {}) {
+  if (config.agentFullCoverage && !config.addVolumeToExistingDomainData && !config.agentConfirmedCreate) {
+    const existingMatches = await searchDomainProjects(config.industry, {
+      spaceType: '',
+      includeIssueCounts: false,
+    });
+    const rows = existingMatches.slice(0, 10).map(project => {
+      const detail = project.detailLabel || project.categoryLabel || project.projectTypeKey || 'Project';
+      return `- ${project.key}: ${project.name} (${detail}, ${project.issueCount || 0} items)`;
+    });
+    const extra = existingMatches.length > rows.length ? [`- ...and ${existingMatches.length - rows.length} more ${config.industry} space(s).`] : [];
+    const question = [
+      existingMatches.length > 0
+        ? `I found existing ${config.industry} demo spaces before creating full coverage.`
+        : `I did not find existing ${config.industry} demo spaces for full coverage.`,
+      ...rows,
+      ...extra,
+      '',
+      'Full createable coverage means: 5 JSM spaces, 5 Work Management spaces, and 3 Software projects. Product Discovery must be added as volume to an existing native JPD project key.',
+      '',
+      'Reply with one of these:',
+      '- add volume KEY',
+      '- delete KEY',
+      '- yes create full coverage because existing spaces cannot accommodate this demo',
+    ].join('\n');
+
+    return {
+      success: false,
+      needsInput: true,
+      question,
+      summary: question,
+      missingFields: existingMatches.length > 0 ? ['reuseExistingProjectDecision'] : ['createConfirmation'],
+      matches: existingMatches.slice(0, 12),
+    };
+  }
+
   const requestedSpaceType = getRequestedAgentSpaceTypeFromConfig(config);
   if (!requestedSpaceType || config.addVolumeToExistingDomainData || config.agentConfirmedCreate) {
     return null;
@@ -9570,7 +9640,7 @@ function buildAgentDemoEnvironmentPayload(payload = {}) {
   if (!domain) {
     return {
       ready: false,
-      question: 'Which domain should I use for the demo environment? For example: Banking & Insurance, Healthcare, Telecom, Retail & E-commerce, Manufacturing & Energy Utilities, SaaS, Public Sector, or Education.',
+      question: `Which supported domain should I use for the demo environment? Current supported domains are: ${AGENT_SUPPORTED_DOMAIN_NAMES.join(', ')}. If your need is outside this list, tell me which supported domain is closest or ask for a generic business demonstration.`,
       missingFields: ['domain'],
     };
   }
@@ -9588,8 +9658,9 @@ function buildAgentDemoEnvironmentPayload(payload = {}) {
   const jsmServiceType = inferAgentJsmServiceType(payload, requestText);
   const businessSpaceType = inferAgentBusinessSpaceType(payload, requestText);
   const wantsProductDiscovery = textIncludesAny(requestText, ['product discovery', 'jpd']);
+  const wantsFullCoverage = agentRequestWantsFullCoverage(payload, requestText);
 
-  if (wantsProductDiscovery && !addVolume) {
+  if (wantsProductDiscovery && !wantsFullCoverage && !addVolume) {
     return {
       ready: false,
       question: 'Jira Product Discovery spaces must be created in Jira first. Share the existing Product Discovery project key if you want me to add demo ideas as volume.',
@@ -9597,7 +9668,7 @@ function buildAgentDemoEnvironmentPayload(payload = {}) {
     };
   }
 
-  if (!softwareTemplate && !jsmServiceType && !businessSpaceType && !addVolume) {
+  if (!wantsFullCoverage && !softwareTemplate && !jsmServiceType && !businessSpaceType && !addVolume) {
     return {
       ready: false,
       question: 'Which Jira space should I use: ITSM, HRSM, CSM, FSM, LSM, Scrum, Kanban, Bug Tracking, Project Management, Task Tracking, Budget Planning, Recruitment Tracking, or Procurement Management?',
@@ -9606,21 +9677,31 @@ function buildAgentDemoEnvironmentPayload(payload = {}) {
   }
 
   const softwareProjectStyle = inferAgentProjectManagement(payload, requestText);
-  const jsmServiceTypes = jsmServiceType ? Array.from({ length: projectCount }, () => jsmServiceType) : [];
-  const softwareProjects = softwareTemplate
+  const jsmServiceTypes = wantsFullCoverage
+    ? [...JSM_SERVICE_TYPES]
+    : (jsmServiceType ? Array.from({ length: projectCount }, () => jsmServiceType) : []);
+  const softwareProjects = wantsFullCoverage
+    ? AGENT_FULL_COVERAGE_SOFTWARE_PROJECTS.map(project => ({ ...project }))
+    : (softwareTemplate
     ? Array.from({ length: projectCount }, () => ({
         softwareTemplate,
         softwareProjectStyle: softwareTemplate === 'bug-tracking' ? '' : softwareProjectStyle,
         issuesPerProject: DEFAULT_SOFTWARE_ISSUES_PER_PROJECT,
       }))
-    : [];
-  const businessProjects = businessSpaceType
+    : []);
+  const businessProjects = wantsFullCoverage
+    ? BUSINESS_SPACE_TYPES.map(type => ({
+        projectKey: '',
+        businessSpaceType: type,
+        issuesPerProject: DEFAULT_SOFTWARE_ISSUES_PER_PROJECT,
+      }))
+    : (businessSpaceType
     ? Array.from({ length: projectCount }, () => ({
         projectKey: '',
         businessSpaceType,
         issuesPerProject: DEFAULT_SOFTWARE_ISSUES_PER_PROJECT,
       }))
-    : [];
+    : []);
   const productDiscoveryProjects = [];
   const dashboardDefaults = buildAgentDashboardDefaults({
     jsmServiceTypes,
@@ -9634,6 +9715,7 @@ function buildAgentDemoEnvironmentPayload(payload = {}) {
     config: {
       industry: domain,
       agentRequestText: requestText,
+      agentFullCoverage: wantsFullCoverage,
       agentExplicitCreateNew: agentRequestExplicitlyNeedsNewSpace(requestText),
       agentConfirmedCreate: agentRequestExplicitlyConfirmsCreation(payload, requestText),
       customIndustry: '',

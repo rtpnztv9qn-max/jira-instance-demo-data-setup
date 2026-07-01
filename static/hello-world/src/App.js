@@ -1,7 +1,7 @@
 import React, { useEffect, useState } from 'react';
 import { invoke, router, view } from '@forge/bridge';
 
-const industries = ['Banking & Insurance', 'Healthcare', 'Telecom', 'Retail & E-commerce', 'Manufacturing & Energy Utilities', 'SaaS', 'Public Sector', 'Education'];
+const industries = ['Banking & Insurance', 'Healthcare', 'Telecom', 'Retail & E-Commerce', 'Manufacturing', 'Energy & Utilities', 'SaaS', 'Public Sector', 'Education'];
 const jsmServiceTypeOptions = ['ITSM', 'HRSM', 'CSM', 'FSM', 'LSM'];
 const jsmServiceTypeLabels = {
   ITSM: 'IT Service Management',
@@ -36,11 +36,23 @@ const groupedSpaceTypeOptions = spaceTypeOptions.reduce((groups, option) => {
   return groups;
 }, {});
 const DEFAULT_DEMO_ISSUE_COUNT = 60;
+const coverageJsmServiceTypes = [...jsmServiceTypeOptions];
+const coverageBusinessSpaceTypes = spaceTypeOptions
+  .filter(option => option.value.startsWith('business:'))
+  .map(option => option.value.replace(/^business:/, ''));
+const coverageSoftwareTemplates = ['scrum', 'kanban', 'bug-tracking'];
+const coverageSpaceTypeCount = spaceTypeOptions.length;
+const coverageCreateableSpaceTypeCount = coverageSpaceTypeCount - 1;
+const coveragePerDomainItemCount = (
+  (coverageJsmServiceTypes.length * DEFAULT_DEMO_ISSUE_COUNT * 4)
+  + (coverageBusinessSpaceTypes.length * DEFAULT_DEMO_ISSUE_COUNT)
+  + (coverageSoftwareTemplates.length * DEFAULT_DEMO_ISSUE_COUNT)
+);
 const PRODUCT_DISCOVERY_VOLUME_ONLY_MESSAGE = 'Jira Product Discovery spaces must be created from Jira UI on this site. The Forge app can add demo ideas to an existing native Product Discovery space selected with Volume, but it will not create a new Product Discovery space through REST because Jira can create an incomplete Polaris shell.';
 const agentActionOptions = [
   { value: 'volume', label: 'Add volume to existing space' },
   { value: 'delete', label: 'Delete demo space' },
-  { value: 'create', label: 'Create new only if existing cannot fit' },
+  { value: 'create', label: 'Check existing, then create only if needed' },
 ];
 const agentSpaceCategoryOptions = [
   { value: 'jpd', label: 'Product Management' },
@@ -53,7 +65,7 @@ const agentManagementOptions = [
   { value: 'company-managed', label: 'Company-managed' },
 ];
 const agentReviewOptions = [
-  { value: 'create-now', label: 'Create now' },
+  { value: 'create-now', label: 'Apply decision' },
   { value: 'add-another', label: 'Add another domain / space type' },
   { value: 'start-over', label: 'Start over' },
 ];
@@ -2830,11 +2842,11 @@ function App() {
   const [result, setResult] = useState('');
   const [isSuccess, setIsSuccess] = useState(false);
   const [progress, setProgress] = useState('');
-  const [agentRequest, setAgentRequest] = useState('Create an ITSM demo environment for retail banking');
+  const [agentRequest, setAgentRequest] = useState('Find existing Banking & Insurance ITSM demo spaces first');
   const [agentMessages, setAgentMessages] = useState([
     {
       role: 'agent',
-      text: 'Tell me what demo environment you want, or start with "create demo environment" and I will guide you.',
+      text: 'Use Ask Rovo for the conversational agent. This admin console can preflight a request, check existing spaces, or apply a confirmed setup decision.',
     },
   ]);
   const [agentDraft, setAgentDraft] = useState({});
@@ -2845,6 +2857,7 @@ function App() {
   const [selectionFeedback, setSelectionFeedback] = useState('');
   const [selectedVolumeProjectKeys, setSelectedVolumeProjectKeys] = useState([]);
   const [selectedDeleteProjectKeys, setSelectedDeleteProjectKeys] = useState([]);
+  const showAdvancedSetup = true;
 
   const [form, setForm] = useState({
     industry: '',
@@ -3097,8 +3110,18 @@ function App() {
     'Please review what I understood:',
     ...selections.map((selection, index) => describeAgentSelection(selection, index)),
     '',
-    'Shall I create this now, or do you want to add another domain / space type?',
+    'Shall I apply this decision now, or do you want to add another domain / space type?',
   ].join('\n');
+
+  const getAgentSubmitLabel = () => {
+    if (agentLoading) return 'Checking...';
+    const normalized = normalizeAgentText(agentRequest);
+    if ((agentDraft.selections || []).length > 0) return 'Apply decision';
+    if (/delete|remove|cleanup|clean up|cancel|rollback|roll back/.test(normalized)) return 'Review cleanup';
+    if (/add volume|increase volume|more tickets|more work|expand/.test(normalized)) return 'Review volume';
+    if (/list|find|existing|show|recommend|compare/.test(normalized)) return 'Check existing';
+    return 'Review request';
+  };
 
   const inferAgentReviewAction = (text) => {
     const normalized = normalizeAgentText(text);
@@ -3167,7 +3190,7 @@ function App() {
   };
 
   const runAgentRequest = async (request) => {
-    appendAgentMessage({ role: 'agent', text: 'Understood. I am preparing the demo environment plan now.' });
+    appendAgentMessage({ role: 'agent', text: 'Understood. I am checking existing matching spaces and preparing the next safe decision.' });
 
     const preparation = await invoke('prepareAgentDemoEnvironment', {
       request,
@@ -3961,7 +3984,7 @@ function App() {
 
   const selectedSpaceTypeOption = spaceTypeOptions.find(option => option.value === form.spaceType);
   const selectedSpaceTypeLabel = selectedSpaceTypeOption?.label || '';
-  const addSelectedSpaceButtonLabel = 'Add selected space';
+  const addSelectedSpaceButtonLabel = 'Use selected space type';
   const isSelectedJsmSpace = form.spaceType.startsWith('jsm:');
   const isSelectedSoftwareSpace = form.spaceType.startsWith('software:');
   const isSelectedBugTrackingSpace = form.spaceType === 'software:bug-tracking';
@@ -3973,9 +3996,12 @@ function App() {
       const serviceType = form.spaceType.replace(/^jsm:/, '');
       setForm({
         ...form,
-        jsmServiceTypes: [...form.jsmServiceTypes, serviceType],
+        jsmServiceTypes: [serviceType],
+        softwareProjects: [],
+        businessProjects: [],
+        productDiscoveryProjects: [],
       });
-      setSelectionFeedback(`${selectedSpaceTypeLabel} added below. It will create 60 incidents, 60 problems, 60 changes, and 60 service requests with relationship links, queues, forms, knowledge base, SLA/report fields, and dashboards.`);
+      setSelectionFeedback(`${selectedSpaceTypeLabel} selected. This setup will create one JSM project with 60 incidents, 60 problems, 60 changes, and 60 service requests with relationship links, queues, forms, knowledge base, SLA/report fields, and dashboards.`);
       return;
     }
 
@@ -3984,16 +4010,16 @@ function App() {
       const isBugTrackingTemplate = softwareTemplate === 'bug-tracking';
       setForm({
         ...form,
-        softwareProjects: [
-          ...form.softwareProjects,
-          {
-            softwareTemplate,
-            softwareProjectStyle: isBugTrackingTemplate ? '' : form.softwareProjectStyle || 'team-managed',
-            issuesPerProject: DEFAULT_DEMO_ISSUE_COUNT,
-          },
-        ],
+        jsmServiceTypes: [],
+        businessProjects: [],
+        productDiscoveryProjects: [],
+        softwareProjects: [{
+          softwareTemplate,
+          softwareProjectStyle: isBugTrackingTemplate ? '' : form.softwareProjectStyle || 'team-managed',
+          issuesPerProject: DEFAULT_DEMO_ISSUE_COUNT,
+        }],
       });
-      setSelectionFeedback(`${selectedSpaceTypeLabel} added below. It will create 60 software issues with releases, bugs, dependencies, timeline fields, ${isBugTrackingTemplate ? 'bug triage/review flow' : 'sprints or Kanban flow'}, Compass/Goals links where configured, development activity, and dashboards.`);
+      setSelectionFeedback(`${selectedSpaceTypeLabel} selected. This setup will create one software project with 60 issues, releases, bugs, dependencies, timeline fields, ${isBugTrackingTemplate ? 'bug triage/review flow' : 'sprints or Kanban flow'}, Compass/Goals links where configured, development activity, and dashboards.`);
       return;
     }
 
@@ -4001,21 +4027,87 @@ function App() {
       const businessSpaceType = form.spaceType.replace(/^business:/, '');
       setForm({
         ...form,
-        businessProjects: [
-          ...form.businessProjects,
-          {
-            businessSpaceType,
-            issuesPerProject: DEFAULT_DEMO_ISSUE_COUNT,
-          },
-        ],
+        jsmServiceTypes: [],
+        softwareProjects: [],
+        productDiscoveryProjects: [],
+        businessProjects: [{
+          businessSpaceType,
+          issuesPerProject: DEFAULT_DEMO_ISSUE_COUNT,
+        }],
       });
-      setSelectionFeedback(`${selectedSpaceTypeLabel} added below. It will create 60 realistic work-management items with due dates, generated custom dates, labels, relationship links, comments, and domain-specific tracking fields where Jira allows them.`);
+      setSelectionFeedback(`${selectedSpaceTypeLabel} selected. This setup will create one Work Management space with 60 realistic items, due dates, generated custom dates, labels, relationship links, comments, and domain-specific tracking fields where Jira allows them.`);
       return;
     }
 
     if (isSelectedJpdSpace) {
       setSelectionFeedback(PRODUCT_DISCOVERY_VOLUME_ONLY_MESSAGE);
     }
+  };
+
+  const addCoverageSelection = (coverageType) => {
+    const selectedIndustry = getSelectedIndustry(form);
+    if (!selectedIndustry) {
+      setSelectionFeedback('Select a Business Domain first, then choose a coverage option.');
+      return;
+    }
+
+    setForm(current => {
+      const nextJsmServiceTypes = [...current.jsmServiceTypes];
+      const nextBusinessProjects = [...current.businessProjects];
+      const nextSoftwareProjects = [...current.softwareProjects];
+
+      if (coverageType === 'all' || coverageType === 'jsm') {
+        const existingJsmTypes = new Set(nextJsmServiceTypes);
+        coverageJsmServiceTypes.forEach(serviceType => {
+          if (!existingJsmTypes.has(serviceType)) {
+            nextJsmServiceTypes.push(serviceType);
+            existingJsmTypes.add(serviceType);
+          }
+        });
+      }
+
+      if (coverageType === 'all' || coverageType === 'business') {
+        const existingBusinessTypes = new Set(nextBusinessProjects.map(project => project.businessSpaceType));
+        coverageBusinessSpaceTypes.forEach(businessSpaceType => {
+          if (!existingBusinessTypes.has(businessSpaceType)) {
+            nextBusinessProjects.push({
+              businessSpaceType,
+              issuesPerProject: DEFAULT_DEMO_ISSUE_COUNT,
+            });
+            existingBusinessTypes.add(businessSpaceType);
+          }
+        });
+      }
+
+      if (coverageType === 'all' || coverageType === 'software') {
+        const existingSoftwareTemplates = new Set(nextSoftwareProjects.map(project => project.softwareTemplate));
+        coverageSoftwareTemplates.forEach(softwareTemplate => {
+          if (!existingSoftwareTemplates.has(softwareTemplate)) {
+            nextSoftwareProjects.push({
+              softwareTemplate,
+              softwareProjectStyle: softwareTemplate === 'bug-tracking' ? '' : current.softwareProjectStyle || 'team-managed',
+              issuesPerProject: DEFAULT_DEMO_ISSUE_COUNT,
+            });
+            existingSoftwareTemplates.add(softwareTemplate);
+          }
+        });
+      }
+
+      return {
+        ...current,
+        jsmServiceTypes: nextJsmServiceTypes,
+        businessProjects: nextBusinessProjects,
+        softwareProjects: nextSoftwareProjects,
+      };
+    });
+
+    const feedbackByType = {
+      all: `Full createable coverage added for ${selectedIndustry}: ${coverageJsmServiceTypes.length} JSM spaces, ${coverageBusinessSpaceTypes.length} Work Management spaces, and ${coverageSoftwareTemplates.length} Software projects. Product Discovery stays existing-space volume only: select a matching JPD row above with Volume to add 60 ideas.`,
+      jsm: `Jira Service Management coverage added for ${selectedIndustry}: ${coverageJsmServiceTypes.map(type => jsmServiceTypeLabels[type] || type).join(', ')}.`,
+      business: `Work Management coverage added for ${selectedIndustry}: ${coverageBusinessSpaceTypes.map(type => spaceTypeOptions.find(option => option.value === `business:${type}`)?.label || type).join(', ')}.`,
+      software: `Software coverage added for ${selectedIndustry}: Scrum, Kanban, and Bug Tracking.`,
+    };
+    setSelectionFeedback(feedbackByType[coverageType] || feedbackByType.all);
   };
 
   const deleteSelectedDomainProjects = async () => {
@@ -4275,89 +4367,10 @@ function App() {
       <div style={cardStyle}>
         <div style={headerStyle}>
           <h1 style={titleStyle}>Jira Instance - Demo Data Setup</h1>
-          <p style={{ ...subtitleStyle, fontStyle: 'italic' }}>Create the demo environment in minutes</p>
+          <p style={{ ...subtitleStyle, fontStyle: 'italic' }}>Admin landing page for the Cprime Demo Agent</p>
         </div>
-        <div style={{ ...sectionStyle, marginTop: 0, borderColor: '#0052cc', backgroundColor: '#f4f8ff' }}>
-          <div style={sectionTitleStyle}>Demo Agent</div>
-          <div style={{ color: '#42526e', fontSize: '13px', marginBottom: '12px' }}>
-            Ask for the environment in plain English. The agent will ask for missing details, then run the full backend setup flow and show live progress.
-          </div>
-          <div style={{ display: 'grid', gap: '10px', marginBottom: '12px', maxHeight: '260px', overflowY: 'auto', paddingRight: '4px' }}>
-            {agentMessages.map((message, index) => (
-              <div
-                key={`agent-message-${index}`}
-                style={{
-                  justifySelf: message.role === 'user' ? 'end' : 'start',
-                  maxWidth: '86%',
-                  padding: '10px 12px',
-                  borderRadius: '8px',
-                  whiteSpace: 'pre-wrap',
-                  fontSize: '13px',
-                  lineHeight: '18px',
-                  color: message.role === 'user' ? '#ffffff' : '#172b4d',
-                  backgroundColor: message.role === 'user' ? '#0052cc' : '#ffffff',
-                  border: message.role === 'user' ? '1px solid #0052cc' : '1px solid #dfe1e6',
-                }}
-              >
-                {message.text}
-                {message.options?.length > 0 && (
-                  <div style={{ display: 'flex', gap: '8px', flexWrap: 'wrap', marginTop: '10px' }}>
-                    {message.options.map(option => (
-                      <button
-                        key={`${message.field}-${option.value}`}
-                        type="button"
-                        disabled={agentLoading || loading}
-                        onClick={() => handleAgentOptionSelect(message.field, option.value, option.label)}
-                        style={{
-                          border: '1px solid #0052cc',
-                          backgroundColor: '#ffffff',
-                          color: '#0052cc',
-                          borderRadius: '4px',
-                          padding: '7px 10px',
-                          fontSize: '12px',
-                          fontWeight: 700,
-                          cursor: agentLoading || loading ? 'not-allowed' : 'pointer',
-                          opacity: agentLoading || loading ? 0.6 : 1,
-                        }}
-                      >
-                        {option.label}
-                      </button>
-                    ))}
-                  </div>
-                )}
-              </div>
-            ))}
-          </div>
-          <div style={{ display: 'grid', gridTemplateColumns: 'minmax(0, 1fr) 150px', gap: '10px', alignItems: 'start' }}>
-            <textarea
-              value={agentRequest}
-              onChange={(event) => setAgentRequest(event.target.value)}
-              placeholder="Create an ITSM demo for Banking & Insurance, reusing existing spaces first"
-              rows={3}
-              disabled={agentLoading || loading}
-              style={{
-                ...inputStyle,
-                resize: 'vertical',
-                minHeight: '72px',
-                fontFamily: 'inherit',
-              }}
-            />
-            <button
-              type="button"
-              onClick={handleAgentSubmit}
-              disabled={agentLoading || loading || !agentRequest.trim()}
-              style={{
-                ...buttonStyle,
-                width: '150px',
-                padding: '12px 14px',
-                fontSize: '14px',
-                opacity: agentLoading || loading || !agentRequest.trim() ? 0.65 : 1,
-              }}
-            >
-              {agentLoading ? 'Running...' : 'Run agent'}
-            </button>
-          </div>
-        </div>
+        {showAdvancedSetup && (
+        <>
         <div style={{ ...fieldStyle, display: 'grid', gridTemplateColumns: form.industry === 'Other' ? 'repeat(3, minmax(0, 1fr))' : 'repeat(2, minmax(0, 1fr))', gap: '16px', alignItems: 'end' }}>
           <div>
             <label style={labelStyle}>
@@ -4416,6 +4429,49 @@ function App() {
             </select>
           </div>
         </div>
+
+        {false && getSelectedIndustry(form) && (
+          <div style={{ ...optionalSectionStyle, marginTop: 0 }}>
+            <div style={sectionTitleStyle}>Dedicated domain coverage</div>
+            <div style={{ color: '#42526e', fontSize: '13px', lineHeight: 1.5, marginBottom: '12px' }}>
+              Supported domains: {industries.join(', ')}. A complete domain baseline has {coverageSpaceTypeCount} space/project types:
+              1 Jira Product Discovery space, {coverageBusinessSpaceTypes.length} Work Management spaces,
+              {coverageJsmServiceTypes.length} Jira Service Management spaces, and {coverageSoftwareTemplates.length} Software projects.
+              Forge can create {coverageCreateableSpaceTypeCount} of these directly for one domain ({coveragePerDomainItemCount} generated work items before Product Discovery ideas).
+              Jira Product Discovery is managed as existing-space volume here; select an existing JPD row with Volume to add 60 demo ideas.
+            </div>
+            <div style={{ display: 'grid', gridTemplateColumns: 'repeat(4, minmax(0, 1fr))', gap: '10px' }}>
+              <button
+                type="button"
+                onClick={() => addCoverageSelection('all')}
+                style={{ ...removeButtonStyle, minHeight: '42px', backgroundColor: '#0052cc', color: '#fff', borderColor: '#0052cc', fontWeight: 700 }}
+              >
+                Add full createable coverage
+              </button>
+              <button
+                type="button"
+                onClick={() => addCoverageSelection('jsm')}
+                style={{ ...removeButtonStyle, minHeight: '42px' }}
+              >
+                Add JSM coverage
+              </button>
+              <button
+                type="button"
+                onClick={() => addCoverageSelection('business')}
+                style={{ ...removeButtonStyle, minHeight: '42px' }}
+              >
+                Add Work Management coverage
+              </button>
+              <button
+                type="button"
+                onClick={() => addCoverageSelection('software')}
+                style={{ ...removeButtonStyle, minHeight: '42px' }}
+              >
+                Add Software coverage
+              </button>
+            </div>
+          </div>
+        )}
 
         {(domainInventoryLoading || domainInventory) && (
           <div style={{ ...optionalSectionStyle, marginTop: 0 }}>
@@ -4526,9 +4582,9 @@ function App() {
 
         {form.spaceType && (
           <div style={{ ...sectionStyle, marginTop: '16px' }}>
-            <div style={sectionTitleStyle}>Add selected space</div>
+            <div style={sectionTitleStyle}>Selected setup</div>
             <div style={{ color: '#42526e', fontSize: '13px', marginBottom: '12px' }}>
-              Add {selectedSpaceTypeLabel} for {getSelectedIndustry(form)}. You can switch the dropdown and add multiple space types before creating the demo.
+              Use {selectedSpaceTypeLabel} for {getSelectedIndustry(form)}. This replaces the current draft setup so only this selected space/project type is created.
             </div>
             {isSelectedSoftwareSpace && !isSelectedBugTrackingSpace && (
               <div style={{ ...fieldStyle, maxWidth: '260px' }}>
@@ -4814,8 +4870,10 @@ function App() {
           onMouseOver={(e) => { if (!loading) e.target.style.backgroundColor = '#0065ff'; }}
           onMouseOut={(e) => { e.target.style.backgroundColor = '#0052cc'; }}
         >
-          {loading ? 'Creating Demo Environment...' : 'CREATE DEMO ENVIRONMENT'}
+          {loading ? 'Running selected setup...' : 'REVIEW / APPLY SELECTED SETUP'}
         </button>
+        </>
+        )}
 
         {progress && <div style={progressStyle}>{progress}</div>}
 

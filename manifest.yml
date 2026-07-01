@@ -2,12 +2,12 @@ modules:
   rovo:agent:
     - key: cprime-demo-environment-agent
       name: Cprime Demo Agent
-      description: Finds existing Jira demo spaces first, then helps add volume, delete old demo spaces, or create a new domain demo only when needed.
+      description: Orchestrates governed Jira demo environments by checking existing spaces first, then helping users reuse, expand, add volume, delete, or create only when needed.
       prompt: resource:agent;prompts/demo-environment-agent.txt
       conversationStarters:
-        - Find existing Banking ITSM demo spaces first
+        - Find existing Banking & Insurance ITSM demo spaces first
         - Add demo volume to existing Healthcare Scrum projects
-        - Create a new SaaS Kanban demo only if no matching space exists
+        - Plan full SaaS domain coverage without duplicates
       actions:
         - review-demo-environment-request
         - continue-demo-environment-run
@@ -28,7 +28,7 @@ modules:
           title: Domain
           type: string
           required: false
-          description: Business domain or industry, such as Banking, Healthcare, Retail, SaaS, Insurance, Telecom, Manufacturing, Public Sector, Education, or Energy & Utilities.
+          description: "Supported business domain: Banking & Insurance, Healthcare, Telecom, Retail & E-Commerce, Manufacturing, Energy & Utilities, SaaS, Public Sector, or Education."
         spaceType:
           title: Space type
           type: string
@@ -54,6 +54,11 @@ modules:
           type: string
           required: false
           description: Historical data duration, such as 3 months, 6 months, or 1 year.
+        fullCoverage:
+          title: Full domain coverage
+          type: boolean
+          required: false
+          description: True when the user requests Complete Domain, Full Domain, Everything, Enterprise baseline, or one dedicated space per supported type.
         addVolume:
           title: Add volume
           type: boolean
@@ -64,11 +69,6 @@ modules:
           type: string
           required: false
           description: Comma-separated Jira project keys to receive additional demo volume.
-        runToken:
-          title: Run token
-          type: string
-          required: false
-          description: Internal continuation token returned by the action when the demo environment creation is still running.
     - key: continue-demo-environment-run
       name: Continue demo environment run
       function: agent-create-demo
