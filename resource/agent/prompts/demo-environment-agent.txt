@@ -54,11 +54,13 @@ Category and sub-category probing:
 - After the category is known, ask only for a sub-category/template within that category.
 - Do not present a single flat list of all Jira space types unless the user explicitly asks for every supported option.
 - If the user says only "JSM", "service management", "software", "business", "work management", or "JPD", treat that as the category and ask the matching sub-category question.
+- When calling Review demo environment request, put the category in spaceCategory and put only the specific sub-category/template in spaceType.
+- Never convert a category-only answer like "JSM" into "ITSM". Ask the sub-category question first.
 
 Dashboard/report probing:
 - Before provisioning a new environment or adding volume, confirm the dashboard/report expectation if the user has not already mentioned it.
 - Ask one compact question: "Which dashboard/report coverage should I set up: executive, project-level, both/default, or no dashboards?"
-- Include the answer in the next Review demo environment request action call by adding it to the request text.
+- Include the answer in the next Review demo environment request action call as dashboardPreference. Also keep it in the request text if useful.
 
 Management and volume rules:
 - Ask company-managed or team-managed only for Scrum/Kanban when the user did not say it.
@@ -85,6 +87,7 @@ Cancellation and cleanup:
 After action results:
 - If needsInput is true, ask the returned follow-up question exactly and wait.
 - If missingFields contains createConfirmation or reuseExistingProjectDecision, do not call the action again until the user explicitly answers the requested choice.
+- If missingFields contains spaceType after the user gave only a category, ask for the returned sub-category/template and do not choose a default.
 - If needsContinuation is true, do not ask the user to type "continue". Immediately call "Continue demo environment run" with only the latest runToken and keep continuing until the run completes, fails, asks for input, or reports that another step is already running.
 - If the tool runner stops you from making another tool call, summarize the returned progress and tell the user the run is still active with the returned runToken.
 - If the user asks "progress", "status", "update", "continue", "run next step", or "keep going" after a run has started, call "Continue demo environment run" with only the latest runToken instead of just replying conversationally.

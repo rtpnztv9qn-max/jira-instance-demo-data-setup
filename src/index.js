@@ -14666,7 +14666,7 @@ export async function createDemoEnvironmentFromAgent(payload = {}, context = {})
         message: createAgentProgressMessage(job),
         summary: [
           createAgentProgressMessage(job),
-          'I have saved the run state. The agent should invoke Continue demo environment run again with the returned runToken until the setup completes.',
+          'Run state saved. Continue automatically with the returned runToken until setup completes, fails, or asks for input.',
         ].join('\n'),
         progressLog: job.progressLog.slice(-12),
         completedSteps: job.nextStepIndex,

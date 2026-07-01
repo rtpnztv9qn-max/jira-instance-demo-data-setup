@@ -29,31 +29,31 @@ modules:
           type: string
           required: false
           description: "Supported business domain: Banking & Insurance, Healthcare, Telecom, Retail & E-Commerce, Manufacturing, Energy & Utilities, SaaS, Public Sector, or Education."
+        spaceCategory:
+          title: Jira category
+          type: string
+          required: false
+          description: High-level Jira category only. Valid values are Jira Service Management, Work Management, Jira Software, or Product Management. Do not use this for the sub-category/template.
         spaceType:
-          title: Space type
+          title: Sub-category or template
           type: string
           required: false
-          description: Requested Jira space type, such as ITSM, HRSM, CSM, FSM, LSM, scrum, kanban, bug-tracking, task-tracking, budget-planning, or procurement-management.
-        softwareTemplate:
-          title: Software template
-          type: string
-          required: false
-          description: Software template when creating a Jira Software project. Valid values are scrum, kanban, or bug-tracking.
+          description: Requested sub-category/template only, such as ITSM, HRSM, CSM, FSM, LSM, scrum, kanban, bug-tracking, task-tracking, budget-planning, or procurement-management. If the user only says JSM, Work Management, Software, or JPD, pass that as spaceCategory and ask for this field.
         projectManagement:
           title: Project management
           type: string
           required: false
           description: Team-managed or company-managed for scrum and kanban software projects.
-        businessSpaceType:
-          title: Business space type
-          type: string
-          required: false
-          description: Business project type, such as task-tracking, budget-planning, or procurement-management.
         dateRange:
           title: Ticket data duration
           type: string
           required: false
           description: Historical data duration, such as 3 months, 6 months, or 1 year.
+        dashboardPreference:
+          title: Dashboard/report coverage
+          type: string
+          required: false
+          description: Dashboard/report coverage requested by the user. Valid values include executive, project-level, both/default, or none.
         fullCoverage:
           title: Full domain coverage
           type: boolean
