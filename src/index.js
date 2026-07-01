@@ -9238,7 +9238,7 @@ const AGENT_DOMAIN_ALIASES = [
 ];
 const AGENT_SUPPORTED_DOMAIN_NAMES = AGENT_DOMAIN_ALIASES.map(([domain]) => domain);
 const AGENT_RUN_KEY_PREFIX = 'agent-demo-run:';
-const AGENT_RUN_STEP_BATCH_LIMIT = 1;
+const AGENT_RUN_STEP_BATCH_LIMIT = 3;
 const AGENT_RUN_TIME_BUDGET_MS = 18000;
 const AGENT_RUN_LOCK_TTL_MS = 30000;
 const AGENT_FULL_COVERAGE_SOFTWARE_PROJECTS = [
@@ -9305,6 +9305,11 @@ function getAgentRequestText(payload = {}) {
     payload.projectManagement,
     payload.businessSpaceType,
     payload.dateRange,
+    payload.dashboardPreference,
+    payload.dashboardFocus,
+    payload.dashboard,
+    payload.reportPreference,
+    payload.reportFocus,
     payload.volume,
     payload.fullCoverage === true ? 'full coverage' : '',
     payload.purpose,
@@ -9631,6 +9636,67 @@ function buildAgentDashboardDefaults({ jsmServiceTypes, softwareProjects, busine
   };
 }
 
+function inferAgentDashboardPreference(payload = {}, requestText = '') {
+  const explicit = [
+    payload.dashboardPreference,
+    payload.dashboardFocus,
+    payload.dashboard,
+    payload.reportPreference,
+    payload.reportFocus,
+  ].map(value => String(value || '').trim()).filter(Boolean).join(' ');
+  const text = `${explicit} ${requestText}`.toLowerCase();
+
+  if (textIncludesAny(text, ['no dashboard', 'no dashboards', 'without dashboard', 'without dashboards', 'skip dashboard', 'skip dashboards'])) {
+    return 'none';
+  }
+  if (textIncludesAny(text, ['both dashboards', 'both/default', 'default dashboards', 'all dashboards', 'dashboard and report', 'dashboards and reports'])) {
+    return 'both';
+  }
+  if (textIncludesAny(text, ['executive dashboard', 'executive report', 'leadership dashboard', 'cross-project dashboard', 'cross project dashboard'])) {
+    return 'executive';
+  }
+  if (textIncludesAny(text, ['project-level dashboard', 'project level dashboard', 'single-project dashboard', 'single project dashboard', 'team dashboard'])) {
+    return 'project-level';
+  }
+  if (textIncludesAny(text, ['dashboard', 'dashboards', 'report', 'reports', 'created vs resolved', 'sla', 'burndown', 'release report', 'velocity'])) {
+    return 'both';
+  }
+
+  return '';
+}
+
+function agentRequestIsLookupOnly(payload = {}, requestText = '') {
+  const text = String(requestText || '').toLowerCase();
+  if (payload.reviewOnly || payload.lookupOnly || payload.describeOnly) {
+    return true;
+  }
+
+  return textIncludesAny(text, [
+    'find existing',
+    'show existing',
+    'list existing',
+    'check existing',
+    'what exists',
+    'existing spaces first',
+    'recommend existing',
+  ])
+    && !agentRequestExplicitlyConfirmsCreation(payload, requestText)
+    && !agentRequestExplicitlyNeedsNewSpace(requestText)
+    && !agentRequestWantsFullCoverage(payload, requestText);
+}
+
+function formatAgentDashboardPreferenceQuestion(domain, requestedType) {
+  return [
+    `Before I provision ${requestedType || 'this demo setup'} for ${domain}, which dashboard/report coverage should I set up?`,
+    '',
+    'Reply with one of:',
+    '- executive',
+    '- project-level',
+    '- both/default',
+    '- no dashboards',
+  ].join('\n');
+}
+
 function buildAgentDemoEnvironmentPayload(payload = {}) {
   const requestText = getAgentRequestText(payload);
   const domain = inferAgentDomain(payload, requestText);
@@ -9659,6 +9725,7 @@ function buildAgentDemoEnvironmentPayload(payload = {}) {
   const businessSpaceType = inferAgentBusinessSpaceType(payload, requestText);
   const wantsProductDiscovery = textIncludesAny(requestText, ['product discovery', 'jpd']);
   const wantsFullCoverage = agentRequestWantsFullCoverage(payload, requestText);
+  const dashboardPreference = inferAgentDashboardPreference(payload, requestText);
 
   if (wantsProductDiscovery && !wantsFullCoverage && !addVolume) {
     return {
@@ -9673,6 +9740,22 @@ function buildAgentDemoEnvironmentPayload(payload = {}) {
       ready: false,
       question: 'Which Jira space should I use: ITSM, HRSM, CSM, FSM, LSM, Scrum, Kanban, Bug Tracking, Project Management, Task Tracking, Budget Planning, Recruitment Tracking, or Procurement Management?',
       missingFields: ['spaceType'],
+    };
+  }
+
+  const createLikeRequest = wantsFullCoverage || Boolean(softwareTemplate || jsmServiceType || businessSpaceType);
+  if (createLikeRequest && !addVolume && !agentRequestIsLookupOnly(payload, requestText) && !dashboardPreference) {
+    const requestedType = softwareTemplate
+      ? `Jira Software ${getSoftwareTemplateLabel(softwareTemplate)}`
+      : jsmServiceType
+        ? getJsmServiceTypeLabel(jsmServiceType)
+        : businessSpaceType
+          ? getBusinessSpaceTypeLabel(businessSpaceType)
+          : 'full domain coverage';
+    return {
+      ready: false,
+      question: formatAgentDashboardPreferenceQuestion(domain, requestedType),
+      missingFields: ['dashboardPreference'],
     };
   }
 
@@ -9721,6 +9804,7 @@ function buildAgentDemoEnvironmentPayload(payload = {}) {
       customIndustry: '',
       isCustomIndustry: false,
       environmentName: createAgentEnvironmentName(domain),
+      agentDashboardPreference: dashboardPreference || 'default',
       reuseExistingDomainData: true,
       addVolumeToExistingDomainData: addVolume,
       volumeProjectKeys,
@@ -14415,24 +14499,6 @@ export async function createDemoEnvironmentFromAgent(payload = {}, context = {})
       updatedAt: new Date().toISOString(),
     };
     await kvs.set(getAgentRunStorageKey(runToken), job);
-    return {
-      success: false,
-      needsInput: false,
-      needsContinuation: true,
-      runToken,
-      message: [
-        `I prepared ${plan.length} setup step(s) for ${config.environmentName}.`,
-        'Reply "continue" and I will run the next setup step with the saved run token.',
-      ].join(' '),
-      summary: [
-        `Prepared ${plan.length} setup step(s) for ${config.environmentName}.`,
-        '',
-        'No Jira resources have been created yet. Reply "continue" to run the first setup step.',
-      ].join('\n'),
-      progressLog: job.progressLog.slice(-12),
-      completedSteps: 0,
-      totalSteps: plan.length,
-    };
   }
 
   let { config, state } = job;
@@ -14467,7 +14533,7 @@ export async function createDemoEnvironmentFromAgent(payload = {}, context = {})
         needsInput: false,
         needsContinuation: true,
         runToken,
-        message: 'A setup step is already running for this demo environment. Wait a moment, then reply "continue" again.',
+        message: 'A setup step is already running for this demo environment. Wait a moment, then continue with the same run token.',
         summary: [
           createAgentProgressMessage(job),
           'A previous continuation call is still running or recently finished. Wait a moment, then continue with the same run token.',
@@ -14510,7 +14576,7 @@ export async function createDemoEnvironmentFromAgent(payload = {}, context = {})
         message: createAgentProgressMessage(job),
         summary: [
           createAgentProgressMessage(job),
-          'I have saved the run state. Continue by invoking the same action again with the returned runToken.',
+          'I have saved the run state. The agent should invoke Continue demo environment run again with the returned runToken until the setup completes.',
         ].join('\n'),
         progressLog: job.progressLog.slice(-12),
         completedSteps: job.nextStepIndex,
