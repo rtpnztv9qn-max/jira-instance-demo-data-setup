@@ -9300,6 +9300,7 @@ function getAgentRequestText(payload = {}) {
     payload.operation,
     payload.request,
     payload.domain,
+    payload.spaceCategory,
     payload.spaceType,
     payload.softwareTemplate,
     payload.projectManagement,
@@ -9401,7 +9402,7 @@ function inferAgentJsmServiceType(payload = {}, requestText = '') {
   if (textIncludesAny(requestText, ['csm', 'customer service'])) return 'CSM';
   if (textIncludesAny(requestText, ['fsm', 'facilities', 'facility'])) return 'FSM';
   if (textIncludesAny(requestText, ['lsm', 'legal service'])) return 'LSM';
-  if (textIncludesAny(requestText, ['itsm', 'it service', 'service management', 'incident', 'change request', 'problem request'])) return 'ITSM';
+  if (textIncludesAny(requestText, ['itsm', 'it service', 'incident', 'change request', 'problem request'])) return 'ITSM';
 
   return '';
 }
@@ -9428,11 +9429,83 @@ function inferAgentBusinessSpaceType(payload = {}, requestText = '') {
     return 'project-management';
   }
 
-  if (textIncludesAny(requestText, ['task tracking', 'task-tracking', 'work management', 'business project'])) {
+  if (textIncludesAny(requestText, ['task tracking', 'task-tracking'])) {
     return 'task-tracking';
   }
 
   return '';
+}
+
+function normaliseAgentSpaceCategory(value = '') {
+  const normalized = String(value || '').trim().toLowerCase();
+  if (['jsm', 'jira service management', 'service management'].includes(normalized)) return 'jsm';
+  if (['business', 'work management', 'jira work management', 'business project', 'business projects'].includes(normalized)) return 'business';
+  if (['software', 'jira software', 'software project', 'software projects'].includes(normalized)) return 'software';
+  if (['jpd', 'product discovery', 'jira product discovery', 'product management'].includes(normalized)) return 'jpd';
+  return '';
+}
+
+function inferAgentSpaceCategory(payload = {}, requestText = '') {
+  const explicitCategory = normaliseAgentSpaceCategory(payload.spaceCategory || payload.category || payload.productCategory);
+  if (explicitCategory) {
+    return explicitCategory;
+  }
+
+  const explicitSpaceType = String(payload.spaceType || '').trim().toLowerCase();
+  if (explicitSpaceType.includes(':')) {
+    return explicitSpaceType.split(':')[0];
+  }
+
+  if (String(payload.serviceType || '').trim()) return 'jsm';
+  if (String(payload.businessSpaceType || '').trim()) return 'business';
+  if (String(payload.softwareTemplate || '').trim()) return 'software';
+
+  if (textIncludesAny(requestText, ['jira product discovery', 'product discovery', 'jpd', 'product management'])) return 'jpd';
+  if (textIncludesAny(requestText, ['jira service management', 'service management', 'jsm', 'hrsm', 'csm', 'fsm', 'lsm', 'itsm', 'incident', 'change request', 'problem request'])) return 'jsm';
+  if (textIncludesAny(requestText, ['work management', 'business project', 'business projects', 'project management', 'task tracking', 'budget planning', 'recruitment tracking', 'procurement management'])) return 'business';
+  if (textIncludesAny(requestText, ['jira software', 'software project', 'software projects', 'scrum', 'kanban', 'bug tracking', 'defect tracking'])) return 'software';
+
+  return '';
+}
+
+function formatAgentSpaceCategoryQuestion(domain) {
+  return [
+    `Which Jira category should I use for the ${domain} demo?`,
+    '',
+    'Reply with one of:',
+    '- Jira Service Management',
+    '- Work Management',
+    '- Jira Software',
+    '- Product Management / Jira Product Discovery',
+  ].join('\n');
+}
+
+function formatAgentSpaceSubcategoryQuestion(category) {
+  if (category === 'jsm') {
+    return [
+      'Which Jira Service Management sub-category should I use?',
+      '',
+      'Reply with one of: IT Service Management, HR Service Management, Customer Service Management, Facilities Service Management, or Legal Service Management.',
+    ].join('\n');
+  }
+  if (category === 'business') {
+    return [
+      'Which Work Management template should I use?',
+      '',
+      'Reply with one of: Project Management, Task Tracking, Budget Planning, Recruitment Tracking, or Procurement Management.',
+    ].join('\n');
+  }
+  if (category === 'software') {
+    return [
+      'Which Jira Software template should I use?',
+      '',
+      'Reply with one of: Scrum, Kanban, or Bug Tracking. For Scrum/Kanban, also tell me team-managed or company-managed if you care.',
+    ].join('\n');
+  }
+  if (category === 'jpd') {
+    return 'Jira Product Discovery volume needs an existing native JPD project key. Which JPD project key should receive demo ideas?';
+  }
+  return 'Which sub-category or template should I use?';
 }
 
 function extractAgentProjectKeys(payload = {}) {
@@ -9726,11 +9799,28 @@ function buildAgentDemoEnvironmentPayload(payload = {}) {
   const wantsProductDiscovery = textIncludesAny(requestText, ['product discovery', 'jpd']);
   const wantsFullCoverage = agentRequestWantsFullCoverage(payload, requestText);
   const dashboardPreference = inferAgentDashboardPreference(payload, requestText);
+  const spaceCategory = inferAgentSpaceCategory(payload, requestText);
 
-  if (wantsProductDiscovery && !wantsFullCoverage && !addVolume) {
+  if (!wantsFullCoverage && !spaceCategory && !softwareTemplate && !jsmServiceType && !businessSpaceType && !addVolume) {
     return {
       ready: false,
-      question: 'Jira Product Discovery spaces must be created in Jira first. Share the existing Product Discovery project key if you want me to add demo ideas as volume.',
+      question: formatAgentSpaceCategoryQuestion(domain),
+      missingFields: ['spaceCategory'],
+    };
+  }
+
+  if (!wantsFullCoverage && spaceCategory && !softwareTemplate && !jsmServiceType && !businessSpaceType && !wantsProductDiscovery && !addVolume) {
+    return {
+      ready: false,
+      question: formatAgentSpaceSubcategoryQuestion(spaceCategory),
+      missingFields: ['spaceType'],
+    };
+  }
+
+  if ((wantsProductDiscovery || spaceCategory === 'jpd') && !wantsFullCoverage && !addVolume) {
+    return {
+      ready: false,
+      question: formatAgentSpaceSubcategoryQuestion('jpd'),
       missingFields: ['volumeProjectKeys'],
     };
   }
@@ -9738,7 +9828,7 @@ function buildAgentDemoEnvironmentPayload(payload = {}) {
   if (!wantsFullCoverage && !softwareTemplate && !jsmServiceType && !businessSpaceType && !addVolume) {
     return {
       ready: false,
-      question: 'Which Jira space should I use: ITSM, HRSM, CSM, FSM, LSM, Scrum, Kanban, Bug Tracking, Project Management, Task Tracking, Budget Planning, Recruitment Tracking, or Procurement Management?',
+      question: formatAgentSpaceCategoryQuestion(domain),
       missingFields: ['spaceType'],
     };
   }

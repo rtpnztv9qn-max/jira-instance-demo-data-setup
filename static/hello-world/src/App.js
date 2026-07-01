@@ -2871,6 +2871,7 @@ function App() {
     productDiscoveryDashboardTypes: [],
     productDiscoveryDashboardPrompt: '',
     dateRange: '6 months',
+    spaceCategory: '',
     spaceType: '',
     softwareProjectStyle: 'team-managed',
     jsmServiceTypes: [],
@@ -2952,9 +2953,10 @@ function App() {
       ...form,
       [name]: value,
       ...(name === 'industry' && value !== 'Other' ? { customIndustry: '' } : {}),
-      ...(name === 'industry' ? { spaceType: '' } : {}),
+      ...(name === 'industry' ? { spaceCategory: '', spaceType: '' } : {}),
+      ...(name === 'spaceCategory' ? { spaceType: '' } : {}),
     });
-    if (name === 'industry' || name === 'customIndustry' || name === 'spaceType') {
+    if (name === 'industry' || name === 'customIndustry' || name === 'spaceCategory' || name === 'spaceType') {
       setSelectedVolumeProjectKeys([]);
       setSelectedDeleteProjectKeys([]);
       setSelectionFeedback('');
@@ -4371,7 +4373,7 @@ function App() {
         </div>
         {showAdvancedSetup && (
         <>
-        <div style={{ ...fieldStyle, display: 'grid', gridTemplateColumns: form.industry === 'Other' ? 'repeat(3, minmax(0, 1fr))' : 'repeat(2, minmax(0, 1fr))', gap: '16px', alignItems: 'end' }}>
+        <div style={{ ...fieldStyle, display: 'grid', gridTemplateColumns: form.industry === 'Other' ? 'repeat(4, minmax(0, 1fr))' : 'repeat(3, minmax(0, 1fr))', gap: '16px', alignItems: 'end' }}>
           <div>
             <label style={labelStyle}>
               Business Domain
@@ -4410,21 +4412,32 @@ function App() {
             </div>
           )}
           <div>
-            <label style={labelStyle}>Space Type</label>
+            <label style={labelStyle}>Jira Category</label>
+            <select
+              name="spaceCategory"
+              value={form.spaceCategory}
+              onChange={handleChange}
+              style={selectStyle}
+              disabled={!getSelectedIndustry(form)}
+            >
+              <option value="">Select category</option>
+              {agentSpaceCategoryOptions.map(option => (
+                <option key={option.value} value={option.value}>{option.label}</option>
+              ))}
+            </select>
+          </div>
+          <div>
+            <label style={labelStyle}>Sub-category / Template</label>
             <select
               name="spaceType"
               value={form.spaceType}
               onChange={handleChange}
               style={selectStyle}
-              disabled={!getSelectedIndustry(form)}
+              disabled={!getSelectedIndustry(form) || !form.spaceCategory}
             >
-              <option value="">Select space type</option>
-              {Object.entries(groupedSpaceTypeOptions).map(([groupLabel, options]) => (
-                <optgroup key={groupLabel} label={groupLabel}>
-                  {options.map(option => (
-                    <option key={option.value} value={option.value}>{option.label}</option>
-                  ))}
-                </optgroup>
+              <option value="">Select sub-category</option>
+              {getAgentOptionsForCategory(form.spaceCategory).map(option => (
+                <option key={option.value} value={option.value}>{option.label}</option>
               ))}
             </select>
           </div>
