@@ -49,11 +49,6 @@ modules:
           type: string
           required: false
           description: Historical data duration, such as 3 months, 6 months, or 1 year.
-        businessSpaceType:
-          title: Business space type
-          type: string
-          required: false
-          description: Business project type, such as task-tracking, budget-planning, or procurement-management.
         dashboardPreference:
           title: Dashboard/report coverage
           type: string
