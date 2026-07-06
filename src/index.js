@@ -2755,6 +2755,40 @@ async function searchDomainProjects(domain, options = {}) {
   return projects;
 }
 
+async function searchDomainProjectsForAgentPreflight(domain, requestedSpaceType, options = {}) {
+  const diagnostics = Array.isArray(options.diagnostics) ? options.diagnostics : [];
+  let matches = await searchDomainProjects(domain, {
+    ...options,
+    spaceType: requestedSpaceType,
+    diagnostics,
+  });
+
+  if (matches.length > 0 || !String(requestedSpaceType || '').startsWith('jsm:')) {
+    return matches;
+  }
+
+  const jsmType = normaliseJsmServiceType(String(requestedSpaceType || '').replace(/^jsm:/, ''));
+  const broadMatches = await searchDomainProjects(domain, {
+    ...options,
+    spaceType: '',
+    diagnostics,
+  });
+
+  matches = broadMatches.filter(project => {
+    const projectType = String(project.projectTypeKey || '').toLowerCase();
+    const name = String(project.name || '').toLowerCase();
+    const isServiceManagement = project.kind === 'business' || projectType === 'service_desk' || projectType === 'service-management';
+    const nameLooksLikeRequestedJsm = name.includes(jsmType.toLowerCase()) || name.includes(`${jsmType.toLowerCase()} ops`);
+    return isServiceManagement && nameLooksLikeRequestedJsm;
+  });
+
+  if (matches.length > 0) {
+    diagnostics.push(`Existing lookup fallback: matched ${matches.length} ${domain} ${jsmType} Service Management project(s) by project name.`);
+  }
+
+  return matches;
+}
+
 function getDomainProjectUrl(siteDetails, project) {
   const key = encodeURIComponent(project?.key || '');
   if (!key) {
@@ -10714,14 +10748,30 @@ async function buildAgentPreflightDecision(config = {}) {
   }
 
   if (config.agentConfirmedCreate) {
-    const existingMatches = await searchDomainProjects(config.industry, {
+    const existingMatches = await searchDomainProjectsForAgentPreflight(config.industry, requestedSpaceType, {
       spaceType: requestedSpaceType,
-      includeIssueCounts: false,
-      includeConfiguration: false,
+      includeIssueCounts: true,
+      includeConfiguration: true,
     });
     const requestedSpaceLabel = formatRequestedAgentSpaceType(requestedSpaceType);
+    if (existingMatches.length > 0 && !config.agentExplicitCreateNew) {
+      const question = [
+        formatAgentExistingSpacePrompt(config.industry, requestedSpaceType, existingMatches),
+        '',
+        `I did not create a new ${requestedSpaceLabel} environment because matching spaces already exist.`,
+      ].join('\n');
+      return {
+        success: false,
+        needsInput: true,
+        question,
+        summary: question,
+        missingFields: ['reuseExistingProjectDecision'],
+        matches: existingMatches.slice(0, 12),
+      };
+    }
+
     config.agentExistingLookupMessage = existingMatches.length > 0
-      ? `Existing ${config.industry} ${requestedSpaceLabel} demo space(s) were found, but the user confirmed creating a new environment.`
+      ? `Existing ${config.industry} ${requestedSpaceLabel} demo space(s) were found, but the user explicitly requested a separate new environment.`
       : `No existing ${config.industry} ${requestedSpaceLabel} demo space was found, so I am creating a new environment.`;
     config.agentExistingLookupMatchCount = existingMatches.length;
     return null;
@@ -10742,7 +10792,7 @@ async function buildAgentPreflightDecision(config = {}) {
     };
   }
 
-  const existingMatches = await searchDomainProjects(config.industry, {
+  const existingMatches = await searchDomainProjectsForAgentPreflight(config.industry, requestedSpaceType, {
     spaceType: requestedSpaceType,
     includeIssueCounts: true,
     includeConfiguration: true,
