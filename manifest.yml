@@ -49,6 +49,11 @@ modules:
           type: string
           required: false
           description: Historical data duration, such as 3 months, 6 months, or 1 year.
+        businessSpaceType:
+          title: Business space type
+          type: string
+          required: false
+          description: Business project type, such as task-tracking, budget-planning, or procurement-management.
         dashboardPreference:
           title: Dashboard/report coverage
           type: string
@@ -135,8 +140,14 @@ modules:
       handler: index.createDemoEnvironmentFromAgent
     - key: agent-cancel-demo
       handler: index.cancelDemoEnvironmentFromAgent
+    - key: agent-demo-run-worker
+      handler: index.processAgentDemoRun
     - key: environment-cleanup
       handler: index.scheduledCleanup
+  consumer:
+    - key: agent-demo-run-consumer
+      queue: agent-demo-run-queue
+      function: agent-demo-run-worker
   scheduledTrigger:
     - key: weekly-environment-cleanup
       function: environment-cleanup
