@@ -10457,37 +10457,6 @@ function inferAgentSpaceCategory(payload = {}, requestText = '') {
   return '';
 }
 
-function inferAgentDashboardPreference(payload = {}, requestText = '') {
-  if (payload.dashboardRequired === false) {
-    return 'none';
-  }
-
-  const explicit = String(payload.dashboardPreference || payload.dashboardLevel || payload.dashboardType || '').trim().toLowerCase();
-  const text = `${explicit} ${String(requestText || '').toLowerCase()}`;
-
-  if (textIncludesAny(text, ['no dashboard', 'without dashboard', 'skip dashboard', 'dashboard not needed', 'dashboard not necessary', 'not necessary dashboard'])) {
-    return 'none';
-  }
-
-  if (textIncludesAny(text, ['both dashboards', 'both dashboard', 'executive and project', 'project and executive', 'all dashboards'])) {
-    return 'both';
-  }
-
-  if (textIncludesAny(text, ['executive dashboard', 'executive', 'portfolio dashboard', 'enterprise dashboard', 'management dashboard'])) {
-    return 'executive';
-  }
-
-  if (textIncludesAny(text, ['project level dashboard', 'project-level dashboard', 'project dashboard', 'team dashboard'])) {
-    return 'project';
-  }
-
-  if (textIncludesAny(text, ['dashboard required', 'dashboard needed', 'dashboard necessary', 'create dashboard', 'with dashboard'])) {
-    return 'project';
-  }
-
-  return '';
-}
-
 function formatAgentSpaceCategoryQuestion(domain) {
   return [
     `Which Jira category should I use for the ${domain} demo?`,
