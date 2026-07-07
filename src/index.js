@@ -10682,6 +10682,15 @@ function extractAgentProjectKeys(payload = {}) {
 
 function agentRequestExplicitlyNeedsNewSpace(requestText) {
   return textIncludesAny(requestText, [
+    'yes create new',
+    'yes, create new',
+    'yes please create new',
+    'create new environment',
+    'create a new environment',
+    'create new space',
+    'create a new space',
+    'create new project',
+    'create a new project',
     'create new because',
     'create a new because',
     'create the new because',
@@ -10706,10 +10715,8 @@ function agentRequestExplicitlyConfirmsCreation(payload = {}, requestText = '') 
     'yes',
     'yes please',
     'proceed',
-    'continue',
-    'create',
-    'create new',
-    'start',
+    'go ahead',
+    'go ahead please',
   ].includes(normalizedText) || textIncludesAny(requestText, [
     'yes create',
     'yes, create',
@@ -10762,7 +10769,23 @@ async function buildAgentPreflightDecision(config = {}) {
   }
 
   const requestedSpaceType = getRequestedAgentSpaceTypeFromConfig(config);
-  if (!requestedSpaceType || config.addVolumeToExistingDomainData) {
+  if (!requestedSpaceType) {
+    const question = [
+      `I have the domain as ${config.industry || 'the selected domain'}, but I do not have a specific Jira space type yet.`,
+      'Please choose the Jira product and sub-type first, for example: JSM ITSM, JSM CSM, Jira Software Scrum, or Work Management Task Tracking.',
+      '',
+      'I will check existing matching projects before creating anything.',
+    ].join('\n');
+    return {
+      success: false,
+      needsInput: true,
+      question,
+      summary: question,
+      missingFields: ['spaceType'],
+    };
+  }
+
+  if (config.addVolumeToExistingDomainData) {
     return null;
   }
 
@@ -10786,6 +10809,24 @@ async function buildAgentPreflightDecision(config = {}) {
         summary: question,
         missingFields: ['reuseExistingProjectDecision'],
         matches: existingMatches.slice(0, 12),
+      };
+    }
+
+    if (existingMatches.length === 0 && !config.agentExplicitCreateNew) {
+      const question = [
+        `I did not find an existing ${config.industry} ${requestedSpaceLabel} project matching this domain and space type.`,
+        'Dashboard choice was not used to exclude existing matches.',
+        '',
+        'No new environment has been created yet.',
+        'Reply exactly "yes create new" if you want me to create a fresh environment, or give a project key if you want me to add volume to an existing project.',
+      ].join('\n');
+      return {
+        success: false,
+        needsInput: true,
+        question,
+        summary: question,
+        missingFields: ['createConfirmation'],
+        matches: [],
       };
     }
 
