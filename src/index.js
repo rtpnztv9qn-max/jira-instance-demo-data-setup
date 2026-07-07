@@ -2550,7 +2550,7 @@ function classifyDomainProject(project, metadata = null) {
   const lowerName = name.toLowerCase();
   const serviceType = JSM_SERVICE_TYPES.find(type => new RegExp(`\\b${type}\\b`, 'i').test(name));
 
-  if (actualProjectTypeKey === 'service_desk') {
+  if (actualProjectTypeKey === 'service_desk' || actualProjectTypeKey === 'service-management' || actualProjectTypeKey === 'service_management') {
     return {
       ...value,
       kind: 'business',
@@ -2582,7 +2582,7 @@ function classifyDomainProject(project, metadata = null) {
   const isKanban = /\bkanban\b/i.test(name);
   const isScrum = /\bscrum\b/i.test(name);
 
-  if (project?.projectTypeKey === 'service_desk') {
+  if (project?.projectTypeKey === 'service_desk' || project?.projectTypeKey === 'service-management' || project?.projectTypeKey === 'service_management') {
     return {
       kind: 'business',
       jsmServiceType: serviceType || 'ITSM',
@@ -2688,6 +2688,12 @@ async function searchDomainProjects(domain, options = {}) {
   const valuesByKey = new Map();
   const siteDetails = includeConfiguration ? await getCurrentSiteDetails() : null;
 
+  try {
+    await addProjectSearchResults(valuesByKey, '/rest/api/3/project/search', diagnostics);
+  } catch (err) {
+    diagnostics.push(`Existing lookup: all-project listing failed: ${err.message}`);
+  }
+
   for (const query of getDomainSearchAliases(domain).slice(0, 6)) {
     await addProjectSearchResults(valuesByKey, `/rest/api/3/project/search?query=${encodeURIComponent(query)}`, diagnostics);
   }
@@ -2711,6 +2717,12 @@ async function searchDomainProjects(domain, options = {}) {
       await addProjectSearchResults(valuesByKey, `/rest/api/3/project/search?query=${encodeURIComponent(query)}`, diagnostics);
     }
   }
+
+  console.log('Existing domain lookup candidates', JSON.stringify({
+    domain,
+    requestedSpaceType,
+    candidateCount: valuesByKey.size,
+  }));
 
   const projects = [];
 
@@ -2751,6 +2763,13 @@ async function searchDomainProjects(domain, options = {}) {
 
     projects.push(record);
   }
+
+  console.log('Existing domain lookup matches', JSON.stringify({
+    domain,
+    requestedSpaceType,
+    matchCount: projects.length,
+    keys: projects.slice(0, 12).map(project => project.key),
+  }));
 
   return projects;
 }
