@@ -13282,58 +13282,32 @@ async function executeSoftwareProjectStep(config, state, step) {
 async function executeSoftwareDateFieldStep(state, step) {
   const project = state.results.softwareProjects[step.projectIndex];
   if (!project?.id || !project?.key) {
-    addChunkedError(state, `Software Project ${step.projectIndex + 1}: skipped date field setup because the project was not created.`);
+    addChunkedDiagnostics(state, [`Software Project ${step.projectIndex + 1}: skipped date field setup because the project was not created.`]);
     return;
   }
 
-  project.timelineStartDateFieldId = await getTimelineStartDateFieldId(state.results.diagnostics);
-
   try {
     const diagnostics = [];
-    const setupResult = project.softwareProjectStyle === 'team-managed'
-      ? {
-        ...(await resolveDemoDateFieldsWithoutScreenSetup(project.key, diagnostics)),
-        success: true,
-        screenCount: 0,
-      }
-      : await ensureDemoDateFieldsOnProjectScreens(project.id, project.key);
-    const demoDateFields = setupResult.demoDateFields || setupResult;
-    if (Array.isArray(setupResult.diagnostics)) {
-      diagnostics.push(...setupResult.diagnostics);
-    }
-    await ensureDevelopmentFieldOnProjectScreens(project.id, project.key, diagnostics);
-    await ensureComponentsFieldOnProjectScreens(project.id, project.key, diagnostics);
-    addChunkedDiagnostics(state, diagnostics);
+    project.timelineStartDateFieldId = await getTimelineStartDateFieldId(diagnostics);
+    const demoDateFields = await resolveDemoDateFieldsWithoutScreenSetup(project.key, diagnostics);
 
     project.demoDateFields = demoDateFields;
     project.demoDateFieldsReady = Boolean(demoDateFields.createdDateFieldId || demoDateFields.resolvedDateFieldId);
     project.skipDemoDateFieldWrites = !project.demoDateFieldsReady;
 
     if (!project.demoDateFieldsReady) {
-      addChunkedError(state, `Software Project ${project.key}: could not resolve demo date fields.`);
+      diagnostics.push(`Date fields ${project.key}: demo date fields were not resolved; charts will use generated issue metadata fallback.`);
     }
 
-    if (project.softwareProjectStyle === 'team-managed') {
-      addChunkedDiagnostics(state, [
-        `Date fields ${project.key}: team-managed project screen setup is not available through classic Jira screen APIs; charts will use generated date metadata if Jira blocks custom field writes.`,
-      ]);
-    } else if (setupResult.success) {
-      addChunkedDiagnostics(state, [
-        `Date fields ${project.key}: configured ${setupResult.fieldCount || 0} date field(s) on ${setupResult.screenCount || 0} company-managed screen(s).`,
-      ]);
-    } else {
-      addChunkedDiagnostics(state, [
-        `Date fields ${project.key}: screen setup did not complete (${setupResult.message || 'unknown reason'}); charts will use generated date metadata if Jira blocks custom field writes.`,
-      ]);
-    }
+    diagnostics.push(`Date fields ${project.key}: fast setup completed; skipped classic screen updates to keep demo creation within Forge time limits.`);
+    addChunkedDiagnostics(state, diagnostics);
   } catch (err) {
     project.demoDateFields = null;
     project.demoDateFieldsReady = false;
     project.skipDemoDateFieldWrites = true;
     addChunkedDiagnostics(state, [
-      `Date fields ${project.key}: date field resolution failed: ${err.message}`,
+      `Date fields ${project.key}: date field fast setup skipped after warning: ${err.message}. Demo creation will continue with generated metadata fallback.`,
     ]);
-    addChunkedError(state, `Software Project ${project.key}: date field setup failed: ${err.message}`);
   }
 }
 
