@@ -2649,11 +2649,11 @@ function classifyDomainProject(project, metadata = null) {
   };
 }
 
-async function addProjectSearchResults(valuesByKey, path, diagnostics = []) {
+async function addProjectSearchResults(valuesByKey, path, diagnostics = [], options = {}) {
   const maxResults = 100;
   let startAt = 0;
   let pagesRead = 0;
-  const maxPages = 10;
+  const maxPages = Number.isFinite(Number(options.maxPages)) ? Math.max(1, Number(options.maxPages)) : 10;
 
   while (pagesRead < maxPages) {
     const separator = path.includes('?') ? '&' : '?';
@@ -2684,18 +2684,20 @@ async function searchDomainProjects(domain, options = {}) {
   const requestedSpaceType = String(options.spaceType || '').trim();
   const includeIssueCounts = options.includeIssueCounts !== false;
   const includeConfiguration = Boolean(options.includeConfiguration);
+  const includeMetadata = options.includeMetadata !== false;
+  const maxSearchPages = Number.isFinite(Number(options.maxSearchPages)) ? Math.max(1, Number(options.maxSearchPages)) : 10;
   const diagnostics = Array.isArray(options.diagnostics) ? options.diagnostics : [];
   const valuesByKey = new Map();
   const siteDetails = includeConfiguration ? await getCurrentSiteDetails() : null;
 
   try {
-    await addProjectSearchResults(valuesByKey, '/rest/api/3/project/search', diagnostics);
+    await addProjectSearchResults(valuesByKey, '/rest/api/3/project/search', diagnostics, { maxPages: maxSearchPages });
   } catch (err) {
     diagnostics.push(`Existing lookup: all-project listing failed: ${err.message}`);
   }
 
   for (const query of getDomainSearchAliases(domain).slice(0, 6)) {
-    await addProjectSearchResults(valuesByKey, `/rest/api/3/project/search?query=${encodeURIComponent(query)}`, diagnostics);
+    await addProjectSearchResults(valuesByKey, `/rest/api/3/project/search?query=${encodeURIComponent(query)}`, diagnostics, { maxPages: maxSearchPages });
   }
 
   if (requestedSpaceType) {
@@ -2707,14 +2709,14 @@ async function searchDomainProjects(domain, options = {}) {
           ? ['business']
           : [];
     for (const projectTypeKey of projectTypeQueries) {
-      await addProjectSearchResults(valuesByKey, `/rest/api/3/project/search?typeKey=${encodeURIComponent(projectTypeKey)}`, diagnostics);
+      await addProjectSearchResults(valuesByKey, `/rest/api/3/project/search?typeKey=${encodeURIComponent(projectTypeKey)}`, diagnostics, { maxPages: maxSearchPages });
     }
   }
 
   if (requestedSpaceType.startsWith('jsm:')) {
     const jsmType = normaliseJsmServiceType(requestedSpaceType.replace(/^jsm:/, ''));
     for (const query of [`${domain} - ${jsmType} Ops`, `${domain} ${jsmType}`, `${jsmType} Ops`]) {
-      await addProjectSearchResults(valuesByKey, `/rest/api/3/project/search?query=${encodeURIComponent(query)}`, diagnostics);
+      await addProjectSearchResults(valuesByKey, `/rest/api/3/project/search?query=${encodeURIComponent(query)}`, diagnostics, { maxPages: maxSearchPages });
     }
   }
 
@@ -2727,7 +2729,7 @@ async function searchDomainProjects(domain, options = {}) {
   const projects = [];
 
   for (const project of valuesByKey.values()) {
-    const metadata = await getProjectDemoDomainMetadata(project.key);
+    const metadata = includeMetadata ? await getProjectDemoDomainMetadata(project.key) : null;
     const matchesDomain = projectNameMatchesDomain(project.name, domain) || metadataMatchesDomain(metadata, domain);
     if (!matchesDomain) {
       continue;
@@ -15729,8 +15731,10 @@ resolver.define('getBusinessDomainInventory', async ({ payload }) => {
     const projects = await searchDomainProjects(domain, {
       spaceType: requestedSpaceType,
       diagnostics,
-      includeIssueCounts: true,
-      includeConfiguration: true,
+      includeIssueCounts: false,
+      includeConfiguration: false,
+      includeMetadata: false,
+      maxSearchPages: 3,
     });
     const serviceProjects = projects.filter(project => project.kind === 'business');
     const softwareProjects = projects.filter(project => project.kind === 'software');
