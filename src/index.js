@@ -14509,6 +14509,18 @@ async function executeGitHubDevelopmentActivityStep(config, state, step) {
     .filter(issue => issue?.key)
     .slice(0, githubActivityPerProject);
 
+  if (projectKind === 'jsm') {
+    try {
+      const visibleJsmIssueRecords = await searchExistingIssuesForGitHubActivity(project, projectKind, githubActivityPerProject);
+      if (visibleJsmIssueRecords.length > 0) {
+        allIssueRecords = visibleJsmIssueRecords;
+        addChunkedDiagnostics(state, [`GitHub activity ${project.key}: using ${allIssueRecords.length} Jira-visible JSM issue key(s) for development panel data.`]);
+      }
+    } catch (err) {
+      addChunkedDiagnostics(state, [`GitHub activity ${project.key}: JSM issue visibility check skipped: ${err.message}`]);
+    }
+  }
+
   if (allIssueRecords.length === 0) {
     allIssueRecords = await searchExistingIssuesForGitHubActivity(project, projectKind, githubActivityPerProject);
     if (allIssueRecords.length > 0) {
