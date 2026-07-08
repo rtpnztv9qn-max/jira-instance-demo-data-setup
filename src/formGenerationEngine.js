@@ -9,6 +9,7 @@ const FORM_FIELD_IDS = {
   incidentImpact: 'incident_impact',
   patientSafety: 'patient_safety',
   complianceImpact: 'compliance_impact',
+  expectedResolution: 'expected_resolution',
 };
 
 export function buildDynamicJsmFormDesign({ projectName, industry }) {
@@ -89,6 +90,12 @@ export function buildDynamicJsmFormDesign({ projectName, industry }) {
         visibleWhen: { field: FORM_FIELD_IDS.priority, oneOf: ['High', 'Critical'] },
         options: isHealthcare ? ['None', 'Potential', 'Confirmed'] : ['None', 'Internal review', 'Regulatory deadline', 'Audit finding'],
       },
+      {
+        id: FORM_FIELD_IDS.expectedResolution,
+        type: 'date',
+        label: 'Expected Resolution Date',
+        required: false,
+      },
     ],
     logic: [
       {
@@ -133,40 +140,82 @@ export function buildDynamicJsmFormDesign({ projectName, industry }) {
 export function buildFormsApiPayload(formDesign, requestType) {
   const requestTypeId = typeof requestType === 'object' ? requestType?.id : requestType;
   const issueTypeId = typeof requestType === 'object' ? requestType?.issueTypeId : null;
-  const guidanceText = [
-    formDesign.description,
-    'Use this request form to capture the operational details needed for triage.',
-    `Suggested intake fields: ${formDesign.questions.map(question => question.label).join(', ')}.`,
-    'High priority or incident work should include impact scope, urgency reason, and escalation owner before triage.',
-  ].join(' ');
+  const questionTypeMap = {
+    choice: 'singleChoice',
+    shortText: 'shortText',
+    paragraph: 'paragraph',
+    date: 'date',
+  };
+  const questions = {};
+  const questionLayout = [];
+
+  formDesign.questions.forEach((question, index) => {
+    const questionId = question.id || `question_${index + 1}`;
+    questions[questionId] = {
+      id: questionId,
+      key: questionId,
+      type: questionTypeMap[question.type] || question.type || 'shortText',
+      label: question.label,
+      title: question.label,
+      description: question.required ? 'Required for triage and routing.' : '',
+      required: Boolean(question.required || question.requiredWhen),
+      isRequired: Boolean(question.required || question.requiredWhen),
+      options: Array.isArray(question.options)
+        ? question.options.map((option, optionIndex) => ({
+          id: `${questionId}_option_${optionIndex + 1}`,
+          label: option,
+          text: option,
+          value: option,
+        }))
+        : [],
+    };
+    questionLayout.push({
+      type: 'question',
+      questionId,
+      questionKey: questionId,
+      id: questionId,
+    });
+  });
+
+  const introDoc = {
+    type: 'doc',
+    version: 1,
+    content: [
+      {
+        type: 'paragraph',
+        content: [
+          {
+            type: 'text',
+            text: 'Capture the required ITSM intake details before triage, routing, escalation, and resolution.',
+          },
+        ],
+      },
+    ],
+  };
 
   return {
     design: {
       conditions: {},
-      // Atlassian's Forms REST API accepts this documented project-form shape
-      // consistently across tenants. The API currently rejects hand-authored
-      // question type strings such as "choice", "shortText", and "paragraph" on
-      // some sites, so we keep the generated form valid and attach a rich intake
-      // guide instead of failing into the fallback path.
       layout: [
+        introDoc,
         {
-          type: 'doc',
-          version: 1,
-          content: [
-            {
-              type: 'paragraph',
-              content: [
-                {
-                  type: 'text',
-                  text: guidanceText,
-                },
-              ],
-            },
-          ],
+          type: 'section',
+          id: 'incident_intake',
+          title: 'Request details',
+          label: 'Request details',
+          children: questionLayout,
+          elements: questionLayout,
         },
       ],
-      questions: {},
-      sections: {},
+      questions,
+      sections: {
+        incident_intake: {
+          id: 'incident_intake',
+          title: 'Request details',
+          label: 'Request details',
+          description: 'Fields used by the service desk team to classify impact, urgency, ownership, and customer communication.',
+        },
+      },
       settings: {
         language: 'en',
         name: formDesign.name,
