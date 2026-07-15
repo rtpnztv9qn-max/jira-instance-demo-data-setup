@@ -1537,6 +1537,7 @@ async function confluencePost(path, body) {
 
 async function requestAtlassianGraph(query, variables = {}) {
   let forgeGraphError = null;
+  let forgeAppGraphError = null;
 
   try {
     const response = await api.asUser().requestGraph(query, variables);
@@ -1561,10 +1562,36 @@ async function requestAtlassianGraph(query, variables = {}) {
     forgeGraphError = err;
   }
 
+  // Agent setup steps continue in a Forge queue consumer, where there is no
+  // interactive user principal. Compass automation must therefore be able to
+  // use the app principal with the declared Compass read/write scopes.
+  try {
+    const response = await api.asApp().requestGraph(query, variables);
+
+    if (response && typeof response.json === 'function') {
+      const data = await response.json();
+      if (!response.ok) {
+        throw new Error(`GraphQL request failed: ${response.status} ${JSON.stringify(data)}`);
+      }
+      if (Array.isArray(data.errors) && data.errors.length > 0) {
+        throw new Error(data.errors.map(error => error.message || JSON.stringify(error)).join('; '));
+      }
+      return data.data || data;
+    }
+
+    if (response?.errors?.length) {
+      throw new Error(response.errors.map(error => error.message || JSON.stringify(error)).join('; '));
+    }
+
+    return response?.data || response;
+  } catch (err) {
+    forgeAppGraphError = err;
+  }
+
   try {
     return await requestAtlassianGraphWithBasicAuth(query, variables);
   } catch (basicAuthErr) {
-    throw new Error(`Forge GraphQL failed: ${forgeGraphError.message}. Basic-auth GraphQL failed: ${basicAuthErr.message}`);
+    throw new Error(`Forge GraphQL asUser failed: ${forgeGraphError.message}. Forge GraphQL asApp failed: ${forgeAppGraphError.message}. Basic-auth GraphQL failed: ${basicAuthErr.message}`);
   }
 }
 
@@ -1592,7 +1619,7 @@ function getAtlassianGraphBasicAuthConfig() {
 async function requestAtlassianGraphWithBasicAuth(query, variables = {}) {
   const authConfig = getAtlassianGraphBasicAuthConfig();
   if (!authConfig.enabled) {
-    throw new Error('configure ATLASSIAN_GRAPHQL_EMAIL/ATLASSIAN_GRAPHQL_API_TOKEN or ATLASSIAN_EMAIL/ATLASSIAN_API_TOKEN for native Goals GraphQL fallback.');
+    throw new Error('configure ATLASSIAN_GRAPHQL_EMAIL/ATLASSIAN_GRAPHQL_API_TOKEN or ATLASSIAN_EMAIL/ATLASSIAN_API_TOKEN for the GraphQL fallback.');
   }
 
   const { baseUrl } = await getCurrentSiteDetails();
@@ -5266,6 +5293,13 @@ async function createCompassDependency(startComponent, endComponent) {
 function getGoalTypeAri(cloudId) {
   const fullAri = String(process.env.ATLASSIAN_GOAL_TYPE_ARI || process.env.GOALS_GOAL_TYPE_ARI || '').trim();
   if (fullAri) {
+    const goalTypeSuffixMatch = fullAri.match(/:goal-type\/(.+)$/);
+    if (goalTypeSuffixMatch?.[1] && cloudId) {
+      // Goal-type ARIs are site-specific. Demo environments are commonly moved
+      // between Atlassian sites while retaining Forge variables, so rebuild the
+      // ARI with the current site's cloudId instead of sending a stale site ID.
+      return `ari:cloud:goal:${cloudId}:goal-type/${goalTypeSuffixMatch[1]}`;
+    }
     return fullAri;
   }
 
@@ -5278,8 +5312,50 @@ function getGoalTypeAri(cloudId) {
   return '';
 }
 
-async function createAtlassianGoal(cloudId, name, targetDate) {
-  const goalTypeAri = getGoalTypeAri(cloudId);
+async function resolveGoalTypeAri(cloudId) {
+  const configured = String(process.env.ATLASSIAN_GOAL_TYPE_ARI || process.env.GOALS_GOAL_TYPE_ARI || '').trim();
+  if (configured.includes(`ari:cloud:goal:${cloudId}:goal-type/`)) {
+    return configured;
+  }
+
+  const containerId = `ari:cloud:townsquare::site/${cloudId}`;
+  const discoveryQueries = [
+    {
+      query: `query DiscoverGoalType($containerId: ID!) {
+        goals_search(containerId: $containerId, searchString: "", first: 1) {
+          edges { node { goalType { id } } }
+        }
+      }`,
+      read: data => data?.goals_search?.edges?.[0]?.node?.goalType?.id,
+    },
+    {
+      query: `query DiscoverGoalTypeId($containerId: ID!) {
+        goals_search(containerId: $containerId, searchString: "", first: 1) {
+          edges { node { goalTypeId } }
+        }
+      }`,
+      read: data => data?.goals_search?.edges?.[0]?.node?.goalTypeId,
+    },
+  ];
+  const errors = [];
+
+  for (const discovery of discoveryQueries) {
+    try {
+      const data = await requestAtlassianGraph(discovery.query, { containerId });
+      const discovered = String(discovery.read(data) || '').trim();
+      if (discovered) {
+        console.log('Atlassian Goal type discovered for current site', JSON.stringify({ cloudId }));
+        return discovered;
+      }
+    } catch (err) {
+      errors.push(err.message);
+    }
+  }
+
+  throw new Error(`Unable to discover a current-site Goal type from existing Goals. ${errors.join(' | ')}`);
+}
+
+async function createAtlassianGoal(cloudId, name, targetDate, goalTypeAri) {
   if (!goalTypeAri) {
     throw new Error('configure ATLASSIAN_GOAL_TYPE_ARI, or ATLASSIAN_GOAL_ACTIVATION_ID and ATLASSIAN_GOAL_TYPE_ID.');
   }
@@ -5496,32 +5572,62 @@ async function updateIssueParentLink(issueKey, parentKey, diagnostics = []) {
 }
 
 async function linkIssueToCompassComponent(issueKey, component, diagnostics = []) {
-  const payloads = [];
-  const jiraComponentId = component.jiraComponentId || component.projectComponentId || null;
-  const jiraComponentName = component.jiraComponentName || component.projectComponentName || component.name || '';
-
-  // Jira's native "Components" field accepts Jira project component IDs, not
-  // Compass GraphQL component IDs. The Compass metadata stays on the run record,
-  // while the visible Jira component gives users something concrete to click in
-  // the project Components view and on generated issues.
-  if (jiraComponentId) {
-    payloads.push({ update: { components: [{ add: { id: String(jiraComponentId) } }] } });
-    payloads.push({ fields: { components: [{ id: String(jiraComponentId) }] } });
-  }
-  if (jiraComponentName) {
-    payloads.push({ update: { components: [{ add: { name: String(jiraComponentName) } }] } });
-    payloads.push({ fields: { components: [{ name: String(jiraComponentName) }] } });
+  const compassComponentId = String(component.id || '').trim();
+  if (!compassComponentId) {
+    throw new Error('No native Compass component ID was available.');
   }
 
-  if (payloads.length === 0) {
-    throw new Error('No Jira project component id or name was available for the Compass component.');
+  // Company-managed software projects that are switched to Compass components
+  // store global Compass component references in the system Components field.
+  // Use the Compass GraphQL ID/ARI directly; a native Jira project-component ID
+  // would update the Jira-components catalog but would not make the Compass
+  // component appear on this project's Compass Components page.
+  let componentFieldId = 'components';
+  let jiraAcceptedComponentId = compassComponentId;
+  try {
+    const editMeta = await jiraGet(`/rest/api/3/issue/${encodeURIComponent(issueKey)}/editmeta`);
+    const componentFieldEntry = Object.entries(editMeta?.fields || {}).find(([fieldId, field]) => (
+      fieldId === 'components' || String(field?.name || '').trim().toLowerCase() === 'components'
+    ));
+    if (componentFieldEntry) {
+      componentFieldId = componentFieldEntry[0];
+      const allowedValues = Array.isArray(componentFieldEntry[1]?.allowedValues)
+        ? componentFieldEntry[1].allowedValues
+        : [];
+      const matchingValue = allowedValues.find(value => (
+        String(value?.name || value?.value || '').trim().toLowerCase() === String(component.name || '').trim().toLowerCase()
+        || String(value?.id || '').trim() === compassComponentId
+      ));
+      if (matchingValue?.id) {
+        jiraAcceptedComponentId = String(matchingValue.id);
+        diagnostics.push(`Compass link ${issueKey}: resolved Jira Components option ${jiraAcceptedComponentId} for native component ${component.name}.`);
+      } else {
+        diagnostics.push(`Compass link ${issueKey}: Components field ${componentFieldId} exposed ${allowedValues.length} option(s), but none matched ${component.name}; trying the Compass ID directly.`);
+      }
+    }
+  } catch (editMetaErr) {
+    diagnostics.push(`Compass link ${issueKey}: Components edit metadata lookup failed: ${editMetaErr.message}`);
   }
+
+  const componentReference = { id: jiraAcceptedComponentId };
+  const payloads = [
+    { update: { [componentFieldId]: [{ add: componentReference }] } },
+    { fields: { [componentFieldId]: [componentReference] } },
+    { update: { [componentFieldId]: [{ add: jiraAcceptedComponentId }] } },
+    { fields: { [componentFieldId]: [jiraAcceptedComponentId] } },
+  ];
 
   try {
-    await updateIssueWithFirstWorkingPayload(issueKey, payloads);
-    diagnostics.push(`Compass link ${issueKey}: linked Jira component "${jiraComponentName || jiraComponentId}" for Compass component "${component.name}" to Components field.`);
+    await updateIssueWithFirstWorkingPayload(issueKey, payloads, {
+      querySuffixes: [
+        'notifyUsers=false',
+        'notifyUsers=false&overrideScreenSecurity=true&overrideEditableFlag=true',
+      ],
+    });
+    component.componentLinkType = 'compass';
+    diagnostics.push(`Compass link ${issueKey}: linked native Compass component "${component.name}" (${jiraAcceptedComponentId}) through ${componentFieldId}.`);
   } catch (err) {
-    diagnostics.push(`Compass link ${issueKey}: "${component.name}" not linked to Jira Components field: ${err.message}`);
+    diagnostics.push(`Compass link ${issueKey}: native component "${component.name}" (${compassComponentId}) was not linked to the Compass Components field: ${err.message}`);
     throw err;
   }
 }
@@ -10293,6 +10399,10 @@ function getAgentRunResultStorageKey(runToken) {
   return `${getAgentRunStorageKey(runToken)}:result`;
 }
 
+function getAgentProjectDraftStorageKey(draftToken) {
+  return `agent-demo-project-draft:${String(draftToken || '').trim()}`;
+}
+
 async function enqueueAgentDemoRun(runToken, { delayInSeconds = 0 } = {}) {
   const token = String(runToken || '').trim();
   if (!token) {
@@ -10346,6 +10456,7 @@ function getAgentRequestText(payload = {}) {
     payload.spaceType,
     payload.softwareTemplate,
     payload.projectManagement,
+    payload.projectCount,
     payload.businessSpaceType,
     payload.dateRange,
     payload.dashboardPreference,
@@ -10417,9 +10528,16 @@ function inferAgentProjectManagement(payload = {}, requestText = '') {
 }
 
 function inferAgentSoftwareTemplate(payload = {}, requestText = '') {
-  const explicit = String(payload.softwareTemplate || '').trim();
-  if (explicit) {
-    return normaliseSoftwareTemplate(explicit);
+  // Prefer the structured action input over natural-language history. In a
+  // multi-project conversation the request text can mention both Scrum and
+  // Kanban; allowing that text to win caused a later Kanban project to replace
+  // an earlier project's explicitly selected Scrum template.
+  const explicit = String(payload.softwareTemplate || payload.spaceType || '')
+    .trim()
+    .replace(/^software:/i, '');
+  const explicitNormalized = explicit.toLowerCase().replace(/_/g, '-');
+  if (['scrum', 'kanban', 'bug-tracking', 'bug tracking'].includes(explicitNormalized)) {
+    return normaliseSoftwareTemplate(explicitNormalized.replace('bug tracking', 'bug-tracking'));
   }
 
   if (textIncludesAny(requestText, ['bug tracking', 'bug-tracking', 'defect tracking'])) {
@@ -10565,6 +10683,24 @@ function inferAgentVolumeProfile(payload = {}, requestText = '') {
   }
 
   return 'standard';
+}
+
+function inferAgentProjectCount(payload = {}, requestText = '') {
+  const explicit = Number(payload.projectCount);
+  if (Number.isInteger(explicit) && explicit >= 1) {
+    return explicit;
+  }
+
+  const countMatch = String(requestText || '').match(/\b(\d+)\s+(?:jira\s+)?projects?\b/i);
+  if (countMatch) {
+    return Number(countMatch[1]);
+  }
+
+  if (textIncludesAny(requestText, ['one project', 'single project', 'a project'])) {
+    return 1;
+  }
+
+  return null;
 }
 
 function getAgentItsmWorkCountPerType(volumeProfile) {
@@ -11171,7 +11307,7 @@ function buildAgentDemoEnvironmentPayload(payload = {}) {
     payload.addVolume
     || payload.addVolumeToExistingDomainData
     || payload.reuseExistingProjectDecision === 'add-volume'
-    || textIncludesAny(requestText, ['add volume', 'more volume', 'existing project', 'existing projects'])
+    || textIncludesAny(requestText, ['add volume', 'more volume', 'increase volume', 'additional volume'])
   );
   const volumeProjectKeys = extractAgentProjectKeys(payload);
 
@@ -11191,7 +11327,19 @@ function buildAgentDemoEnvironmentPayload(payload = {}) {
     };
   }
 
-  const projectCount = normalisePositiveInteger(payload.projectCount, 1, 1, 10);
+  // One project remains the safe backend default. The Rovo prompt builds
+  // heterogeneous batches conversationally and submits each distinct project
+  // specification separately. An explicit projectCount is only a shortcut for
+  // several projects that intentionally share the exact same specification.
+  const requestedProjectCount = inferAgentProjectCount(payload, requestText);
+  if (requestedProjectCount > 3) {
+    return {
+      ready: false,
+      question: `A setup batch supports a maximum of 3 projects. I can prepare the first 3 projects now, and the remaining ${requestedProjectCount - 3} project(s) can be created in a new batch. Please confirm the first 3 project specifications.`,
+      missingFields: ['projectBatchLimitConfirmation'],
+    };
+  }
+  const projectCount = requestedProjectCount || 1;
   const softwareTemplate = inferAgentSoftwareTemplate(payload, requestText);
   const jsmServiceType = inferAgentJsmServiceType(payload, requestText);
   const businessSpaceType = inferAgentBusinessSpaceType(payload, requestText);
@@ -11260,7 +11408,15 @@ function buildAgentDemoEnvironmentPayload(payload = {}) {
   }
 
   const createLikeRequest = wantsFullCoverage || Boolean(softwareTemplate || jsmServiceType || businessSpaceType);
-  if (createLikeRequest && !addVolume && !agentRequestIsLookupOnly(payload, requestText) && !dashboardPreference) {
+  // Existing-first is a hard backend ordering rule. Merely selecting a domain
+  // and template must perform the inventory review before dashboard discovery.
+  // Dashboard coverage becomes required only after the user chooses an action
+  // that can provision resources (add volume or explicitly create new).
+  const hasProvisioningDecision = addVolume || (
+    agentRequestExplicitlyConfirmsCreation(payload, requestText)
+    && agentRequestExplicitlyNeedsNewSpace(requestText)
+  );
+  if (createLikeRequest && !addVolume && hasProvisioningDecision && !dashboardPreference) {
     const requestedType = softwareTemplate
       ? `Jira Software ${getSoftwareTemplateLabel(softwareTemplate)}`
       : jsmServiceType
@@ -11302,12 +11458,17 @@ function buildAgentDemoEnvironmentPayload(payload = {}) {
       }))
     : []);
   const productDiscoveryProjects = [];
+  // Standard volume addition preserves the existing project's dashboards.
+  // Dashboard work is included only when the user explicitly requests it.
+  const effectiveDashboardPreference = addVolume && !dashboardPreference
+    ? 'none'
+    : (dashboardPreference || 'project');
   const dashboardDefaults = buildAgentDashboardDefaults({
     jsmServiceTypes,
     softwareProjects,
     businessProjects,
     productDiscoveryProjects,
-    dashboardPreference: dashboardPreference || 'project',
+    dashboardPreference: effectiveDashboardPreference,
   });
 
   return {
@@ -11316,13 +11477,16 @@ function buildAgentDemoEnvironmentPayload(payload = {}) {
       industry: domain,
       agentRequestText: requestText,
       agentVolumeProfile: volumeProfile,
+      agentProjectCount: projectCount,
       agentFullCoverage: wantsFullCoverage,
       agentExplicitCreateNew: agentRequestExplicitlyNeedsNewSpace(requestText),
       agentConfirmedCreate: agentRequestExplicitlyConfirmsCreation(payload, requestText),
       customIndustry: '',
       isCustomIndustry: false,
       environmentName: createAgentEnvironmentName(domain),
-      agentDashboardPreference: dashboardPreference || 'default',
+      agentDashboardPreference: addVolume && !dashboardPreference
+        ? 'preserve-existing'
+        : (dashboardPreference || 'default'),
       reuseExistingDomainData: true,
       addVolumeToExistingDomainData: addVolume,
       volumeProjectKeys,
@@ -11642,11 +11806,11 @@ function buildChunkedExecutionPlan(config) {
       }
     }
 
-    if (softwareTemplate === 'scrum') {
+    if (softwareTemplate === 'scrum' || softwareTemplate === 'kanban') {
       steps.push({
         type: 'create-atlassian-goals',
         projectIndex,
-        label: `Create and link Atlassian Goals for software project ${projectIndex + 1}`,
+        label: `Create and link Atlassian Goals for ${getSoftwareTemplateLabel(softwareTemplate)} project ${projectIndex + 1}`,
       });
     }
 
@@ -13505,11 +13669,17 @@ async function executeCompassComponentsStep(config, state, step) {
     for (let index = 0; index < createdCompassComponents.length && linkTargets.length > 0; index += 1) {
       const component = createdCompassComponents[index];
       const issueKey = linkTargets[index % linkTargets.length];
-      try {
-        await linkIssueToCompassComponent(issueKey, component, state.results.diagnostics);
-        component.linkedIssueKey = issueKey;
-      } catch {
-        // linkIssueToCompassComponent already records the exact Jira error.
+      for (let attempt = 1; attempt <= 3 && !component.linkedIssueKey; attempt += 1) {
+        try {
+          await linkIssueToCompassComponent(issueKey, component, state.results.diagnostics);
+          component.linkedIssueKey = issueKey;
+        } catch {
+          // Compass catalog entries can take a moment to appear in Jira's
+          // Components edit metadata. Retry before declaring the link missing.
+          if (attempt < 3) {
+            await wait(1500);
+          }
+        }
       }
     }
   } catch (err) {
@@ -13556,14 +13726,7 @@ async function executeAtlassianGoalsStep(config, state, step) {
 
   try {
     const cloudId = await resolveAtlassianCloudId();
-    const goalTypeAri = getGoalTypeAri(cloudId);
-    if (!goalTypeAri) {
-      if (!state.metadata.goalsConfigWarningShown) {
-        addChunkedDiagnostics(state, ['Atlassian Goals GraphQL skipped: configure ATLASSIAN_GOAL_TYPE_ARI, or ATLASSIAN_GOAL_ACTIVATION_ID and ATLASSIAN_GOAL_TYPE_ID. Jira project goal work items were still created where possible.']);
-        state.metadata.goalsConfigWarningShown = true;
-      }
-      return;
-    }
+    const goalTypeAri = await resolveGoalTypeAri(cloudId);
 
     project.atlassianGoals = project.atlassianGoals || [];
     for (let goalIndex = 0; goalIndex < project.projectGoals.length; goalIndex += 1) {
@@ -13572,7 +13735,7 @@ async function executeAtlassianGoalsStep(config, state, step) {
       const nativeLinkIssueType = nativeLinkIssueKey === projectGoal.key ? 'goal work item' : 'epic';
       const statusPlan = getAtlassianGoalStatusPlan(goalIndex);
       try {
-        const goal = await createAtlassianGoal(cloudId, projectGoal.name, projectGoal.targetDate);
+        const goal = await createAtlassianGoal(cloudId, projectGoal.name, projectGoal.targetDate, goalTypeAri);
         const record = {
           id: goal.id,
           name: goal.name || projectGoal.name,
@@ -13596,6 +13759,10 @@ async function executeAtlassianGoalsStep(config, state, step) {
 
         project.atlassianGoals.push(record);
         state.results.atlassianGoals.push(record);
+        console.log('Atlassian Goal created', JSON.stringify({
+          projectKey: project.key,
+          goalName: record.name,
+        }));
         addChunkedDiagnostics(state, [`Atlassian Goal ${project.key}: created "${record.name}" (${record.targetDate}, ${record.statusUpdated ? record.statusLabel : 'PENDING'}).`]);
 
         try {
@@ -13607,10 +13774,19 @@ async function executeAtlassianGoalsStep(config, state, step) {
           addChunkedDiagnostics(state, [`Atlassian Goal ${project.key}: created "${record.name}" but native link to ${nativeLinkIssueType} ${nativeLinkIssueKey} failed: ${linkErr.message}`]);
         }
       } catch (goalErr) {
+        console.warn('Atlassian Goal creation failed', JSON.stringify({
+          projectKey: project.key,
+          goalName: projectGoal.name,
+          message: goalErr.message,
+        }));
         addChunkedDiagnostics(state, [`Atlassian Goal ${project.key}: "${projectGoal.name}" skipped: ${goalErr.message}`]);
       }
     }
   } catch (err) {
+    console.warn('Atlassian Goals step failed', JSON.stringify({
+      projectKey: project.key,
+      message: err.message,
+    }));
     addChunkedDiagnostics(state, [`Atlassian Goals ${project.key}: skipped: ${err.message}`]);
   }
 }
@@ -16321,6 +16497,193 @@ export async function cancelDemoEnvironmentFromAgent(payload = {}) {
   };
 }
 
+export async function findMatchingDemoProjectsFromAgent(payload = {}, context = {}) {
+  console.log('findMatchingDemoProjectsFromAgent started', JSON.stringify({
+    payload,
+    accountId: context?.accountId || null,
+  }));
+
+  const requestText = getAgentRequestText(payload);
+  const domain = inferAgentDomain(payload, requestText);
+  if (!domain) {
+    return {
+      success: false,
+      needsInput: true,
+      question: `Which supported domain should I search? Choose one of: ${AGENT_SUPPORTED_DOMAIN_NAMES.join(', ')}.`,
+      missingFields: ['domain'],
+    };
+  }
+
+  const category = inferAgentSpaceCategory(payload, requestText);
+  let requestedSpaceType = '';
+  if (category === 'software') {
+    const template = inferAgentSoftwareTemplate(payload, requestText);
+    if (template) requestedSpaceType = `software:${template}`;
+  } else if (category === 'jsm') {
+    const serviceType = inferAgentJsmServiceType(payload, requestText);
+    if (serviceType) requestedSpaceType = `jsm:${serviceType}`;
+  } else if (category === 'business') {
+    const businessType = inferAgentBusinessSpaceType(payload, requestText);
+    if (businessType) requestedSpaceType = `business:${businessType}`;
+  } else if (category === 'jpd') {
+    requestedSpaceType = 'jpd:product-discovery';
+  }
+
+  if (!requestedSpaceType) {
+    return {
+      success: false,
+      needsInput: true,
+      question: formatAgentSpaceSubcategoryQuestion(category),
+      missingFields: ['spaceType'],
+    };
+  }
+
+  const access = await validateAdminAccess();
+  if (!access.ok) {
+    return {
+      success: false,
+      needsInput: false,
+      summary: access.message,
+    };
+  }
+
+  const diagnostics = [];
+  const matches = await searchDomainProjectsForAgentPreflight(domain, requestedSpaceType, {
+    includeIssueCounts: true,
+    includeConfiguration: true,
+    diagnostics,
+  });
+  const question = matches.length > 0
+    ? formatAgentExistingSpacePrompt(domain, requestedSpaceType, matches)
+    : [
+        `I did not find an existing ${domain} ${formatRequestedAgentSpaceType(requestedSpaceType)} project matching this domain and space type.`,
+        '',
+        'Would you like me to create a new environment?',
+      ].join('\n');
+
+  return {
+    success: false,
+    needsInput: true,
+    needsContinuation: false,
+    lookupOnly: true,
+    question,
+    summary: question,
+    missingFields: matches.length > 0 ? ['reuseExistingProjectDecision'] : ['createConfirmation'],
+    matches: matches.slice(0, 12),
+    diagnostics,
+  };
+}
+
+export async function saveDemoProjectDraftFromAgent(payload = {}, context = {}) {
+  const projectNumber = Number(payload.projectNumber);
+  if (!Number.isInteger(projectNumber) || projectNumber < 1 || projectNumber > 3) {
+    return {
+      success: false,
+      needsInput: true,
+      question: 'Which batch position is this project: 1, 2, or 3?',
+      missingFields: ['projectNumber'],
+    };
+  }
+
+  const candidatePayload = {
+    request: String(payload.request || '').trim(),
+    domain: String(payload.domain || '').trim(),
+    spaceCategory: String(payload.spaceCategory || '').trim(),
+    spaceType: String(payload.spaceType || '').trim(),
+    projectManagement: String(payload.projectManagement || '').trim(),
+    dashboardPreference: String(payload.dashboardPreference || '').trim(),
+    dateRange: String(payload.dateRange || '').trim(),
+  };
+  const parsed = buildAgentDemoEnvironmentPayload(candidatePayload);
+  if (!parsed.ready) {
+    return {
+      success: false,
+      needsInput: true,
+      question: parsed.question,
+      missingFields: parsed.missingFields,
+    };
+  }
+
+  const requestedSpaceType = getRequestedAgentSpaceTypeFromConfig(parsed.config);
+  const draftToken = `draft-${createAgentRunToken()}`;
+  const draft = {
+    projectNumber,
+    accountId: context?.accountId || null,
+    payload: candidatePayload,
+    specification: {
+      domain: parsed.config.industry,
+      category: inferAgentSpaceCategory(candidatePayload, getAgentRequestText(candidatePayload)),
+      spaceType: requestedSpaceType,
+      spaceTypeLabel: formatRequestedAgentSpaceType(requestedSpaceType),
+      projectManagement: parsed.config.softwareProjectStyle || candidatePayload.projectManagement || '',
+      dashboardPreference: parsed.config.agentDashboardPreference,
+      dateRange: parsed.config.dateRange,
+    },
+    createdAt: new Date().toISOString(),
+  };
+  await kvs.set(getAgentProjectDraftStorageKey(draftToken), draft);
+
+  return {
+    success: true,
+    needsInput: false,
+    draftToken,
+    projectNumber,
+    specification: draft.specification,
+    summary: [
+      `Saved Project ${projectNumber} as an immutable draft.`,
+      `- Domain: ${draft.specification.domain}`,
+      `- Jira type: ${draft.specification.spaceTypeLabel}`,
+      `- Management: ${draft.specification.projectManagement || 'default'}`,
+      `- Dashboard coverage: ${draft.specification.dashboardPreference}`,
+      `- Date range: ${draft.specification.dateRange}`,
+      `- Draft token: ${draftToken}`,
+      'No Jira resources were created.',
+    ].join('\n'),
+  };
+}
+
+export async function reviewSavedDemoProjectFromAgent(payload = {}, context = {}) {
+  const draftToken = String(payload.draftToken || '').trim();
+  if (!draftToken) {
+    return {
+      success: false,
+      needsInput: true,
+      question: 'Which saved project draft should I review? Provide its draft token.',
+      missingFields: ['draftToken'],
+    };
+  }
+
+  const draft = await kvs.get(getAgentProjectDraftStorageKey(draftToken));
+  if (!draft) {
+    return {
+      success: false,
+      needsInput: true,
+      question: 'I could not find that saved project draft. Please collect and save this project specification again.',
+      missingFields: ['draftToken'],
+    };
+  }
+  if (draft.accountId && context?.accountId && draft.accountId !== context.accountId) {
+    return {
+      success: false,
+      needsInput: false,
+      summary: 'This project draft belongs to a different user and cannot be reviewed from this session.',
+    };
+  }
+
+  const decision = String(payload.decision || '').trim();
+  const immutablePayload = {
+    ...draft.payload,
+    request: [draft.payload.request, decision].filter(Boolean).join(' '),
+  };
+  const result = await createDemoEnvironmentFromAgent(immutablePayload, context);
+  return {
+    ...result,
+    draftToken,
+    projectNumber: draft.projectNumber,
+    savedSpecification: draft.specification,
+  };
+}
+
 export async function createDemoEnvironmentFromAgent(payload = {}, context = {}) {
   console.log('createDemoEnvironmentFromAgent started', JSON.stringify({
     payload,
@@ -16910,8 +17273,19 @@ function validateGeneratedVolumeAccuracy(config, state) {
     }
 
     const compassComponentsForProject = (state.results.compassComponents || []).filter(component => component.projectKey === project.key);
-    if (COMPASS_DEMO_COMPONENTS_ENABLED && compassComponentsForProject.length > 0 && !compassComponentsForProject.some(component => component.linkedIssueKey)) {
+    if (COMPASS_DEMO_COMPONENTS_ENABLED && compassComponentsForProject.length === 0) {
+      addUniqueChunkedError(state, `Compass component coverage missing ${project.key}: no native Compass components were created. Check Compass availability and GraphQL app access.`);
+    } else if (COMPASS_DEMO_COMPONENTS_ENABLED && !compassComponentsForProject.some(component => component.linkedIssueKey && component.componentLinkType === 'compass')) {
       addUniqueChunkedError(state, `Compass component links missing ${project.key}: Compass-backed components were created but no generated work item link was verified.`);
+    }
+
+    if (GOALS_DEMO_ENABLED && ['scrum', 'kanban'].includes(softwareTemplate)) {
+      const nativeGoalsForProject = (state.results.atlassianGoals || []).filter(goal => goal.projectKey === project.key);
+      if (nativeGoalsForProject.length === 0) {
+        addUniqueChunkedError(state, `Native Goals coverage missing ${project.key}: no Atlassian Goals were created for this ${getSoftwareTemplateLabel(softwareTemplate)} project.`);
+      } else if (!nativeGoalsForProject.some(goal => goal.nativeLinked)) {
+        addUniqueChunkedError(state, `Native Goals links missing ${project.key}: Goals were created but none were linked to a generated work item through Jira's Goals field.`);
+      }
     }
 
     if (softwareTemplate === 'scrum') {
@@ -17054,7 +17428,7 @@ function buildChunkedSummary(config, state) {
   const jiraDevInfoSubmitted = githubActivity.filter(record => record.jiraDevelopmentInfoSubmitted);
   const jiraDeploymentInfoSubmitted = githubActivity.filter(record => record.jiraDeploymentInfoSubmitted);
   const compassComponents = results.compassComponents?.filter(Boolean) || [];
-  const linkedCompassComponents = compassComponents.filter(component => component.linkedIssueKey);
+  const linkedCompassComponents = compassComponents.filter(component => component.linkedIssueKey && component.componentLinkType === 'compass');
   const repositoryLinkedCompassComponents = compassComponents.filter(component => component.repositoryLinked);
   const dependencyLinkedCompassComponents = compassComponents.filter(component => component.dependencyLinked);
   const ownedCompassComponents = compassComponents.filter(component => component.ownerConfigured);
