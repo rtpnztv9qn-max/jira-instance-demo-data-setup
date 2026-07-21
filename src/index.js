@@ -16497,6 +16497,117 @@ export async function cancelDemoEnvironmentFromAgent(payload = {}) {
   };
 }
 
+export async function createOverdueAlertTestIssueFromAgent(payload = {}, context = {}) {
+  const projectKey = String(payload?.projectKey || '').trim().toUpperCase();
+  if (!projectKey) {
+    return {
+      success: false,
+      needsInput: true,
+      question: 'Which Cprime demo project key should receive the overdue-alert test issue?',
+      missingFields: ['projectKey'],
+    };
+  }
+  if (!/^[A-Z][A-Z0-9_]{1,99}$/.test(projectKey)) {
+    return {
+      success: false,
+      needsInput: true,
+      question: `"${projectKey}" does not look like a Jira project key. Which demo project should I use?`,
+      missingFields: ['projectKey'],
+    };
+  }
+  if (payload?.confirmed !== true) {
+    return {
+      success: false,
+      needsInput: true,
+      question: `Create exactly one test issue in ${projectKey}, assign it to you, and set its due date to yesterday?`,
+      missingFields: ['confirmed'],
+    };
+  }
+
+  try {
+    const projectResponse = await api.asUser().requestJira(
+      buildTrustedJiraRoute(`/rest/api/3/project/${encodeURIComponent(projectKey)}`)
+    );
+    const project = await readJiraJsonResponse(projectResponse, 'GET', `/rest/api/3/project/${projectKey}`);
+    const propertyResponse = await api.asUser().requestJira(
+      buildTrustedJiraRoute(`/rest/api/3/project/${encodeURIComponent(projectKey)}/properties/${DEMO_DOMAIN_PROJECT_PROPERTY_KEY}`)
+    );
+    const projectProperty = await readJiraJsonResponse(
+      propertyResponse,
+      'GET',
+      `/rest/api/3/project/${projectKey}/properties/${DEMO_DOMAIN_PROJECT_PROPERTY_KEY}`
+    );
+    const metadata = projectProperty?.value || {};
+    if (metadata.generatedBy !== 'jira-demo-data-setup') {
+      return {
+        success: false,
+        needsInput: false,
+        summary: `${projectKey} is not marked as a Cprime-generated demo project, so I did not create a test issue there.`,
+      };
+    }
+
+    const accountId = context?.accountId || await getCurrentUser();
+    const yesterday = new Date();
+    yesterday.setUTCDate(yesterday.getUTCDate() - 1);
+    const dueDate = yesterday.toISOString().slice(0, 10);
+    const nowIso = new Date().toISOString();
+    const diagnostics = [];
+    const summary = String(payload?.summary || 'Overdue alert automation test').trim().slice(0, 180)
+      || 'Overdue alert automation test';
+    const issue = await createIssue(projectKey, summary, 'Task', null, 'Medium', dueDate, null, {
+      assigneeAccountId: accountId,
+      description: 'Test issue created by the Cprime Demo Agent to verify the overdue assignee notification automation.',
+      environmentName: project?.name || projectKey,
+      retentionPeriodDays: ACTIVE_TICKET_RETENTION_DAYS,
+      projectKind: metadata.kind || project?.projectTypeKey || 'demo',
+      lifecycle: {
+        createdAt: nowIso,
+        resolutionDate: null,
+        targetStatus: 'To Do',
+      },
+      labels: ['cprime-overdue-alert-test'],
+      diagnostics,
+    });
+    const created = await jiraGet(
+      `/rest/api/3/issue/${encodeURIComponent(issue.key)}?fields=summary,assignee,duedate,status`
+    );
+    const dueDateReady = created?.fields?.duedate === dueDate;
+    const assigneeReady = created?.fields?.assignee?.accountId === accountId;
+    const siteDetails = await getCurrentSiteDetails().catch(() => ({}));
+    const issueUrl = siteDetails?.baseUrl ? `${siteDetails.baseUrl}/browse/${issue.key}` : `/browse/${issue.key}`;
+
+    return {
+      success: dueDateReady && assigneeReady,
+      needsInput: false,
+      issueKey: issue.key,
+      issueUrl,
+      projectKey,
+      dueDate,
+      assignedToRequester: assigneeReady,
+      readyForScheduledAlert: dueDateReady && assigneeReady,
+      message: dueDateReady && assigneeReady
+        ? `Created ${issue.key} with yesterday (${dueDate}) as its due date and assigned it to you.`
+        : `Created ${issue.key}, but Jira did not retain all required test fields. Review its assignee and due date before waiting for the alert.`,
+      summary: [
+        `Overdue alert test issue: ${issue.key}`,
+        `- Project: ${projectKey}`,
+        `- Due date: ${dueDate} (yesterday)`,
+        `- Assigned to requester: ${assigneeReady ? 'yes' : 'no'}`,
+        `- Ready for scheduled alert: ${dueDateReady && assigneeReady ? 'yes' : 'no'}`,
+        `- Link: ${issueUrl}`,
+        '- Alert timing: next hourly scheduled overdue check',
+        diagnostics.length ? `- Diagnostics: ${diagnostics.join('; ')}` : '',
+      ].filter(Boolean).join('\n'),
+    };
+  } catch (err) {
+    return {
+      success: false,
+      needsInput: false,
+      summary: `I could not create the overdue-alert test issue in ${projectKey}: ${err.message}`,
+    };
+  }
+}
+
 export async function summarizeProjectSpaceFromAgent(payload = {}, context = {}) {
   const projectKey = String(payload?.projectKey || '').trim().toUpperCase();
   if (!projectKey) {
@@ -17938,9 +18049,12 @@ function buildChunkedSummary(config, state) {
   }
 
   if (automationBlueprints.length > 0) {
-    lines.push('Automation Rules To Configure:');
+    lines.push('Automation Coverage:');
     for (const rule of automationBlueprints) {
       lines.push(`- ${rule.name}`);
+      if (rule.implementation === 'forge-scheduled') {
+        lines.push('  Status: Active through the app hourly scheduled trigger');
+      }
       lines.push(`  Trigger: ${rule.trigger}`);
       lines.push(`  Condition: ${rule.condition}`);
       lines.push(`  Action: ${rule.action}`);
@@ -17953,7 +18067,9 @@ function buildChunkedSummary(config, state) {
       }
       lines.push(`  Scope: ${rule.scope || 'created projects'}`);
     }
-    lines.push('Note: Jira Automation rule creation is not exposed through the supported Jira project/issue REST APIs used by this app. The app lists only the two requested rule blueprints and does not invent extra automation behavior.');
+    if (automationBlueprints.some(rule => rule.implementation !== 'forge-scheduled')) {
+      lines.push('Note: Rules marked as active are implemented by Forge. Other listed blueprints still require Jira Automation configuration because native rule creation is not exposed through the supported Jira REST APIs used by this app.');
+    }
     lines.push('');
   }
 
@@ -18253,6 +18369,141 @@ async function applyRetentionPolicyToIssue(issue, now) {
   }
 
   return 'retained';
+}
+
+const OVERDUE_ASSIGNEE_ALERT_PROPERTY_KEY = 'cprimeOverdueAssigneeAlert';
+
+async function findGeneratedOverdueAssignedIssues() {
+  const issues = [];
+  const generatedProjectKeys = [];
+  let startAt = 0;
+
+  // Jira does not index arbitrary issue properties for JQL unless a separate
+  // entity-property index module is declared. Project properties are therefore
+  // checked directly first, and only verified Cprime project keys enter JQL.
+  for (let page = 0; page < 20; page += 1) {
+    const data = await jiraAppGet(`/rest/api/3/project/search?startAt=${startAt}&maxResults=50`);
+    const projects = Array.isArray(data?.values) ? data.values : [];
+    for (const project of projects) {
+      try {
+        const property = await jiraAppGet(
+          `/rest/api/3/project/${encodeURIComponent(project.key)}/properties/${DEMO_DOMAIN_PROJECT_PROPERTY_KEY}`
+        );
+        if (property?.value?.generatedBy === 'jira-demo-data-setup') {
+          generatedProjectKeys.push(project.key);
+        }
+      } catch (err) {
+        if (!(err?.status === 404 || String(err.message || '').includes('404'))) throw err;
+      }
+    }
+    startAt += projects.length;
+    if (projects.length === 0 || startAt >= Number(data?.total || 0)) break;
+  }
+
+  for (let offset = 0; offset < generatedProjectKeys.length; offset += 25) {
+    const projectKeys = generatedProjectKeys.slice(offset, offset + 25);
+    let nextPageToken = null;
+    for (let page = 0; page < 10; page += 1) {
+      const body = {
+        jql: `project in (${projectKeys.map(quoteJqlValue).join(', ')}) AND statusCategory != Done AND assignee is not EMPTY AND duedate < startOfDay() ORDER BY duedate ASC, key ASC`,
+        maxResults: 100,
+        fields: ['summary', 'assignee', 'duedate', 'project'],
+      };
+      if (nextPageToken) body.nextPageToken = nextPageToken;
+      const data = await jiraAppPost('/rest/api/3/search/jql', body);
+      issues.push(...(Array.isArray(data?.issues) ? data.issues : []));
+      if (!data?.nextPageToken) break;
+      nextPageToken = data.nextPageToken;
+    }
+  }
+
+  console.log('Overdue alert project scan', JSON.stringify({
+    generatedProjects: generatedProjectKeys.length,
+    overdueAssignedIssues: issues.length,
+  }));
+  return issues;
+}
+
+async function getOverdueAlertMarker(issueKey) {
+  try {
+    const property = await jiraAppGet(
+      `/rest/api/3/issue/${encodeURIComponent(issueKey)}/properties/${encodeURIComponent(OVERDUE_ASSIGNEE_ALERT_PROPERTY_KEY)}`
+    );
+    return property?.value || null;
+  } catch (err) {
+    if (err?.status === 404 || String(err.message || '').includes('404')) return null;
+    throw err;
+  }
+}
+
+async function notifyOverdueIssueAssignee(issue) {
+  const issueKey = issue?.key;
+  const fields = issue?.fields || {};
+  const assigneeAccountId = fields.assignee?.accountId;
+  const dueDate = fields.duedate;
+  if (!issueKey || !assigneeAccountId || !dueDate) return 'skipped-missing-fields';
+
+  const previousAlert = await getOverdueAlertMarker(issueKey);
+  // Suppress repeated daily alerts, while allowing one alert to a new assignee
+  // when an already-overdue issue is reassigned.
+  if (previousAlert?.dueDate === dueDate && previousAlert?.assigneeAccountId === assigneeAccountId) {
+    return 'already-notified';
+  }
+
+  await jiraAppPost(`/rest/api/3/issue/${encodeURIComponent(issueKey)}/notify`, {
+    subject: `Overdue Jira work item: ${issueKey}`,
+    textBody: [
+      `Hello ${fields.assignee?.displayName || 'assignee'},`,
+      '',
+      `${issueKey} is assigned to you and passed its due date of ${dueDate}.`,
+      `Summary: ${fields.summary || issueKey}`,
+      `Project: ${fields.project?.name || fields.project?.key || 'Cprime demo environment'}`,
+      '',
+      'Please review the work item and update its status or due date.',
+    ].join('\n'),
+    to: { assignee: true },
+  });
+
+  await jiraAppPut(
+    `/rest/api/3/issue/${encodeURIComponent(issueKey)}/properties/${encodeURIComponent(OVERDUE_ASSIGNEE_ALERT_PROPERTY_KEY)}`,
+    {
+      dueDate,
+      assigneeAccountId,
+      notifiedAt: new Date().toISOString(),
+      source: 'cprime-demo-agent-hourly-overdue-alert',
+    }
+  );
+  return 'notified';
+}
+
+export async function sendOverdueAssigneeAlerts(event) {
+  const summary = {
+    scanned: 0,
+    notified: 0,
+    alreadyNotified: 0,
+    skipped: 0,
+    failed: 0,
+  };
+  const issues = await findGeneratedOverdueAssignedIssues();
+  summary.scanned = issues.length;
+
+  for (const issue of issues) {
+    try {
+      const result = await notifyOverdueIssueAssignee(issue);
+      if (result === 'notified') summary.notified += 1;
+      else if (result === 'already-notified') summary.alreadyNotified += 1;
+      else summary.skipped += 1;
+    } catch (err) {
+      summary.failed += 1;
+      console.error(`Overdue assignee alert failed for ${issue?.key || 'unknown issue'}: ${err.message}`);
+    }
+  }
+
+  console.log('sendOverdueAssigneeAlerts completed', JSON.stringify({
+    triggerTime: event?.context?.triggerTime || null,
+    ...summary,
+  }));
+  return summary;
 }
 
 export async function scheduledCleanup(event) {

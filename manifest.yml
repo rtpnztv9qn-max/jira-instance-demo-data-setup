@@ -11,6 +11,7 @@ modules:
         - Add demo volume to existing Healthcare Scrum projects
         - Plan full SaaS domain coverage without duplicates
       actions:
+        - create-overdue-alert-test-issue
         - summarize-project-space
         - find-matching-demo-projects
         - save-demo-project-draft
@@ -19,6 +20,27 @@ modules:
         - continue-demo-environment-run
         - cancel-demo-environment-run
   action:
+    - key: create-overdue-alert-test-issue
+      name: Create overdue alert test issue
+      function: agent-overdue-test
+      actionVerb: CREATE
+      description: Creates one issue due yesterday in a Cprime-generated project and assigns it to the requester. Supports project, board, or space wording and requires explicit confirmation.
+      inputs:
+        projectKey:
+          title: Project key
+          type: string
+          required: true
+          description: Existing Cprime-generated Jira demo project key in which to create the test issue.
+        summary:
+          title: Issue summary
+          type: string
+          required: false
+          description: Optional summary for the test issue. Defaults to Overdue alert automation test.
+        confirmed:
+          title: Confirm test issue creation
+          type: boolean
+          required: true
+          description: Must be true only after the user explicitly confirms creating one assigned test issue with yesterday as its due date.
     - key: summarize-project-space
       name: Analyze and report on Jira project
       function: agent-summarize-project
@@ -252,6 +274,8 @@ modules:
       handler: index.findMatchingDemoProjectsFromAgent
     - key: agent-summarize-project
       handler: index.summarizeProjectSpaceFromAgent
+    - key: agent-overdue-test
+      handler: index.createOverdueAlertTestIssueFromAgent
     - key: agent-save-demo-draft
       handler: index.saveDemoProjectDraftFromAgent
     - key: agent-review-demo-draft
@@ -262,11 +286,16 @@ modules:
       handler: index.processAgentDemoRun
     - key: environment-cleanup
       handler: index.scheduledCleanup
+    - key: overdue-assignee-alerts
+      handler: index.sendOverdueAssigneeAlerts
   consumer:
     - key: agent-demo-run-consumer
       queue: agent-demo-run-queue
       function: agent-demo-run-worker
   scheduledTrigger:
+    - key: hourly-overdue-assignee-alerts
+      function: overdue-assignee-alerts
+      interval: hour
     - key: weekly-environment-cleanup
       function: environment-cleanup
       interval: week
