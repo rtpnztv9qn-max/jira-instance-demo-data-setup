@@ -7,6 +7,7 @@ modules:
       conversationStarters:
         - Find existing Banking & Insurance ITSM demo spaces first
         - Give me a short summary of what is happening in project DEMO
+        - Create a 30-day trend report for project DEMO
         - Add demo volume to existing Healthcare Scrum projects
         - Plan full SaaS domain coverage without duplicates
       actions:
@@ -19,10 +20,10 @@ modules:
         - cancel-demo-environment-run
   action:
     - key: summarize-project-space
-      name: Summarize Jira project space
+      name: Analyze and report on Jira project
       function: agent-summarize-project
       actionVerb: GET
-      description: Reads a Jira project the current user can access and returns a concise live operational snapshot. Use this when the user asks what is happening, what needs attention, or requests a short summary of a project or Jira space.
+      description: Reads a Jira project the current user can access and returns a live summary, operational report, or trend analysis. Use this when the user asks what is happening, what needs attention, requests a report, or asks about trends in a project or Jira space.
       inputs:
         projectKey:
           title: Project key
@@ -33,7 +34,12 @@ modules:
           title: Recent activity window
           type: integer
           required: false
-          description: Number of days used to identify recent activity. Defaults to 14 and is limited to 1 through 90.
+          description: Number of days used for activity and trends. Defaults to 14 for summaries and 30 for reports or trends; limited to 1 through 90.
+        reportType:
+          title: Report type
+          type: string
+          required: false
+          description: Use summary for a short snapshot, report for an operational report, or trend for created-versus-completed trend analysis. Defaults to summary.
     - key: find-matching-demo-projects
       name: Find matching existing projects
       function: agent-find-projects

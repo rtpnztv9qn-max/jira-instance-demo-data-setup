@@ -16517,7 +16517,16 @@ export async function summarizeProjectSpaceFromAgent(payload = {}, context = {})
     };
   }
 
-  const recentDays = normalisePositiveInteger(payload?.recentDays, 14, 1, 90);
+  const requestedReportType = String(payload?.reportType || 'summary').trim().toLowerCase();
+  const reportType = ['summary', 'report', 'trend'].includes(requestedReportType)
+    ? requestedReportType
+    : 'summary';
+  const recentDays = normalisePositiveInteger(
+    payload?.recentDays,
+    reportType === 'summary' ? 14 : 30,
+    1,
+    90
+  );
 
   try {
     // Keep this read-only action strictly in the calling user's permission context.
@@ -16591,6 +16600,40 @@ export async function summarizeProjectSpaceFromAgent(payload = {}, context = {})
     const qualifier = isPartial ? 'at least ' : '';
     const completionRate = issues.length ? Math.round((completed / issues.length) * 100) : 0;
     const topIssueTypes = orderedCounts(issueTypeCounts).slice(0, 4);
+    const dayMs = 24 * 60 * 60 * 1000;
+    const trendStart = now - (recentDays * dayMs);
+    const trendPeriods = Array.from({ length: Math.ceil(recentDays / 7) }, (_, index) => {
+      const start = trendStart + (index * 7 * dayMs);
+      const end = Math.min(now, start + (7 * dayMs));
+      return {
+        period: `${new Date(start).toISOString().slice(0, 10)} to ${new Date(end).toISOString().slice(0, 10)}`,
+        created: 0,
+        completed: 0,
+        netChange: 0,
+      };
+    });
+    const addToTrend = (dateValue, field) => {
+      const timestamp = Date.parse(dateValue || '');
+      if (!Number.isFinite(timestamp) || timestamp < trendStart || timestamp > now) return;
+      const index = Math.min(trendPeriods.length - 1, Math.floor((timestamp - trendStart) / (7 * dayMs)));
+      if (trendPeriods[index]) trendPeriods[index][field] += 1;
+    };
+    for (const issue of issues) {
+      addToTrend(issue?.fields?.created, 'created');
+      addToTrend(issue?.fields?.resolutiondate, 'completed');
+    }
+    for (const period of trendPeriods) {
+      period.netChange = period.created - period.completed;
+    }
+    const netChange = recentlyCreated - recentlyCompleted;
+    const trendDirection = netChange > 0
+      ? `The backlog grew by ${netChange} item(s) during the period.`
+      : netChange < 0
+        ? `The backlog reduced by ${Math.abs(netChange)} item(s) during the period.`
+        : 'Created and completed work were balanced during the period.';
+    const averageWeeklyCompletion = trendPeriods.length
+      ? Math.round((recentlyCompleted / trendPeriods.length) * 10) / 10
+      : 0;
     const adfToText = value => {
       if (!value) return '';
       if (typeof value === 'string') return value.trim();
@@ -16625,6 +16668,7 @@ export async function summarizeProjectSpaceFromAgent(payload = {}, context = {})
         name: project?.name || projectKey,
         projectType: project?.projectTypeKey || null,
       },
+      reportType,
       overview: `${project?.name || projectKey} (${projectKey}) has ${qualifier}${issues.length} items: ${open} open and ${completed} completed in the readable sample. ${recentActivityCount} were updated in the last ${recentDays} days.`,
       boardPurpose,
       progressAssessment,
@@ -16634,6 +16678,15 @@ export async function summarizeProjectSpaceFromAgent(payload = {}, context = {})
         recentlyCreated,
         recentlyCompleted,
         recentlyUpdated: recentActivityCount,
+      },
+      trendAnalysis: {
+        days: recentDays,
+        created: recentlyCreated,
+        completed: recentlyCompleted,
+        netChange,
+        direction: trendDirection,
+        averageWeeklyCompletion,
+        periods: trendPeriods,
       },
       attention,
       issueTypeCounts: orderedCounts(issueTypeCounts),
@@ -16648,10 +16701,12 @@ export async function summarizeProjectSpaceFromAgent(payload = {}, context = {})
         `- How work is progressing: ${progressAssessment}`,
         `- Work: ${qualifier}${issues.length} total, ${open} open, ${completed} completed`,
         `- Recent activity: ${recentActivityCount} item(s) updated in the last ${recentDays} days`,
+        reportType !== 'summary' ? `- Trend: ${trendDirection} Average weekly completion: ${averageWeeklyCompletion} item(s).` : '',
+        reportType !== 'summary' ? `- Periods: ${trendPeriods.map(period => `${period.period}: ${period.created} created / ${period.completed} completed`).join('; ')}` : '',
         `- Needs attention: ${attention.length ? attention.join('; ') : 'no overdue or unassigned open items in the readable sample'}`,
         `- Status mix: ${orderedCounts(statusCounts).map(item => `${item.name} ${item.count}`).join(', ') || 'none'}`,
         isPartial ? '- Coverage: partial; the project has more than 1,000 readable items' : '- Coverage: complete for currently readable items',
-      ].join('\n'),
+      ].filter(Boolean).join('\n'),
     };
   } catch (err) {
     const inaccessible = err?.status === 401 || err?.status === 403 || err?.status === 404;
