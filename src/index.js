@@ -16497,6 +16497,174 @@ export async function cancelDemoEnvironmentFromAgent(payload = {}) {
   };
 }
 
+export async function summarizeProjectSpaceFromAgent(payload = {}, context = {}) {
+  const projectKey = String(payload?.projectKey || '').trim().toUpperCase();
+  if (!projectKey) {
+    return {
+      success: false,
+      needsInput: true,
+      question: 'Which Jira project key should I summarize?',
+      missingFields: ['projectKey'],
+    };
+  }
+
+  if (!/^[A-Z][A-Z0-9_]{1,99}$/.test(projectKey)) {
+    return {
+      success: false,
+      needsInput: true,
+      question: `"${projectKey}" does not look like a Jira project key. Which project key should I summarize?`,
+      missingFields: ['projectKey'],
+    };
+  }
+
+  const recentDays = normalisePositiveInteger(payload?.recentDays, 14, 1, 90);
+
+  try {
+    // Keep this read-only action strictly in the calling user's permission context.
+    // This ensures the summary cannot reveal a project or issue the user cannot browse.
+    const projectResponse = await api.asUser().requestJira(
+      buildTrustedJiraRoute(`/rest/api/3/project/${encodeURIComponent(projectKey)}`)
+    );
+    const project = await readJiraJsonResponse(projectResponse, 'GET', `/rest/api/3/project/${projectKey}`);
+
+    const searchPath = '/rest/api/3/search/jql';
+    const searchResponse = await api.asUser().requestJira(buildTrustedJiraRoute(searchPath), {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        jql: `project = ${quoteJqlValue(projectKey)} ORDER BY updated DESC`,
+        maxResults: 1000,
+        fields: ['summary', 'status', 'priority', 'assignee', 'issuetype', 'duedate', 'created', 'updated', 'resolutiondate'],
+      }),
+    });
+    const data = await readJiraJsonResponse(searchResponse, 'POST', searchPath);
+    const issues = Array.isArray(data?.issues) ? data.issues : [];
+    const isPartial = Boolean(data?.nextPageToken);
+    const now = Date.now();
+    const recentCutoff = now - (recentDays * 24 * 60 * 60 * 1000);
+    const today = new Date().toISOString().slice(0, 10);
+    const increment = (map, key) => map.set(key, (map.get(key) || 0) + 1);
+    const statusCounts = new Map();
+    const priorityCounts = new Map();
+    const issueTypeCounts = new Map();
+    let completed = 0;
+    let inProgress = 0;
+    let unassigned = 0;
+    let overdue = 0;
+    let recentlyCreated = 0;
+    let recentlyCompleted = 0;
+
+    for (const issue of issues) {
+      const fields = issue?.fields || {};
+      increment(statusCounts, fields.status?.name || 'Unknown');
+      increment(priorityCounts, fields.priority?.name || 'None');
+      increment(issueTypeCounts, fields.issuetype?.name || 'Work item');
+      if (fields.status?.statusCategory?.key === 'done') completed += 1;
+      if (fields.status?.statusCategory?.key === 'indeterminate') inProgress += 1;
+      if (!fields.assignee && fields.status?.statusCategory?.key !== 'done') unassigned += 1;
+      if (fields.duedate && fields.duedate < today && fields.status?.statusCategory?.key !== 'done') overdue += 1;
+      if (Date.parse(fields.created || '') >= recentCutoff) recentlyCreated += 1;
+      if (Date.parse(fields.resolutiondate || '') >= recentCutoff) recentlyCompleted += 1;
+    }
+
+    const recentlyUpdatedIssues = issues
+      .filter(issue => Date.parse(issue?.fields?.updated || '') >= recentCutoff);
+    const recentActivityCount = recentlyUpdatedIssues.length;
+    const recentIssues = recentlyUpdatedIssues
+      .slice(0, 8)
+      .map(issue => ({
+        key: issue.key,
+        summary: issue.fields?.summary || issue.key,
+        status: issue.fields?.status?.name || 'Unknown',
+        priority: issue.fields?.priority?.name || 'None',
+        assignee: issue.fields?.assignee?.displayName || 'Unassigned',
+        updated: issue.fields?.updated || null,
+      }));
+    const open = issues.length - completed;
+    const orderedCounts = map => Array.from(map.entries())
+      .sort((left, right) => right[1] - left[1])
+      .map(([name, count]) => ({ name, count }));
+    const attention = [
+      overdue ? `${overdue} overdue open item${overdue === 1 ? '' : 's'}` : '',
+      unassigned ? `${unassigned} unassigned open item${unassigned === 1 ? '' : 's'}` : '',
+    ].filter(Boolean);
+    const qualifier = isPartial ? 'at least ' : '';
+    const completionRate = issues.length ? Math.round((completed / issues.length) * 100) : 0;
+    const topIssueTypes = orderedCounts(issueTypeCounts).slice(0, 4);
+    const adfToText = value => {
+      if (!value) return '';
+      if (typeof value === 'string') return value.trim();
+      if (Array.isArray(value)) return value.map(adfToText).filter(Boolean).join(' ');
+      if (typeof value === 'object') {
+        return [value.text, adfToText(value.content)].filter(Boolean).join(' ').trim();
+      }
+      return '';
+    };
+    const projectDescription = adfToText(project?.description).replace(/\s+/g, ' ').trim();
+    const boardPurpose = projectDescription
+      ? projectDescription.slice(0, 500)
+      : `${project?.name || projectKey} is a ${String(project?.projectTypeKey || 'Jira').replace(/_/g, ' ')} board tracking ${topIssueTypes.map(item => item.name.toLowerCase()).join(', ') || 'team work'}.`;
+    let progressAssessment;
+    if (issues.length === 0) {
+      progressAssessment = 'The board does not currently contain any readable work items.';
+    } else if (recentActivityCount === 0) {
+      progressAssessment = `There has been no visible issue activity in the last ${recentDays} days; the board may need review.`;
+    } else if (overdue > 0 && overdue >= Math.max(3, Math.ceil(open * 0.25))) {
+      progressAssessment = `Work is active, with ${inProgress} item(s) in progress and ${recentActivityCount} recently updated, but delivery is at risk because ${overdue} open item(s) are overdue.`;
+    } else if (recentlyCompleted > recentlyCreated) {
+      progressAssessment = `The backlog is trending down: ${recentlyCompleted} item(s) were completed and ${recentlyCreated} created in the last ${recentDays} days. Overall completion is ${completionRate}%.`;
+    } else {
+      progressAssessment = `Work is moving: ${inProgress} item(s) are in progress, ${recentlyCompleted} completed, and ${recentlyCreated} created in the last ${recentDays} days. Overall completion is ${completionRate}%.`;
+    }
+
+    return {
+      success: true,
+      needsInput: false,
+      project: {
+        key: projectKey,
+        name: project?.name || projectKey,
+        projectType: project?.projectTypeKey || null,
+      },
+      overview: `${project?.name || projectKey} (${projectKey}) has ${qualifier}${issues.length} items: ${open} open and ${completed} completed in the readable sample. ${recentActivityCount} were updated in the last ${recentDays} days.`,
+      boardPurpose,
+      progressAssessment,
+      progress: {
+        completionRate,
+        inProgress,
+        recentlyCreated,
+        recentlyCompleted,
+        recentlyUpdated: recentActivityCount,
+      },
+      attention,
+      issueTypeCounts: orderedCounts(issueTypeCounts),
+      statusCounts: orderedCounts(statusCounts),
+      priorityCounts: orderedCounts(priorityCounts),
+      recentDays,
+      recentIssues,
+      isPartial,
+      summary: [
+        `${project?.name || projectKey} (${projectKey})`,
+        `- What this board is about: ${boardPurpose}`,
+        `- How work is progressing: ${progressAssessment}`,
+        `- Work: ${qualifier}${issues.length} total, ${open} open, ${completed} completed`,
+        `- Recent activity: ${recentActivityCount} item(s) updated in the last ${recentDays} days`,
+        `- Needs attention: ${attention.length ? attention.join('; ') : 'no overdue or unassigned open items in the readable sample'}`,
+        `- Status mix: ${orderedCounts(statusCounts).map(item => `${item.name} ${item.count}`).join(', ') || 'none'}`,
+        isPartial ? '- Coverage: partial; the project has more than 1,000 readable items' : '- Coverage: complete for currently readable items',
+      ].join('\n'),
+    };
+  } catch (err) {
+    const inaccessible = err?.status === 401 || err?.status === 403 || err?.status === 404;
+    return {
+      success: false,
+      needsInput: false,
+      summary: inaccessible
+        ? `I could not read Jira project ${projectKey}. Check that the key exists and that you have Browse Projects permission.`
+        : `I could not summarize Jira project ${projectKey}: ${err.message}`,
+    };
+  }
+}
+
 export async function findMatchingDemoProjectsFromAgent(payload = {}, context = {}) {
   console.log('findMatchingDemoProjectsFromAgent started', JSON.stringify({
     payload,
